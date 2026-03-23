@@ -1,0 +1,85 @@
+[project]
+name = "lightning-yolo"
+version = "0.1.0"
+description = "YOLO architectures for PyTorch Lightning."
+readme = "README.md"
+authors = [
+    { name = "Seppo Enarvi", email = "ssekivln@duck.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "lightning[extra]>=2.6.1",
+    "pycocotools>=2.0.11",
+    "torchvision>=0.25.0",
+]
+
+[project.scripts]
+lightning-yolo = "lightning_yolo:main"
+
+[build-system]
+requires = ["uv_build>=0.10.8,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+]
+
+[tool.docformatter]
+recursive = true
+# This need to be shorter as some docstings start with r""".
+wrap-summaries = 119
+wrap-descriptions = 120
+blank = true
+
+[tool.codespell]
+quiet-level = 3
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+exclude = [".git", "docs"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # https://pypi.org/project/pycodestyle
+    "F",  # https://pypi.org/project/pyflakes
+    "S",  # https://pypi.org/project/flake8-bandit
+    "RUF018",  # https://docs.astral.sh/ruff/rules/assignment-in-assert
+    "UP", # https://docs.astral.sh/ruff/rules/#pyupgrade-up
+]
+extend-select = [
+    "I",  # isort
+    "C4",  # https://pypi.org/project/flake8-comprehensions
+    "SIM",  # https://pypi.org/project/flake8-simplify
+    "RET",  # https://pypi.org/project/flake8-return
+    "PT",  # https://pypi.org/project/flake8-pytest-style
+    "RUF100",  # https://docs.astral.sh/ruff/rules/unused-noqa/
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/**" = [
+    "S101",  # Use of `assert` detected
+]
+"tests/**" = [
+    "S101",  # Use of `assert` detected
+]
+
+[tool.mypy]
+files = ["src/lightning_yolo"]
+install_types = "True"
+non_interactive = "True"
+disallow_untyped_defs = "True"
+ignore_missing_imports = "True"
+show_error_codes = "True"
+warn_redundant_casts = "True"
+warn_unused_configs = "True"
+warn_unused_ignores = "True"
+allow_redefinition = "True"
+
+[tool.pytest.ini_options]
+addopts = [
+    "--color=yes",
+]
