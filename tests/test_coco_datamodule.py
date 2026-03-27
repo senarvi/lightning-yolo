@@ -13,14 +13,14 @@ from lightning_yolo.coco_datamodule import (
 )
 
 
-def write_minimal_coco_sample(tmp_path: Path) -> tuple[Path, Path]:
-    image_dir = tmp_path / "train2017"
+def create_coco_data(data_dir: Path) -> tuple[Path, Path]:
+    image_dir = data_dir / "train2017"
     image_dir.mkdir(parents=True, exist_ok=True)
 
     image_path = image_dir / "000000000001.jpg"
     Image.new("RGB", (10, 6)).save(image_path)
 
-    annotation_path = tmp_path / "annotations.json"
+    annotation_path = data_dir / "annotations.json"
     annotation_path.write_text(
         json.dumps(
             {
@@ -44,16 +44,14 @@ def write_minimal_coco_sample(tmp_path: Path) -> tuple[Path, Path]:
     return image_dir, annotation_path
 
 
-def test_annotations_to_target() -> None:
+def test_convert_annotations() -> None:
     annotations = [
         {"bbox": [10, 10, 20, 5], "category_id": 3, "iscrowd": 0},
         {"bbox": [-5, -5, 8, 8], "category_id": 7, "iscrowd": 0},
         {"bbox": [0, 0, 1, 1], "category_id": 99, "iscrowd": 1},
         {"bbox": [5, 5, 0, 10], "category_id": 8, "iscrowd": 0},
     ]
-
     target = convert_annotations(annotations=annotations, width=20, height=20, include_crowd=False)
-
     expected_boxes = torch.tensor(
         [
             [10.0, 10.0, 20.0, 15.0],
@@ -74,7 +72,6 @@ def test_collate_fn() -> None:
         "boxes": torch.zeros((0, 4)),
         "labels": torch.empty((0,), dtype=torch.int64),
     }
-
     images, targets = collate_fn([(image1, target1), (image2, target2)])
 
     assert isinstance(images, list)
@@ -85,9 +82,8 @@ def test_collate_fn() -> None:
     assert targets[1]["boxes"].shape == (0, 4)
 
 
-def test_coco_dataset_transforms(tmp_path: Path) -> None:
-    image_dir, annotation_path = write_minimal_coco_sample(tmp_path)
-
+def test_coco_detection_dataset(tmp_path: Path) -> None:
+    image_dir, annotation_path = create_coco_data(tmp_path)
     transforms = v2.Compose(
         [
             v2.ToImage(),
@@ -100,7 +96,6 @@ def test_coco_dataset_transforms(tmp_path: Path) -> None:
         ann_file=annotation_path,
         transforms=transforms,
     )
-
     image, target = dataset[0]
 
     assert image.shape == (3, 6, 10)
@@ -108,20 +103,14 @@ def test_coco_dataset_transforms(tmp_path: Path) -> None:
     torch.testing.assert_close(target["labels"], torch.tensor([3]))
 
 
-def test_coco_datamodule_default_transforms(tmp_path: Path) -> None:
-    image_dir, annotation_path = write_minimal_coco_sample(tmp_path)
-
+def test_coco_detection_datamodule(tmp_path: Path) -> None:
+    image_dir, annotation_path = create_coco_data(tmp_path)
     datamodule = COCODetectionDataModule(tmp_path, image_size=(12, 20))
-
-    assert datamodule.train_transforms is not None
-    assert datamodule.val_transforms is not None
-
     dataset = COCODetectionDataset(
         image_dir=image_dir,
         ann_file=annotation_path,
-        transforms=datamodule.val_transforms,
+        transforms=datamodule.test_transforms,
     )
-
     image, target = dataset[0]
 
     assert image.shape == (3, 12, 20)

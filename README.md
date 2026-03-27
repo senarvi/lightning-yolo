@@ -47,7 +47,37 @@ The `YOLO` class defined in [lightning_module.py](src/lightning_yolo/lightning_m
 
 A data module for the COCO object detection dataset is provided for demonstration purposes. The data module needs to resize the data to a suitable size, in addition to any augmenting transforms. For example, YOLOv4 network requires that the width and the height are multiples of 32.
 
-There's also a command line tool `lightning-yolo` that demonstrates training using Lightning CLI. Display command line usage for the `fit` command:
+There's also a command line tool `lightning-yolo` that demonstrates training using Lightning CLI. It downloads the COCO dataset automatically.
+
+#### Train a Darnet architecture, starting from pretrained weights
+
+```bash
+wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny-3l.cfg
+wget https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4-tiny.conv.29
+
+uv run lightning-yolo fit \
+	--model.darknet_config yolov4-tiny-3l.cfg \
+	--model.darknet_weights yolov4-tiny.conv.29 \
+	--model.num_classes 80 \
+	--data.data_dir data \
+	--data.batch_size 16 \
+    --trainer.accumulate_grad_batches 4 \
+	--trainer.max_epochs 80
+```
+
+#### Train a YOLOv8n model from scratch
+
+```bash
+uv run lightning-yolo fit \
+	--model.architecture yolov8n \
+	--model.num_classes 80 \
+	--model.matching_algorithm tal \
+	--data.data_dir data \
+	--data.batch_size 64 \
+	--trainer.max_epochs 200
+```
+
+#### Display all available options
 
 ```bash
 uv run lightning-yolo fit -h
@@ -67,28 +97,28 @@ Every detection head predicts a bounding box at every anchor. `forward()` return
 
 ## Development
 
-This repository uses [uv](https://docs.astral.sh/uv/) for dependency and environment management. Before every commit, run the following checks.
+This repository uses [uv](https://docs.astral.sh/uv/) for dependency and environment management.
 
-Pre-commit hooks:
+Before every commit, run the pre-commit hooks.
 
 ```bash
 uv run pre-commit run -a
 ```
 
-Optionally, install the git hook so pre-commit runs automatically before each commit:
+Optionally, install the git hook so that pre-commit runs automatically before each commit.
 
 ```bash
 uv run pre-commit install
 ```
 
-Unit tests:
-
-```bash
-uv run pytest -v
-```
-
-A static type check:
+The pre-commit hooks cannot run Mypy. You have to run it separately.
 
 ```bash
 uv run mypy
+```
+
+The pre-commit hooks do run the unit tests, but if you want, you can also run them separately.
+
+```bash
+uv run pytest -v
 ```

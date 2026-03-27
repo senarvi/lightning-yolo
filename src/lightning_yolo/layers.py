@@ -9,6 +9,7 @@ from .loss import YOLOLoss
 from .target_matching import (
     HighestIoUMatching,
     IoUThresholdMatching,
+    MatchingFn,
     ShapeMatching,
     SimOTAMatching,
     SizeRatioMatching,
@@ -77,7 +78,7 @@ class DetectionLayer(nn.Module):
         self,
         num_classes: int,
         prior_shapes: PRIOR_SHAPES,
-        matching_func: Callable,
+        matching_func: MatchingFn,
         loss_func: YOLOLoss,
         xy_scale: float = 1.0,
         input_is_normalized: bool = False,
@@ -188,7 +189,10 @@ class DetectionLayer(nn.Module):
         for image_preds, image_return_preds, image_targets in zip(preds, return_preds, targets):
             if image_targets["boxes"].shape[0] > 0:
                 pred_selector, background_selector, target_selector = self.matching_func(
-                    image_preds, image_targets, image_size
+                    image_preds,
+                    image_targets,
+                    image_size,
+                    self.input_is_normalized,
                 )
                 matched_preds: MatchedPredictionDict = {
                     "boxes": image_return_preds["boxes"][pred_selector],

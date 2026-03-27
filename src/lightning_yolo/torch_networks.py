@@ -378,6 +378,64 @@ class ELANStage(nn.Module):
         return self.mix(torch.cat(outputs, dim=1))
 
 
+class C2fStage(nn.Module):
+    """A C2f stage from YOLOv8.
+
+    Like ``ELANStage``, C2f aggregates a list of intermediate feature maps before a final mixing convolution. However,
+    it starts from a two-way channel split and uses ``BottleneckBlock`` modules.
+
+    Args:
+        in_channels: Number of input channels that the C2f stage expects.
+        out_channels: Number of output channels that the C2f stage produces.
+        hidden_channels: Number of output channels that bottleneck blocks produce. By default, half of
+            ``out_channels``.
+        depth: Number of bottleneck blocks that the C2f stage contains.
+        shortcut: Whether the bottleneck blocks should include a shortcut connection.
+        activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"),
+            "logistic", "linear", or "none".
+        norm: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
+
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int | None = None,
+        depth: int = 1,
+        shortcut: bool = False,
+        activation: str | None = "silu",
+        norm: str | None = "batchnorm",
+    ) -> None:
+        super().__init__()
+
+        if hidden_channels is None:
+            hidden_channels = out_channels // 2
+
+        self.split = Conv(in_channels, hidden_channels * 2, kernel_size=1, stride=1, activation=activation, norm=norm)
+        bottlenecks: list[nn.Module] = [
+            BottleneckBlock(hidden_channels, hidden_channels, shortcut=shortcut, norm=norm, activation=activation)
+            for _ in range(depth)
+        ]
+        self.bottlenecks = nn.ModuleList(bottlenecks)
+        self.mix = Conv(
+            hidden_channels * (2 + depth),
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            activation=activation,
+            norm=norm,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        outputs = list(self.split(x).chunk(2, dim=1))
+        x = outputs[-1]
+        for block in self.bottlenecks:
+            x = block(x)
+            outputs.append(x)
+        return self.mix(torch.cat(outputs, dim=1))
+
+
 class CSPSPP(nn.Module):
     """Spatial pyramid pooling module from the Cross Stage Partial Network from YOLOv4.
 
@@ -799,6 +857,82 @@ class YOLOV7Backbone(nn.Module):
         return outputs
 
 
+class YOLOV8Backbone(nn.Module):
+    """The backbone from YOLOv8.
+
+    Different variants (n/s/m/l/x) can be achieved by adjusting the ``widths`` and ``depth`` parameters. The standard
+    YOLOv8 variants use the following widths:
+
+    - yolov8n: (16, 32, 64, 128, 256)
+    - yolov8s: (32, 64, 128, 256, 512)
+    - yolov8m: (48, 96, 192, 384, 576)
+    - yolov8l: (64, 128, 256, 512, 512)
+    - yolov8x: (80, 160, 320, 640, 640)
+
+    Args:
+        in_channels: Number of channels in the input image.
+        widths: Number of channels at each network stage.
+        depth: Repeat the bottleneck layers this many times. Can be used to make the network deeper. The values used by
+            the different variants are 1 (yolov8n, yolov8s), 2 (yolov8m), and 3 (yolov8l, yolov8x).
+        activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"),
+            "logistic", "linear", or "none".
+        normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
+
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        widths: Sequence[int] = (64, 128, 256, 512, 512),
+        depth: int = 3,
+        activation: str | None = "silu",
+        normalization: str | None = "batchnorm",
+    ) -> None:
+        super().__init__()
+
+        if len(widths) != 5:
+            raise ValueError("YOLOV8Backbone requires exactly 5 width values.")
+
+        def downsample(in_channels: int, out_channels: int) -> nn.Module:
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
+
+        def stage(in_channels: int, out_channels: int, stage_depth: int) -> nn.Module:
+            c2f = C2fStage(
+                out_channels,
+                out_channels,
+                depth=stage_depth,
+                shortcut=True,
+                activation=activation,
+                norm=normalization,
+            )
+            return nn.Sequential(
+                OrderedDict(
+                    [
+                        ("downsample", downsample(in_channels, out_channels)),
+                        ("c2f", c2f),
+                    ]
+                )
+            )
+
+        self.stages = nn.ModuleList(
+            [
+                downsample(in_channels, widths[0]),
+                stage(widths[0], widths[1], depth),
+                stage(widths[1], widths[2], depth * 2),
+                stage(widths[2], widths[3], depth * 2),
+                stage(widths[3], widths[4], depth),
+            ]
+        )
+
+    def forward(self, x: Tensor) -> list[Tensor]:
+        c1 = self.stages[0](x)
+        c2 = self.stages[1](c1)
+        c3 = self.stages[2](c2)
+        c4 = self.stages[3](c3)
+        c5 = self.stages[4](c4)
+        return [c1, c2, c3, c4, c5]
+
+
 class YOLOV4TinyNetwork(nn.Module):
     """The "tiny" network architecture from YOLOv4.
 
@@ -816,9 +950,9 @@ class YOLOV4TinyNetwork(nn.Module):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -964,9 +1098,9 @@ class YOLOV4Network(nn.Module):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -1157,9 +1291,9 @@ class YOLOV4P6Network(nn.Module):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -1382,9 +1516,9 @@ class YOLOV5Network(nn.Module):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -1566,9 +1700,9 @@ class YOLOV7W6Network(nn.Module):
             that you typically want to sort the shapes from the smallest to the largest.
         aux_weight: Weight for the loss from the auxiliary heads.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
             no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
@@ -1826,6 +1960,190 @@ class YOLOV7W6Network(nn.Module):
         return detections, losses, hits
 
 
+class YOLOV8Network(nn.Module):
+    """The YOLOv8 network architecture.
+
+    Different variants (n/s/m/l/x) can be achieved by adjusting the ``widths`` and ``depth`` parameters. The standard
+    YOLOv8 variants use the following widths:
+
+    - yolov8n: (16, 32, 64, 128, 256)
+    - yolov8s: (32, 64, 128, 256, 512)
+    - yolov8m: (48, 96, 192, 384, 576)
+    - yolov8l: (64, 128, 256, 512, 512)
+    - yolov8x: (80, 160, 320, 640, 640)
+
+    Args:
+        num_classes: Number of different classes that this model predicts.
+        backbone: A backbone network that returns the output from each stage.
+        widths: Number of channels at each network stage.
+        depth: Repeat the bottleneck layers this many times. Can be used to make the network deeper. The values used by
+            the different variants are 1 (yolov8n, yolov8s), 2 (yolov8m), and 3 (yolov8l, yolov8x).
+        activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"),
+            "logistic", "linear", or "none".
+        normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
+        prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
+            matching the targets to the anchors. The list should contain (width, height) tuples in the network input
+            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
+            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
+            that you typically want to sort the shapes from the smallest to the largest.
+        matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
+        matching_threshold: Threshold for "size" and "iou" matching algorithms.
+        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
+            area centered at the target, where `N` is the value of this parameter.
+        size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
+            no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
+        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the prior shape has IoU
+            with some target greater than this threshold, the predictor will not be taken into account when calculating
+            the confidence loss.
+        overlap_func: A function for calculating the pairwise overlaps between two sets of boxes. Valid string values
+            are "iou", "giou", "diou", and "ciou".
+        predict_overlap: Balance between binary confidence targets and predicting the overlap. 0.0 means that the target
+            confidence is 1 if there's an object, and 1.0 means that the target confidence is the output of
+            ``overlap_func``.
+        label_smoothing: The epsilon parameter (weight) for class label smoothing. 0.0 means no smoothing (binary
+            targets), and 1.0 means that the target probabilities are always 0.5.
+        overlap_loss_multiplier: Overlap loss will be scaled by this value.
+        confidence_loss_multiplier: Confidence loss will be scaled by this value.
+        class_loss_multiplier: Classification loss will be scaled by this value.
+        xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
+            to produce coordinate values close to one.
+
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        backbone: nn.Module | None = None,
+        widths: Sequence[int] = (64, 128, 256, 512, 512),
+        depth: int = 3,
+        activation: str | None = "silu",
+        normalization: str | None = "batchnorm",
+        prior_shapes: PRIOR_SHAPES | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+
+        if len(widths) != 5:
+            raise ValueError("YOLOV8Network requires exactly 5 width values.")
+
+        # By default use the prior shapes that have been learned from the COCO data.
+        if prior_shapes is None:
+            prior_shapes = [
+                (12, 16),
+                (19, 36),
+                (40, 28),
+                (36, 75),
+                (76, 55),
+                (72, 146),
+                (142, 110),
+                (192, 243),
+                (459, 401),
+            ]
+            anchors_per_cell = 3
+        else:
+            anchors_per_cell, modulo = divmod(len(prior_shapes), 3)
+            if modulo != 0:
+                raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
+        num_outputs = (5 + num_classes) * anchors_per_cell
+
+        def spp(in_channels: int, out_channels: int) -> nn.Module:
+            return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
+
+        def downsample(in_channels: int, out_channels: int) -> nn.Module:
+            return Conv(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=2,
+                activation=activation,
+                norm=normalization,
+            )
+
+        def out(in_channels: int) -> nn.Module:
+            outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
+            return nn.Sequential(OrderedDict([(f"outputs_{num_outputs}", outputs)]))
+
+        def c2f(in_channels: int, out_channels: int) -> nn.Module:
+            return C2fStage(
+                in_channels,
+                out_channels,
+                depth=depth,
+                shortcut=False,
+                norm=normalization,
+                activation=activation,
+            )
+
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+            assert prior_shapes is not None
+            return create_detection_layer(
+                prior_shapes,
+                prior_shape_idxs,
+                num_classes=num_classes,
+                input_is_normalized=False,
+                **kwargs,
+            )
+
+        self.backbone = backbone or YOLOV8Backbone(
+            widths=widths,
+            depth=depth,
+            activation=activation,
+            normalization=normalization,
+        )
+
+        w3 = widths[-3]
+        w4 = widths[-2]
+        w5 = widths[-1]
+
+        self.spp = spp(w5, w5)
+
+        self.pan3 = c2f(w4 + w3, w3)
+        self.out3 = out(w3)
+
+        self.fpn4 = c2f(w5 + w4, w4)
+        self.pan4 = c2f(w3 + w4, w4)
+        self.out4 = out(w4)
+
+        self.pan5 = c2f(w4 + w5, w5)
+        self.out5 = out(w5)
+
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+
+        self.downsample3 = downsample(w3, w3)
+        self.downsample4 = downsample(w4, w4)
+
+        self.detect3 = detect(range(0, anchors_per_cell))
+        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
+        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
+
+    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+        detections: list[Tensor] = []  # Outputs from detection layers
+        losses: list[Tensor] = []  # Losses from detection layers
+        hits: list[int] = []  # Number of targets each detection layer was responsible for
+
+        image_size = get_image_size(x)
+
+        c3, c4, x = self.backbone(x)[-3:]
+        c5 = self.spp(x)
+
+        x = torch.cat((self.upsample(c5), c4), dim=1)
+        p4 = self.fpn4(x)
+        x = torch.cat((self.upsample(p4), c3), dim=1)
+
+        n3 = self.pan3(x)
+        x = torch.cat((self.downsample3(n3), p4), dim=1)
+        n4 = self.pan4(x)
+        x = torch.cat((self.downsample4(n4), c5), dim=1)
+        n5 = self.pan5(x)
+
+        run_detection(self.detect3, self.out3(n3), targets, image_size, detections, losses, hits)
+        run_detection(self.detect4, self.out4(n4), targets, image_size, detections, losses, hits)
+        run_detection(self.detect5, self.out5(n5), targets, image_size, detections, losses, hits)
+        return detections, losses, hits
+
+
 class YOLOXHead(nn.Module):
     """A module that produces features for YOLO detection layer, decoupling the classification and localization
     features.
@@ -1919,9 +2237,9 @@ class YOLOXNetwork(nn.Module):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -2086,8 +2404,8 @@ def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Mod
 
     Args:
         architecture: Name of the built-in architecture to construct. Supported values are "yolov4", "yolov4-tiny",
-            "yolov4-p6", "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x", "yolov7-w6", "yolox-tiny", "yolox-s",
-            "yolox-m", and "yolox-l".
+            "yolov4-p6", "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x", "yolov7-w6", "yolov8n",
+            "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolox-tiny", "yolox-s", "yolox-m", and "yolox-l".
         num_classes: Number of different classes that this model predicts.
         kwargs: Additional keyword arguments to pass to the network constructor.
 
@@ -2119,6 +2437,21 @@ def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Mod
         network_size = {"width": 80, "depth": 4}
     elif architecture == "yolov7-w6":
         network_class = YOLOV7W6Network
+    elif architecture == "yolov8n":
+        network_class = YOLOV8Network
+        network_size = {"widths": (16, 32, 64, 128, 256), "depth": 1}
+    elif architecture == "yolov8s":
+        network_class = YOLOV8Network
+        network_size = {"widths": (32, 64, 128, 256, 512), "depth": 1}
+    elif architecture == "yolov8m":
+        network_class = YOLOV8Network
+        network_size = {"widths": (48, 96, 192, 384, 576), "depth": 2}
+    elif architecture == "yolov8l":
+        network_class = YOLOV8Network
+        network_size = {"widths": (64, 128, 256, 512, 512), "depth": 3}
+    elif architecture == "yolov8x":
+        network_class = YOLOV8Network
+        network_size = {"widths": (80, 160, 320, 640, 640), "depth": 3}
     elif architecture == "yolox-tiny":
         network_class = YOLOXNetwork
         network_size = {"width": 24, "depth": 1}
@@ -2134,7 +2467,8 @@ def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Mod
     else:
         raise ValueError(
             f"Unknown architecture '{architecture}'. Supported values are: yolov4, yolov4-tiny, yolov4-p6, yolov5n, "
-            "yolov5s, yolov5m, yolov5l, yolov5x, yolov7, yolov7-w6, yolox-tiny, yolox-s, yolox-m, yolox-l."
+            "yolov5s, yolov5m, yolov5l, yolov5x, yolov7-w6, yolov8n, yolov8s, yolov8m, yolov8l, yolov8x, "
+            "yolox-tiny, yolox-s, yolox-m, yolox-l."
         )
 
     return network_class(num_classes=num_classes, **network_size, **kwargs)

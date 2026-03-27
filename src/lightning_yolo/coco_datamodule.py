@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -8,6 +6,7 @@ from urllib.request import urlretrieve
 
 import torch
 from lightning.pytorch import LightningDataModule
+from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torchvision import tv_tensors
@@ -17,8 +16,8 @@ from torchvision.transforms import v2
 from .types import BATCH, IMAGES, TARGETS, TargetDict
 
 TransformFn = Callable[
-    [object, dict[str, Tensor | tv_tensors.BoundingBoxes]],
-    tuple[object, dict[str, Tensor | tv_tensors.BoundingBoxes]],
+    [Image.Image, dict[str, Tensor | tv_tensors.BoundingBoxes]],
+    tuple[Image.Image, dict[str, Tensor | tv_tensors.BoundingBoxes]],
 ]
 
 
@@ -26,12 +25,10 @@ def collate_fn(batch: list[tuple[Tensor, TargetDict]]) -> BATCH:
     """Collate a batch of image-target pairs for detection training.
 
     Args:
-        batch: List of ``(image, target)`` samples, where each target may contain
-            a variable number of bounding boxes.
+        batch: List of ``(image, target)`` samples, where each target may contain a variable number of bounding boxes.
 
     Returns:
-        A tuple ``(images, targets)`` where both values are lists aligned by
-        sample index.
+        A tuple ``(images, targets)`` where both values are lists aligned by sample index.
 
     """
     images, targets = zip(*batch)
@@ -99,9 +96,9 @@ class COCODetectionDataset(CocoDetection):
     Args:
         image_dir: Directory containing image files.
         ann_file: Path to the COCO annotation JSON file.
-        transforms: Optional transform pipeline receiving ``(image, target)``
-            and returning transformed ``(image, target)``.
-        include_crowd: Whether to keep annotations marked as crowd.
+        transforms: Optional transform pipeline receiving ``(image, target)`` and returning transformed
+            ``(image, target)``.
+        include_crowd: Whether to keep annotations marked as "crowd". These are boxes the contain multiple objects.
 
     """
 
@@ -109,7 +106,7 @@ class COCODetectionDataset(CocoDetection):
         self,
         image_dir: Path,
         ann_file: Path,
-        transforms: TransformFn | None = None,
+        transforms: TransformFn,
         include_crowd: bool = False,
     ) -> None:
         # Keep VisionDataset transforms disabled. The transforms will be applied after converting raw COCO annotations
@@ -132,22 +129,11 @@ class COCODetectionDataset(CocoDetection):
         annotations = self._load_target(self.ids[index])
         width, height = image.size
         target = convert_annotations(annotations, width=width, height=height, include_crowd=self.include_crowd)
+        image, target = self.sample_transforms(image, target)
 
-        if self.sample_transforms is not None:
-            transforms = self.sample_transforms
-        else:
-            transforms = v2.Compose(
-                [
-                    v2.ToImage(),
-                    v2.ToDtype(torch.float32, scale=True),
-                ]
-            )
-
-        image, target = transforms(image, target)
         image_tensor = torch.as_tensor(image, dtype=torch.float32)
         boxes_tensor = torch.as_tensor(target["boxes"], dtype=torch.float32)
         labels_tensor = torch.as_tensor(target["labels"], dtype=torch.int64)
-
         return image_tensor, {"boxes": boxes_tensor, "labels": labels_tensor}
 
 
@@ -188,22 +174,7 @@ class COCODetectionDataModule(LightningDataModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.train_dataset: COCODetectionDataset | None = None
-        self.val_dataset: COCODetectionDataset | None = None
-        self.test_dataset: COCODetectionDataset | None = None
-
-    @staticmethod
-    def default_train_transforms(image_size: tuple[int, int]) -> v2.Transform:
-        """Builds the default training transform pipeline.
-
-        Args:
-            image_size: Output image size as ``(height, width)``.
-
-        Returns:
-            A Torchvision v2 transform pipeline for training.
-
-        """
-        return v2.Compose(
+        self.train_transforms = train_transforms or v2.Compose(
             [
                 v2.ToImage(),
                 v2.RandomHorizontalFlip(p=0.5),
@@ -213,19 +184,7 @@ class COCODetectionDataModule(LightningDataModule):
                 v2.ToDtype(torch.float32, scale=True),
             ]
         )
-
-    @staticmethod
-    def default_val_transforms(image_size: tuple[int, int]) -> v2.Transform:
-        """Builds the default validation/test transform pipeline.
-
-        Args:
-            image_size: Output image size as ``(height, width)``.
-
-        Returns:
-            A Torchvision v2 transform pipeline for validation or testing.
-
-        """
-        return v2.Compose(
+        self.test_transforms = val_transforms or v2.Compose(
             [
                 v2.ToImage(),
                 v2.Resize(size=image_size),
@@ -234,31 +193,9 @@ class COCODetectionDataModule(LightningDataModule):
             ]
         )
 
-    @property
-    def train_transforms(self) -> TransformFn:
-        """Returns the transform pipeline used for training samples.
-
-        Args:
-            self: Data module instance.
-
-        Returns:
-            A callable transform pipeline for training data.
-
-        """
-        return self.hparams.train_transforms or self.default_train_transforms(self.hparams.image_size)  # type: ignore[attr-defined]
-
-    @property
-    def val_transforms(self) -> TransformFn:
-        """Returns the transform pipeline used for validation and test samples.
-
-        Args:
-            self: Data module instance.
-
-        Returns:
-            A callable transform pipeline for validation and test data.
-
-        """
-        return self.hparams.val_transforms or self.default_val_transforms(self.hparams.image_size)  # type: ignore[attr-defined]
+        self.train_dataset: COCODetectionDataset | None = None
+        self.val_dataset: COCODetectionDataset | None = None
+        self.test_dataset: COCODetectionDataset | None = None
 
     def prepare_data(self) -> None:
         """Downloads and extracts the COCO files if they are missing.
@@ -283,8 +220,8 @@ class COCODetectionDataModule(LightningDataModule):
             archive_path = data_dir / f"{name}.zip"
             if not archive_path.exists():
                 urlretrieve(url, archive_path)  # noqa: S310
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                zf.extractall(data_dir)
+            with zipfile.ZipFile(archive_path, "r") as archive_file:
+                archive_file.extractall(data_dir)
 
     def setup(self, stage: str | None = None) -> None:
         """Creates datasets for the requested Lightning stage.
@@ -296,8 +233,6 @@ class COCODetectionDataModule(LightningDataModule):
         """
         data_dir = Path(self.hparams.data_dir)  # type: ignore[attr-defined]
         include_crowd = self.hparams.include_crowd  # type: ignore[attr-defined]
-        train_transforms = self.train_transforms
-        val_transforms = self.val_transforms
 
         train_images = data_dir / "train2017"
         val_images = data_dir / "val2017"
@@ -308,13 +243,13 @@ class COCODetectionDataModule(LightningDataModule):
             self.train_dataset = COCODetectionDataset(
                 image_dir=train_images,
                 ann_file=train_ann,
-                transforms=train_transforms,
+                transforms=self.train_transforms,
                 include_crowd=include_crowd,
             )
             self.val_dataset = COCODetectionDataset(
                 image_dir=val_images,
                 ann_file=val_ann,
-                transforms=val_transforms,
+                transforms=self.test_transforms,
                 include_crowd=include_crowd,
             )
 
@@ -322,7 +257,7 @@ class COCODetectionDataModule(LightningDataModule):
             self.val_dataset = COCODetectionDataset(
                 image_dir=val_images,
                 ann_file=val_ann,
-                transforms=val_transforms,
+                transforms=self.test_transforms,
                 include_crowd=include_crowd,
             )
 
@@ -330,7 +265,7 @@ class COCODetectionDataModule(LightningDataModule):
             self.test_dataset = COCODetectionDataset(
                 image_dir=val_images,
                 ann_file=val_ann,
-                transforms=val_transforms,
+                transforms=self.test_transforms,
                 include_crowd=include_crowd,
             )
 

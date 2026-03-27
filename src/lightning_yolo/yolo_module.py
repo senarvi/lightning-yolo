@@ -17,7 +17,7 @@ from .types import BATCH, IMAGES, PRIOR_SHAPES, TARGETS
 
 class YOLO(LightningModule):
     """PyTorch Lightning implementation of YOLO that supports the most important features of YOLOv3, YOLOv4, YOLOv5,
-    YOLOv7, Scaled-YOLOv4, and YOLOX.
+    YOLOv7, YOLOv8, Scaled-YOLOv4, and YOLOX.
 
     *YOLOv3 paper*: `Joseph Redmon and Ali Farhadi <https://arxiv.org/abs/1804.02767>`__
 
@@ -95,7 +95,8 @@ class YOLO(LightningModule):
             the network will be initialized by these weights.
         architecture: Name of the built-in architecture to construct when ``darknet_config`` is not given. Supported
             values are "yolov4", "yolov4-tiny", "yolov4-p6", "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x",
-            "yolov7-w6", "yolox-tiny", "yolox-s", "yolox-m", and "yolox-l".
+            "yolov7-w6", "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolox-tiny", "yolox-s",
+            "yolox-m", and "yolox-l".
         num_classes: Number of object classes.
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
@@ -103,9 +104,9 @@ class YOLO(LightningModule):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -161,7 +162,7 @@ class YOLO(LightningModule):
         weight_decay: float = 0.0005,
         confidence_threshold: float = 0.2,
         nms_threshold: float = 0.45,
-        detections_per_image: int = 300,
+        detections_per_image: int = 100,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -230,8 +231,9 @@ class YOLO(LightningModule):
         self.nms_threshold = nms_threshold
         self.detections_per_image = detections_per_image
 
-        self._val_map = MeanAveragePrecision()
-        self._test_map = MeanAveragePrecision()
+        map_thresholds = [1, min(10, self.detections_per_image), self.detections_per_image]
+        self._val_map = MeanAveragePrecision(max_detection_thresholds=map_thresholds)
+        self._test_map = MeanAveragePrecision(max_detection_thresholds=map_thresholds)
 
     def forward(self, images: Tensor | IMAGES, targets: TARGETS | None = None) -> Tensor | tuple[Tensor, Tensor]:
         """Runs a forward pass through the network (all layers listed in ``self.network``), and if training targets are
@@ -366,11 +368,15 @@ class YOLO(LightningModule):
     def on_validation_epoch_end(self) -> None:
         # When continuing training from a checkpoint, it may happen that epoch_end is called without detections. In this
         # case the metrics cannot be computed.
-        if not self._val_map.detections:
+        if not self._val_map.detection_labels:
             return
 
         map_scores = self._val_map.compute()
-        map_scores = {"val/" + k: v for k, v in map_scores.items()}
+        map_scores = {
+            "val/" + k: v
+            for k, v in map_scores.items()
+            if isinstance(v, (int, float)) or (isinstance(v, Tensor) and v.numel() == 1)
+        }
         self.log_dict(map_scores, sync_dist=True)
         self._val_map.reset()
 
@@ -399,11 +405,15 @@ class YOLO(LightningModule):
     def on_test_epoch_end(self) -> None:
         # When continuing training from a checkpoint, it may happen that epoch_end is called without detections. In this
         # case the metrics cannot be computed.
-        if not self._test_map.detections:
+        if not self._test_map.detection_labels:
             return
 
         map_scores = self._test_map.compute()
-        map_scores = {"test/" + k: v for k, v in map_scores.items()}
+        map_scores = {
+            "test/" + k: v
+            for k, v in map_scores.items()
+            if isinstance(v, (int, float)) or (isinstance(v, Tensor) and v.numel() == 1)
+        }
         self.log_dict(map_scores, sync_dist=True)
         self._test_map.reset()
 

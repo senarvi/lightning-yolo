@@ -43,9 +43,9 @@ class DarknetNetwork(nn.Module):
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
@@ -452,9 +452,9 @@ def _create_yolo(
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "size" (match those prior shapes, whose width and height relative to the target is below given
-            ratio), "iou" (match all prior shapes that give a high enough IoU), or "maxiou" (match the prior shape that
-            gives the highest IoU, default).
+            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
+            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
+            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
         spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
             area centered at the target, where `N` is the value of this parameter.
