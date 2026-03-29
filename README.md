@@ -54,6 +54,7 @@ There's also a command line tool `lightning-yolo` that demonstrates training usi
 ```bash
 wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny-3l.cfg
 wget https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4-tiny.conv.29
+sed -i 's/iou_normalizer=.*/iou_normalizer=5.0/' yolov4-tiny-3l.cfg
 
 uv run lightning-yolo fit \
 	--model.darknet_config yolov4-tiny-3l.cfg \

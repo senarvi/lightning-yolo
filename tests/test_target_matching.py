@@ -96,15 +96,15 @@ def test_probability_of_labels() -> None:
             [0.8, 0.3, 0.4],
         ]
     )
-    target_labels = torch.tensor([1, 0], dtype=torch.int64)
+    target_labels = torch.tensor([1, 5], dtype=torch.int64)
     probs = _probability_of_labels(pred_probs, target_labels)
 
     # For the first target, the label is class 1, so the probabilities are [0.9, 0.3]. For the second target, the label
-    # is class 0, so the probabilities are [0.1, 0.8].
+    # is mapped to class 2, so the probabilities are [0.2, 0.4].
     expected = torch.tensor(
         [
-            [0.9, 0.1],
-            [0.3, 0.8],
+            [0.9, 0.2],
+            [0.3, 0.4],
         ]
     )
     torch.testing.assert_close(probs, expected)
@@ -175,7 +175,7 @@ def test_sim_ota_matching() -> None:
         torch.tensor([[True, False], [False, True]]),
     ],
     ids=["integer-labels", "boolean-class-mask"],
-)   
+)
 def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) -> None:
     matcher = TALMatching(prior_shapes=[[2, 2]], prior_shape_idxs=[0], topk=1, alpha=0.5, beta=6.0)
     class_logits = torch.tensor([[[[8.0, -8.0]], [[-8.0, 8.0]]]])

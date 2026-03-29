@@ -58,10 +58,10 @@ def test_convert_annotations() -> None:
             [0.0, 0.0, 3.0, 3.0],
         ]
     )
-    expected_labels = torch.tensor([3, 7])
+    expected_labels = torch.tensor([2, 6])
 
     torch.testing.assert_close(target["boxes"], expected_boxes)
-    torch.testing.assert_close(target["labels"], expected_labels)
+    assert torch.equal(target["labels"], expected_labels)
 
 
 def test_collate_fn() -> None:
@@ -100,7 +100,7 @@ def test_coco_detection_dataset(tmp_path: Path) -> None:
 
     assert image.shape == (3, 6, 10)
     torch.testing.assert_close(target["boxes"], torch.tensor([[7.0, 1.0, 9.0, 3.0]]))
-    torch.testing.assert_close(target["labels"], torch.tensor([3]))
+    assert torch.equal(target["labels"], torch.tensor([2]))
 
 
 def test_coco_detection_datamodule(tmp_path: Path) -> None:

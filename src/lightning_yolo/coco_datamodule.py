@@ -52,7 +52,7 @@ def convert_annotations(
     Returns:
         A dictionary containing:
         - ``boxes``: Tensor of shape ``(N, 4)`` in ``XYXY`` pixel coordinates.
-        - ``labels``: Tensor of shape ``(N,)`` with class ids.
+        - ``labels``: Tensor of shape ``(N,)`` with zero-based class ids (COCO category_id minus 1).
 
     """
     boxes: list[list[float]] = []
@@ -75,7 +75,7 @@ def convert_annotations(
             continue
 
         boxes.append([x1, y1, x2, y2])
-        labels.append(int(annotation["category_id"]))
+        labels.append(int(annotation["category_id"]) - 1)
 
     if boxes:
         boxes_tensor = torch.tensor(boxes, dtype=torch.float32)

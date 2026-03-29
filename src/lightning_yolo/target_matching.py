@@ -324,11 +324,20 @@ def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
 
     if target_labels.ndim == 1:
         assert target_labels.dtype == torch.int64
+
+        # The data may contain a different number of classes than what the model predicts. In case a label is
+        # greater than the number of predicted classes, it will be mapped to the last class.
+        last_class = torch.tensor(num_classes - 1, device=target_labels.device)
+        target_labels = torch.min(target_labels, last_class)
         return pred_probs[:, target_labels]
 
     if target_labels.ndim == 2:
-        assert target_labels.shape[-1] == num_classes
         assert target_labels.dtype == torch.bool
+        if target_labels.shape[-1] != num_classes:
+            raise ValueError(
+                f"The number of classes in the data ({target_labels.shape[-1]}) doesn't match the number of classes "
+                f"predicted by the model ({num_classes})."
+            )
 
         # For each prediction/target pair, take the predicted probability of every class that is assigned to the target.
         class_mask = target_labels.unsqueeze(0)  # [1, targets, num_classes]
@@ -409,7 +418,7 @@ class SimOTAMatching:
         pred_mask, target_selector = _sim_ota_match(costs, ious)
 
         # Replace True values with the results of the actual SimOTA matching.
-        prior_mask[tuple(prior_mask.nonzero().T.tolist())] = pred_mask
+        prior_mask[prior_mask.nonzero(as_tuple=True)] = pred_mask
 
         # Background mask is used to select anchors that are not responsible for predicting any object, for
         # calculating the part of the confidence loss with zero as the target confidence. It is set to False, if a
