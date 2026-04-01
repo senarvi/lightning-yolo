@@ -9,6 +9,8 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "lightning[extra]>=2.6.1",
+    "onnxruntime>=1.24.4",
+    "onnxscript>=0.6.2",
     "pycocotools>=2.0.11",
     "torchvision>=0.25.0",
 ]

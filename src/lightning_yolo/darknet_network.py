@@ -246,6 +246,7 @@ class DarknetNetwork(nn.Module):
             "scale_x_y": float,
             "size": int,
             "steps": str,
+            "stopbackward": int,
             "stride": int,
             "subdivisions": int,
             "truth_thresh": float,
