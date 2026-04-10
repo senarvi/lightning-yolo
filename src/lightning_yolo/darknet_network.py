@@ -22,7 +22,7 @@ from .torch_networks import NETWORK_OUTPUT
 from .types import PRIOR_SHAPES, TARGETS
 from .utils import get_image_size
 
-CONFIG = dict[str, Any]
+DARKNET_CONFIG = dict[str, Any]
 CREATE_LAYER_OUTPUT = tuple[nn.Module, int]  # layer, num_outputs
 
 
@@ -69,11 +69,7 @@ class DarknetNetwork(nn.Module):
     """
 
     def __init__(
-        self,
-        config_path: str,
-        weights_path: str | None = None,
-        in_channels: int | None = None,
-        **kwargs: Any,
+        self, config_path: str, weights_path: str | None = None, in_channels: int | None = None, **kwargs: Any
     ) -> None:
         super().__init__()
 
@@ -259,7 +255,7 @@ class DarknetNetwork(nn.Module):
         def convert(key: str, value: str) -> str | int | float | list[str | int | float]:
             """Converts a value to the correct type based on key."""
             if key not in variable_types:
-                warn(f"Unknown YOLO configuration variable: {key}")
+                warn(f"Unknown YOLO configuration variable: {key}", stacklevel=2)
                 return value
             if key in list_variables:
                 return [variable_types[key](v) for v in value.split(",")]
@@ -288,7 +284,7 @@ class DarknetNetwork(nn.Module):
         return sections
 
 
-def _create_layer(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
+def _create_layer(config: DARKNET_CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
     """Calls one of the ``_create_<layertype>(config, num_inputs)`` functions to create a PyTorch module from the layer
     config.
 
@@ -312,7 +308,7 @@ def _create_layer(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREAT
     return create_func[config["type"]](config, num_inputs, **kwargs)
 
 
-def _create_convolutional(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
+def _create_convolutional(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) -> CREATE_LAYER_OUTPUT:
     """Creates a convolutional layer.
 
     Args:
@@ -340,7 +336,7 @@ def _create_convolutional(config: CONFIG, num_inputs: list[int], **kwargs: Any) 
     return layer, config["filters"]
 
 
-def _create_maxpool(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
+def _create_maxpool(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) -> CREATE_LAYER_OUTPUT:
     """Creates a max pooling layer.
 
     Padding is added so that the output resolution will be the input resolution divided by stride, rounded upwards.
@@ -358,7 +354,7 @@ def _create_maxpool(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CRE
     return layer, num_inputs[-1]
 
 
-def _create_route(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
+def _create_route(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) -> CREATE_LAYER_OUTPUT:
     """Creates a routing layer.
 
     A routing layer concatenates the output (or part of it) from the layers specified by the "layers" configuration
@@ -388,7 +384,7 @@ def _create_route(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREAT
     return layer, num_outputs
 
 
-def _create_shortcut(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
+def _create_shortcut(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) -> CREATE_LAYER_OUTPUT:
     """Creates a shortcut layer.
 
     A shortcut layer adds a residual connection from the layer specified by the "from" configuration option.
@@ -406,7 +402,7 @@ def _create_shortcut(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CR
     return layer, num_inputs[-1]
 
 
-def _create_upsample(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CREATE_LAYER_OUTPUT:
+def _create_upsample(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) -> CREATE_LAYER_OUTPUT:
     """Creates a layer that upsamples the data.
 
     Args:
@@ -423,7 +419,7 @@ def _create_upsample(config: CONFIG, num_inputs: list[int], **kwargs: Any) -> CR
 
 
 def _create_yolo(
-    config: CONFIG,
+    config: DARKNET_CONFIG,
     num_inputs: list[int],
     num_classes: int | None = None,
     prior_shapes: PRIOR_SHAPES | None = None,
@@ -439,7 +435,7 @@ def _create_yolo(
     confidence_loss_multiplier: float | None = None,
     class_loss_multiplier: float | None = None,
     xy_scale: float | None = None,
-    **kwargs: Any,
+    **_: Any,
 ) -> CREATE_LAYER_OUTPUT:
     """Creates a YOLO detection layer.
 

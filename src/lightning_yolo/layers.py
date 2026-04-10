@@ -117,11 +117,11 @@ class DetectionLayer(nn.Module):
         """
         batch_size, num_features, height, width = x.shape
         num_attrs = self.num_classes + 5
-        anchors_per_cell = int(torch.div(num_features, num_attrs, rounding_mode="floor"))
+        anchors_per_cell = num_features // num_attrs
         if anchors_per_cell != len(self.prior_shapes):
             raise ValueError(
                 f"The model predicts {anchors_per_cell} bounding boxes per spatial location, but "
-                "{len(self.prior_shapes)} prior box dimensions are defined for this layer."
+                f"{len(self.prior_shapes)} prior box dimensions are defined for this layer."
             )
 
         # Reshape the output to have the bounding box attributes of each grid cell on its own row.
@@ -154,7 +154,7 @@ class DetectionLayer(nn.Module):
         # It's better to use binary_cross_entropy_with_logits() for loss computation, so we'll provide the unnormalized
         # confidence and classprob, when available.
         preds: PREDICTIONS = [
-            {"boxes": b, "confidences": c, "classprobs": p} for b, c, p in zip(box, confidence, classprob)
+            {"boxes": b, "confidences": c, "classprobs": p} for b, c, p in zip(box, confidence, classprob, strict=True)
         ]
 
         return output, preds
@@ -186,13 +186,10 @@ class DetectionLayer(nn.Module):
             raise ValueError("Different batch size for predictions and targets.")
 
         matches = []
-        for image_preds, image_return_preds, image_targets in zip(preds, return_preds, targets):
+        for image_preds, image_return_preds, image_targets in zip(preds, return_preds, targets, strict=True):
             if image_targets["boxes"].shape[0] > 0:
                 pred_selector, background_selector, target_selector = self.matching_func(
-                    image_preds,
-                    image_targets,
-                    image_size,
-                    self.input_is_normalized,
+                    image_preds, image_targets, image_size, self.input_is_normalized
                 )
                 matched_preds: MatchedPredictionDict = {
                     "boxes": image_return_preds["boxes"][pred_selector],
@@ -500,12 +497,7 @@ def create_detection_layer(
     matching_func: ShapeMatching | SimOTAMatching | TALMatching
     if matching_algorithm == "simota":
         loss_func = YOLOLoss(
-            overlap_func,
-            None,
-            None,
-            overlap_loss_multiplier,
-            confidence_loss_multiplier,
-            class_loss_multiplier,
+            overlap_func, None, None, overlap_loss_multiplier, confidence_loss_multiplier, class_loss_multiplier
         )
         matching_func = SimOTAMatching(prior_shapes, prior_shape_idxs, loss_func, spatial_range, size_range)
     elif matching_algorithm == "tal":
@@ -539,9 +531,4 @@ def create_detection_layer(
         class_loss_multiplier,
     )
     layer_shapes = [prior_shapes[i] for i in prior_shape_idxs]
-    return DetectionLayer(
-        prior_shapes=layer_shapes,
-        matching_func=matching_func,
-        loss_func=loss_func,
-        **kwargs,
-    )
+    return DetectionLayer(prior_shapes=layer_shapes, matching_func=matching_func, loss_func=loss_func, **kwargs)

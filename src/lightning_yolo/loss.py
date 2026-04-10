@@ -3,11 +3,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-from torch.nn.functional import (
-    binary_cross_entropy,
-    binary_cross_entropy_with_logits,
-    one_hot,
-)
+from torch.nn.functional import binary_cross_entropy, binary_cross_entropy_with_logits, one_hot
 from torchvision.ops import (
     box_iou,
     complete_box_iou,
@@ -151,10 +147,7 @@ def _background_confidence_loss(preds: Tensor, bce_func: Callable) -> Tensor:
 
 
 def _target_labels_to_probs(
-    targets: Tensor,
-    num_classes: int,
-    dtype: torch.dtype,
-    label_smoothing: float | None = None,
+    targets: Tensor, num_classes: int, dtype: torch.dtype, label_smoothing: float | None = None
 ) -> Tensor:
     """If ``targets`` is a vector of class labels, converts it to a matrix of one-hot class probabilities.
 
@@ -175,11 +168,13 @@ def _target_labels_to_probs(
 
     """
     if targets.ndim == 1:
+        if torch.is_floating_point(targets):
+            raise ValueError("Class-index targets must use an integer dtype.")
         # The data may contain a different number of classes than what the model predicts. In case a label is
         # greater than the number of predicted classes, it will be mapped to the last class.
         last_class = torch.tensor(num_classes - 1, device=targets.device)
         targets = torch.min(targets, last_class)
-        targets = one_hot(targets, num_classes)
+        targets = one_hot(targets.to(dtype=torch.int64), num_classes)  # one_hot() only supports int64 dtype.
     elif targets.shape[-1] != num_classes:
         raise ValueError(
             f"The number of classes in the data ({targets.shape[-1]}) doesn't match the number of classes "
@@ -278,10 +273,7 @@ class YOLOLoss:
 
         pred_probs = preds["classprobs"].unsqueeze(1)  # [N, 1, classes]
         target_probs = _target_labels_to_probs(
-            targets["labels"],
-            pred_probs.shape[-1],
-            pred_probs.dtype,
-            self.label_smoothing,
+            targets["labels"], pred_probs.shape[-1], pred_probs.dtype, self.label_smoothing
         )
         target_probs = target_probs.unsqueeze(0)  # [1, M, classes]
         pred_probs, target_probs = torch.broadcast_tensors(pred_probs, target_probs)

@@ -232,7 +232,7 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
     """
     num_preds, num_targets = ious.shape
 
-    matching_matrix = torch.zeros_like(costs, dtype=torch.bool, device=costs.device)
+    matching_matrix = torch.zeros_like(costs, dtype=torch.bool)
 
     if ious.numel() > 0:
         # For each target, define k as the sum of the 10 highest IoUs.
@@ -241,7 +241,7 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
         assert len(ks) == num_targets
 
         # For each target, select k predictions with the lowest cost.
-        for target_idx, (target_costs, k) in enumerate(zip(costs.T, ks)):
+        for target_idx, (target_costs, k) in enumerate(zip(costs.T, ks, strict=True)):
             pred_idx = torch.topk(target_costs, k, largest=False).indices
             matching_matrix[pred_idx, target_idx] = True
 
@@ -323,7 +323,8 @@ def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
     num_classes = pred_probs.shape[-1]
 
     if target_labels.ndim == 1:
-        assert target_labels.dtype == torch.int64
+        if torch.is_floating_point(target_labels):
+            raise ValueError("Class-index targets must use an integer dtype.")
 
         # The data may contain a different number of classes than what the model predicts. In case a label is
         # greater than the number of predicted classes, it will be mapped to the last class.
@@ -332,7 +333,9 @@ def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
         return pred_probs[:, target_labels]
 
     if target_labels.ndim == 2:
-        assert target_labels.dtype == torch.bool
+        if target_labels.dtype != torch.bool:
+            raise ValueError("Class-mask targets must use the bool dtype.")
+
         if target_labels.shape[-1] != num_classes:
             raise ValueError(
                 f"The number of classes in the data ({target_labels.shape[-1]}) doesn't match the number of classes "

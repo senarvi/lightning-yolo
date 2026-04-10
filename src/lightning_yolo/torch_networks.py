@@ -6,89 +6,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .layers import Conv, DetectionLayer, MaxPool, ReOrg, create_detection_layer
+from .layers import Conv, MaxPool, ReOrg, create_detection_layer
 from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS
 from .utils import get_image_size
-
-
-def run_detection(
-    detection_layer: DetectionLayer,
-    layer_input: Tensor,
-    targets: TARGETS | None,
-    image_size: Tensor,
-    detections: list[Tensor],
-    losses: list[Tensor],
-    hits: list[int],
-) -> None:
-    """Runs the detection layer on the inputs and appends the output to the ``detections`` list.
-
-    If ``targets`` is given, also calculates the losses and appends to the ``losses`` list.
-
-    Args:
-        detection_layer: The detection layer.
-        layer_input: Input to the detection layer.
-        targets: List of training targets for each image.
-        image_size: Width and height in a vector that defines the scale of the target coordinates.
-        detections: A list where a tensor containing the detections will be appended to.
-        losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
-        hits: A list where the number of targets that matched this layer will be appended to, if ``targets`` is given.
-
-    """
-    output, preds = detection_layer(layer_input, image_size)
-    detections.append(output)
-
-    if targets is not None:
-        layer_losses, layer_hits = detection_layer.calculate_losses(preds, targets, image_size)
-        losses.append(layer_losses)
-        hits.append(layer_hits)
-
-
-def run_detection_with_aux_head(
-    detection_layer: DetectionLayer,
-    aux_detection_layer: DetectionLayer,
-    layer_input: Tensor,
-    aux_input: Tensor,
-    targets: TARGETS | None,
-    image_size: Tensor,
-    aux_weight: float,
-    detections: list[Tensor],
-    losses: list[Tensor],
-    hits: list[int],
-) -> None:
-    """Runs the detection layer on the inputs and appends the output to the ``detections`` list.
-
-    If ``targets`` is given, also runs the auxiliary detection layer on the auxiliary inputs, calculates the losses, and
-    appends the losses to the ``losses`` list.
-
-    Args:
-        detection_layer: The lead detection layer.
-        aux_detection_layer: The auxiliary detection layer.
-        layer_input: Input to the lead detection layer.
-        aux_input: Input to the auxiliary detection layer.
-        targets: List of training targets for each image.
-        image_size: Width and height in a vector that defines the scale of the target coordinates.
-        aux_weight: Weight of the auxiliary loss.
-        detections: A list where a tensor containing the detections will be appended to.
-        losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
-        hits: A list where the number of targets that matched this layer will be appended to, if ``targets`` is given.
-
-    """
-    output, preds = detection_layer(layer_input, image_size)
-    detections.append(output)
-
-    if targets is not None:
-        # Match lead head predictions to targets and calculate losses from lead head outputs.
-        layer_losses, layer_hits = detection_layer.calculate_losses(preds, targets, image_size)
-        losses.append(layer_losses)
-        hits.append(layer_hits)
-
-        # Match lead head predictions to targets and calculate losses from auxiliary head outputs.
-        _, aux_preds = aux_detection_layer(aux_input, image_size)
-        layer_losses, layer_hits = aux_detection_layer.calculate_losses(
-            preds, targets, image_size, loss_preds=aux_preds
-        )
-        losses.append(layer_losses * aux_weight)
-        hits.append(layer_hits)
 
 
 class BottleneckBlock(nn.Module):
@@ -121,22 +41,8 @@ class BottleneckBlock(nn.Module):
             hidden_channels = out_channels
 
         self.convs = nn.Sequential(
-            Conv(
-                in_channels,
-                hidden_channels,
-                kernel_size=1,
-                stride=1,
-                activation=activation,
-                norm=norm,
-            ),
-            Conv(
-                hidden_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=norm,
-            ),
+            Conv(in_channels, hidden_channels, kernel_size=1, stride=1, activation=activation, norm=norm),
+            Conv(hidden_channels, out_channels, kernel_size=3, stride=1, activation=activation, norm=norm),
         )
         self.shortcut = shortcut and in_channels == out_channels
 
@@ -166,30 +72,9 @@ class TinyStage(nn.Module):
         super().__init__()
 
         hidden_channels = num_channels // 2
-        self.conv1 = Conv(
-            hidden_channels,
-            hidden_channels,
-            kernel_size=3,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
-        self.conv2 = Conv(
-            hidden_channels,
-            hidden_channels,
-            kernel_size=3,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
-        self.mix = Conv(
-            num_channels,
-            num_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.conv1 = Conv(hidden_channels, hidden_channels, kernel_size=3, stride=1, activation=activation, norm=norm)
+        self.conv2 = Conv(hidden_channels, hidden_channels, kernel_size=3, stride=1, activation=activation, norm=norm)
+        self.mix = Conv(num_channels, num_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         partial = torch.chunk(x, 2, dim=1)[1]
@@ -233,41 +118,14 @@ class CSPStage(nn.Module):
         # convolutions with N/2 output channels.
         hidden_channels = out_channels // 2
 
-        self.split1 = Conv(
-            in_channels,
-            hidden_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
-        self.split2 = Conv(
-            in_channels,
-            hidden_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.split1 = Conv(in_channels, hidden_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
+        self.split2 = Conv(in_channels, hidden_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
         bottlenecks: list[nn.Module] = [
-            BottleneckBlock(
-                hidden_channels,
-                hidden_channels,
-                shortcut=shortcut,
-                norm=norm,
-                activation=activation,
-            )
+            BottleneckBlock(hidden_channels, hidden_channels, shortcut=shortcut, norm=norm, activation=activation)
             for _ in range(depth)
         ]
         self.bottlenecks = nn.Sequential(*bottlenecks)
-        self.mix = Conv(
-            hidden_channels * 2,
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.mix = Conv(hidden_channels * 2, out_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
 
     def forward(self, x: Tensor) -> Tensor:
         y1 = self.bottlenecks(self.split1(x))
@@ -313,14 +171,7 @@ class ELANStage(nn.Module):
         super().__init__()
 
         def conv3x3(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=norm,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=1, activation=activation, norm=norm)
 
         def block(in_channels: int, out_channels: int) -> nn.Module:
             convs = [conv3x3(in_channels, out_channels)]
@@ -337,22 +188,8 @@ class ELANStage(nn.Module):
         if split_channels is None:
             split_channels = hidden_channels
 
-        self.split1 = Conv(
-            in_channels,
-            split_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
-        self.split2 = Conv(
-            in_channels,
-            split_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.split1 = Conv(in_channels, split_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
+        self.split2 = Conv(in_channels, split_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
 
         blocks = [block(split_channels, hidden_channels)]
         for _ in range(depth - 1):
@@ -360,14 +197,7 @@ class ELANStage(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
         total_channels = (split_channels * 2) + (hidden_channels * depth)
-        self.mix = Conv(
-            total_channels,
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.mix = Conv(total_channels, out_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
 
     def forward(self, x: Tensor) -> Tensor:
         outputs = [self.split1(x), self.split2(x)]
@@ -387,12 +217,12 @@ class C2fStage(nn.Module):
     Args:
         in_channels: Number of input channels that the C2f stage expects.
         out_channels: Number of output channels that the C2f stage produces.
-        hidden_channels: Number of output channels that bottleneck blocks produce. By default, half of
-            ``out_channels``.
+        hidden_channels: Number of output channels that the bottleneck blocks produce. The default value is half the
+            number of output channels of the stage.
         depth: Number of bottleneck blocks that the C2f stage contains.
         shortcut: Whether the bottleneck blocks should include a shortcut connection.
-        activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"),
-            "logistic", "linear", or "none".
+        activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
+            "linear", or "none".
         norm: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
 
     """
@@ -419,12 +249,7 @@ class C2fStage(nn.Module):
         ]
         self.bottlenecks = nn.ModuleList(bottlenecks)
         self.mix = Conv(
-            hidden_channels * (2 + depth),
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
+            hidden_channels * (2 + depth), out_channels, kernel_size=1, stride=1, activation=activation, norm=norm
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -458,14 +283,7 @@ class CSPSPP(nn.Module):
         super().__init__()
 
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=1,
-                activation=activation,
-                norm=norm,
-            )
+            return Conv(in_channels, out_channels, kernel_size=kernel_size, stride=1, activation=activation, norm=norm)
 
         self.conv1 = nn.Sequential(
             conv(in_channels, out_channels),
@@ -515,23 +333,9 @@ class FastSPP(nn.Module):
     ):
         super().__init__()
         hidden_channels = in_channels // 2
-        self.conv = Conv(
-            in_channels,
-            hidden_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.conv = Conv(in_channels, hidden_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
         self.maxpool = MaxPool(kernel_size=5, stride=1)
-        self.mix = Conv(
-            hidden_channels * 4,
-            out_channels,
-            kernel_size=1,
-            stride=1,
-            activation=activation,
-            norm=norm,
-        )
+        self.mix = Conv(hidden_channels * 4, out_channels, kernel_size=1, stride=1, activation=activation, norm=norm)
 
     def forward(self, x: Tensor) -> Tensor:
         y1 = self.conv(x)
@@ -564,23 +368,11 @@ class YOLOV4TinyBackbone(nn.Module):
         super().__init__()
 
         def smooth(num_channels: int) -> nn.Module:
-            return Conv(
-                num_channels,
-                num_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(num_channels, num_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
             conv_module = Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
+                in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization
             )
             return nn.Sequential(OrderedDict([("downsample", conv_module), ("smooth", smooth(out_channels))]))
 
@@ -601,14 +393,7 @@ class YOLOV4TinyBackbone(nn.Module):
             return nn.Sequential(OrderedDict([("downsample", downsample_module), ("stage", stage_module)]))
 
         stages = [
-            Conv(
-                in_channels,
-                width,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            ),
+            Conv(in_channels, width, kernel_size=3, stride=2, activation=activation, norm=normalization),
             stage(width * 2, False),
             stage(width * 4, True),
             stage(width * 8, True),
@@ -654,33 +439,14 @@ class YOLOV4Backbone(nn.Module):
             raise ValueError("Width and depth has to be given for an equal number of stages.")
 
         def conv3x3(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
         def stage(in_channels: int, out_channels: int, depth: int) -> nn.Module:
             csp = CSPStage(
-                out_channels,
-                out_channels,
-                depth=depth,
-                shortcut=True,
-                activation=activation,
-                norm=normalization,
+                out_channels, out_channels, depth=depth, shortcut=True, activation=activation, norm=normalization
             )
             return nn.Sequential(
                 OrderedDict(
@@ -695,7 +461,7 @@ class YOLOV4Backbone(nn.Module):
         self.stem = nn.Sequential(*convs)
         self.stages = nn.ModuleList(
             stage(in_channels, out_channels, depth)
-            for in_channels, out_channels, depth in zip(widths[:-1], widths[1:], depths[1:])
+            for in_channels, out_channels, depth in zip(widths[:-1], widths[1:], depths[1:], strict=True)
         )
 
     def forward(self, x: Tensor) -> list[Tensor]:
@@ -735,22 +501,12 @@ class YOLOV5Backbone(nn.Module):
 
         def downsample(in_channels: int, out_channels: int, kernel_size: int = 3) -> nn.Module:
             return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=2,
-                activation=activation,
-                norm=normalization,
+                in_channels, out_channels, kernel_size=kernel_size, stride=2, activation=activation, norm=normalization
             )
 
         def stage(in_channels: int, out_channels: int, depth: int) -> nn.Module:
             csp = CSPStage(
-                out_channels,
-                out_channels,
-                depth=depth,
-                shortcut=True,
-                activation=activation,
-                norm=normalization,
+                out_channels, out_channels, depth=depth, shortcut=True, activation=activation, norm=normalization
             )
             return nn.Sequential(
                 OrderedDict(
@@ -806,24 +562,10 @@ class YOLOV7Backbone(nn.Module):
         super().__init__()
 
         def conv3x3(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
         def stage(in_channels: int, out_channels: int) -> nn.Module:
             elan = ELANStage(
@@ -845,7 +587,7 @@ class YOLOV7Backbone(nn.Module):
 
         self.stem = nn.Sequential(*[ReOrg(), conv3x3(in_channels * 4, widths[0])])
         self.stages = nn.ModuleList(
-            stage(in_channels, out_channels) for in_channels, out_channels in zip(widths[:-1], widths[1:])
+            stage(in_channels, out_channels) for in_channels, out_channels in zip(widths[:-1], widths[1:], strict=True)
         )
 
     def forward(self, x: Tensor) -> list[Tensor]:
@@ -898,12 +640,7 @@ class YOLOV8Backbone(nn.Module):
 
         def stage(in_channels: int, out_channels: int, stage_depth: int) -> nn.Module:
             c2f = C2fStage(
-                out_channels,
-                out_channels,
-                depth=stage_depth,
-                shortcut=True,
-                activation=activation,
-                norm=normalization,
+                out_channels, out_channels, depth=stage_depth, shortcut=True, activation=activation, norm=normalization
             )
             return nn.Sequential(
                 OrderedDict(
@@ -933,6 +670,114 @@ class YOLOV8Backbone(nn.Module):
         return [c1, c2, c3, c4, c5]
 
 
+class DetectionStage(nn.Module):
+    """This is a convenience class for running a detection layer.
+
+    It might be cleaner to implement this as a function, but TorchScript allows only specific types in function
+    arguments, not modules.
+
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__()
+        self.detection_layer = create_detection_layer(**kwargs)
+
+    def forward(
+        self,
+        layer_input: Tensor,
+        targets: TARGETS | None,
+        image_size: Tensor,
+        detections: list[Tensor],
+        losses: list[Tensor],
+        hits: list[int],
+    ) -> None:
+        """Runs the detection layer on the inputs and appends the output to the ``detections`` list.
+
+        If ``targets`` is given, also calculates the losses and appends to the ``losses`` list.
+
+        Args:
+            layer_input: Input to the detection layer.
+            targets: List of training targets for each image.
+            image_size: Width and height in a vector that defines the scale of the target coordinates.
+            detections: A list where a tensor containing the detections will be appended to.
+            losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
+            hits: A list where the number of targets that matched this layer will be appended to, if ``targets`` is
+                given.
+
+        """
+        output, preds = self.detection_layer(layer_input, image_size)
+        detections.append(output)
+
+        if targets is not None:
+            layer_losses, layer_hits = self.detection_layer.calculate_losses(preds, targets, image_size)
+            losses.append(layer_losses)
+            hits.append(layer_hits)
+
+
+class DetectionStageWithAux(nn.Module):
+    """This class represents a combination of a lead and an auxiliary detection layer.
+
+    Args:
+        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
+            area centered at the target. This parameter specifies `N` for the lead head.
+        aux_spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
+            area centered at the target. This parameter specifies `N` for the auxiliary head.
+        aux_weight: Weight for the loss from the auxiliary head.
+
+    """
+
+    def __init__(
+        self, spatial_range: float = 5.0, aux_spatial_range: float = 3.0, aux_weight: float = 0.25, **kwargs: Any
+    ) -> None:
+        super().__init__()
+        self.detection_layer = create_detection_layer(spatial_range=spatial_range, **kwargs)
+        self.aux_detection_layer = create_detection_layer(spatial_range=aux_spatial_range, **kwargs)
+        self.aux_weight = aux_weight
+
+    def forward(
+        self,
+        layer_input: Tensor,
+        aux_input: Tensor,
+        targets: TARGETS | None,
+        image_size: Tensor,
+        detections: list[Tensor],
+        losses: list[Tensor],
+        hits: list[int],
+    ) -> None:
+        """Runs the detection layer and the auxiliary detection layer on their respective inputs and appends the outputs
+        to the ``detections`` list.
+
+        If ``targets`` is given, also calculates the losses and appends to the ``losses`` list.
+
+        Args:
+            layer_input: Input to the lead detection layer.
+            aux_input: Input to the auxiliary detection layer.
+            targets: List of training targets for each image.
+            image_size: Width and height in a vector that defines the scale of the target coordinates.
+            detections: A list where a tensor containing the detections will be appended to.
+            losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
+            hits: A list where the number of targets that matched this layer will be appended to, if ``targets`` is
+                given.
+
+        """
+        output, preds = self.detection_layer(layer_input, image_size)
+        detections.append(output)
+
+        if targets is not None:
+            # Match lead head predictions to targets and calculate losses from lead head outputs.
+            layer_losses, layer_hits = self.detection_layer.calculate_losses(preds, targets, image_size)
+            losses.append(layer_losses)
+            hits.append(layer_hits)
+
+            # Match lead head predictions to targets and calculate losses from auxiliary head outputs.
+            _, aux_preds = self.aux_detection_layer(aux_input, image_size)
+            layer_losses, layer_hits = self.aux_detection_layer.calculate_losses(
+                preds, targets, image_size, loss_preds=aux_preds
+            )
+            losses.append(layer_losses * self.aux_weight)
+            hits.append(layer_hits)
+
+
 class YOLOV4TinyNetwork(nn.Module):
     """The "tiny" network architecture from YOLOv4.
 
@@ -946,9 +791,9 @@ class YOLOV4TinyNetwork(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
+            resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1010,14 +855,7 @@ class YOLOV4TinyNetwork(nn.Module):
         num_outputs = (5 + num_classes) * anchors_per_cell
 
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size, stride=1, activation=activation, norm=normalization)
 
         def upsample(in_channels: int, out_channels: int) -> nn.Module:
             channels = conv(in_channels, out_channels)
@@ -1027,11 +865,11 @@ class YOLOV4TinyNetwork(nn.Module):
         def outputs(in_channels: int) -> nn.Module:
             return nn.Conv2d(in_channels, num_outputs, kernel_size=1, stride=1, bias=True)
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
+            return DetectionStage(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
@@ -1076,9 +914,9 @@ class YOLOV4TinyNetwork(nn.Module):
         x = torch.cat((self.upsample4(p4), c3), dim=1)
         p3 = self.fpn3(x)
 
-        run_detection(self.detect5, self.out5(p5), targets, image_size, detections, losses, hits)
-        run_detection(self.detect4, self.out4(p4), targets, image_size, detections, losses, hits)
-        run_detection(self.detect3, self.out3(p3), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(p5), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(p4), targets, image_size, detections, losses, hits)
+        self.detect3(self.out3(p3), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
@@ -1094,9 +932,9 @@ class YOLOV4Network(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
+            resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1161,14 +999,7 @@ class YOLOV4Network(nn.Module):
             return CSPSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def conv(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=1, stride=1, activation=activation, norm=normalization)
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
@@ -1181,14 +1012,7 @@ class YOLOV4Network(nn.Module):
             )
 
         def out(in_channels: int) -> nn.Module:
-            conv = Conv(
-                in_channels,
-                in_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            conv = Conv(in_channels, in_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
             return nn.Sequential(OrderedDict([("conv", conv), (f"outputs_{num_outputs}", outputs)]))
 
@@ -1198,20 +1022,13 @@ class YOLOV4Network(nn.Module):
             return nn.Sequential(OrderedDict([("channels", channels), ("upsample", upsample)]))
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
+            return DetectionStage(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
@@ -1269,9 +1086,9 @@ class YOLOV4Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        run_detection(self.detect3, self.out3(n3), targets, image_size, detections, losses, hits)
-        run_detection(self.detect4, self.out4(n4), targets, image_size, detections, losses, hits)
-        run_detection(self.detect5, self.out5(n5), targets, image_size, detections, losses, hits)
+        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
@@ -1287,9 +1104,9 @@ class YOLOV4P6Network(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
+            resolution. There should be `4N` pairs, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1361,14 +1178,7 @@ class YOLOV4P6Network(nn.Module):
             return CSPSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def conv(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=1, stride=1, activation=activation, norm=normalization)
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
@@ -1381,14 +1191,7 @@ class YOLOV4P6Network(nn.Module):
             )
 
         def out(in_channels: int) -> nn.Module:
-            conv = Conv(
-                in_channels,
-                in_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            conv = Conv(in_channels, in_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
             return nn.Sequential(OrderedDict([("conv", conv), (f"outputs_{num_outputs}", outputs)]))
 
@@ -1398,20 +1201,13 @@ class YOLOV4P6Network(nn.Module):
             return nn.Sequential(OrderedDict([("channels", channels), ("upsample", upsample)]))
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
+            return DetectionStage(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
@@ -1421,10 +1217,7 @@ class YOLOV4P6Network(nn.Module):
             self.backbone = backbone
         else:
             self.backbone = YOLOV4Backbone(
-                widths=widths,
-                depths=(1, 1, 3, 15, 15, 7, 7),
-                activation=activation,
-                normalization=normalization,
+                widths=widths, depths=(1, 1, 3, 15, 15, 7, 7), activation=activation, normalization=normalization
             )
 
         w3 = widths[-4]
@@ -1488,10 +1281,10 @@ class YOLOV4P6Network(nn.Module):
         x = torch.cat((self.downsample5(n5), c6), dim=1)
         n6 = self.pan6(x)
 
-        run_detection(self.detect3, self.out3(n3), targets, image_size, detections, losses, hits)
-        run_detection(self.detect4, self.out4(n4), targets, image_size, detections, losses, hits)
-        run_detection(self.detect5, self.out5(n5), targets, image_size, detections, losses, hits)
-        run_detection(self.detect6, self.out6(n6), targets, image_size, detections, losses, hits)
+        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
+        self.detect6(self.out6(n6), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
@@ -1512,9 +1305,9 @@ class YOLOV5Network(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
+            resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1580,24 +1373,10 @@ class YOLOV5Network(nn.Module):
             return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
         def conv(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=1, stride=1, activation=activation, norm=normalization)
 
         def out(in_channels: int) -> nn.Module:
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
@@ -1613,11 +1392,11 @@ class YOLOV5Network(nn.Module):
                 activation=activation,
             )
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
+            return DetectionStage(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
@@ -1677,9 +1456,9 @@ class YOLOV5Network(nn.Module):
         x = torch.cat((self.downsample4(n4), p5), dim=1)
         n5 = self.pan5(x)
 
-        run_detection(self.detect3, self.out3(n3), targets, image_size, detections, losses, hits)
-        run_detection(self.detect4, self.out4(n4), targets, image_size, detections, losses, hits)
-        run_detection(self.detect5, self.out5(n5), targets, image_size, detections, losses, hits)
+        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
@@ -1695,15 +1474,18 @@ class YOLOV7W6Network(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
-        aux_weight: Weight for the loss from the auxiliary heads.
+            resolution. There should be `4N` pairs, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
             that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
         matching_threshold: Threshold for "size" and "iou" matching algorithms.
+        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
+            area centered at the target. This parameter specifies `N` for the lead head.
+        aux_spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
+            area centered at the target. This parameter specifies `N` for the auxiliary head.
         size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
             no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
         ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the prior shape has IoU
@@ -1722,6 +1504,7 @@ class YOLOV7W6Network(nn.Module):
         class_loss_multiplier: Classification loss will be scaled by this value.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
             to produce coordinate values close to one.
+        aux_weight: Weight for the loss from the auxiliary heads.
 
     """
 
@@ -1733,12 +1516,9 @@ class YOLOV7W6Network(nn.Module):
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        aux_weight: float = 0.25,
         **kwargs: Any,
     ) -> None:
         super().__init__()
-
-        self.aux_weight = aux_weight
 
         # By default use the prior shapes that have been learned from the COCO data.
         if prior_shapes is None:
@@ -1771,14 +1551,7 @@ class YOLOV7W6Network(nn.Module):
             return CSPSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def conv(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=1, stride=1, activation=activation, norm=normalization)
 
         def elan(in_channels: int, out_channels: int) -> nn.Module:
             return ELANStage(
@@ -1793,12 +1566,7 @@ class YOLOV7W6Network(nn.Module):
 
         def out(in_channels: int, hidden_channels: int) -> nn.Module:
             conv = Conv(
-                in_channels,
-                hidden_channels,
-                kernel_size=3,
-                stride=1,
-                activation=activation,
-                norm=normalization,
+                in_channels, hidden_channels, kernel_size=3, stride=1, activation=activation, norm=normalization
             )
             outputs = nn.Conv2d(hidden_channels, num_outputs, kernel_size=1)
             return nn.Sequential(OrderedDict([("conv", conv), (f"outputs_{num_outputs}", outputs)]))
@@ -1809,21 +1577,13 @@ class YOLOV7W6Network(nn.Module):
             return nn.Sequential(OrderedDict([("channels", channels), ("upsample", upsample)]))
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
-        def detect(prior_shape_idxs: Sequence[int], range: float) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStageWithAux:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
-                spatial_range=range,
+            return DetectionStageWithAux(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
@@ -1833,11 +1593,7 @@ class YOLOV7W6Network(nn.Module):
             self.backbone = backbone
         else:
             self.backbone = YOLOV7Backbone(
-                widths=widths,
-                depth=2,
-                block_depth=2,
-                activation=activation,
-                normalization=normalization,
+                widths=widths, depth=2, block_depth=2, activation=activation, normalization=normalization
             )
 
         w3 = widths[-4]
@@ -1877,14 +1633,10 @@ class YOLOV7W6Network(nn.Module):
         self.out6 = out(w6 // 2, w6)
         self.aux_out6 = out(w6 // 2, w6 + (w6 // 4))
 
-        self.detect3 = detect(range(0, anchors_per_cell), 5.0)
-        self.aux_detect3 = detect(range(0, anchors_per_cell), 3.0)
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2), 5.0)
-        self.aux_detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2), 3.0)
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3), 5.0)
-        self.aux_detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3), 3.0)
-        self.detect6 = detect(range(anchors_per_cell * 3, anchors_per_cell * 4), 5.0)
-        self.aux_detect6 = detect(range(anchors_per_cell * 3, anchors_per_cell * 4), 3.0)
+        self.detect3 = detect(range(0, anchors_per_cell))
+        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
+        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
+        self.detect6 = detect(range(anchors_per_cell * 3, anchors_per_cell * 4))
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
@@ -1909,54 +1661,10 @@ class YOLOV7W6Network(nn.Module):
         x = torch.cat((self.downsample5(n5), c6), dim=1)
         n6 = self.pan6(x)
 
-        run_detection_with_aux_head(
-            self.detect3,
-            self.aux_detect3,
-            self.out3(n3),
-            self.aux_out3(n3),
-            targets,
-            image_size,
-            self.aux_weight,
-            detections,
-            losses,
-            hits,
-        )
-        run_detection_with_aux_head(
-            self.detect4,
-            self.aux_detect4,
-            self.out4(n4),
-            self.aux_out4(p4),
-            targets,
-            image_size,
-            self.aux_weight,
-            detections,
-            losses,
-            hits,
-        )
-        run_detection_with_aux_head(
-            self.detect5,
-            self.aux_detect5,
-            self.out5(n5),
-            self.aux_out5(p5),
-            targets,
-            image_size,
-            self.aux_weight,
-            detections,
-            losses,
-            hits,
-        )
-        run_detection_with_aux_head(
-            self.detect6,
-            self.aux_detect6,
-            self.out6(n6),
-            self.aux_out6(c6),
-            targets,
-            image_size,
-            self.aux_weight,
-            detections,
-            losses,
-            hits,
-        )
+        self.detect3(self.out3(n3), self.aux_out3(n3), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(n4), self.aux_out4(p4), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(n5), self.aux_out5(p5), targets, image_size, detections, losses, hits)
+        self.detect6(self.out6(n6), self.aux_out6(c6), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
@@ -1983,9 +1691,9 @@ class YOLOV8Network(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
+            resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -2053,14 +1761,7 @@ class YOLOV8Network(nn.Module):
             return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
         def out(in_channels: int) -> nn.Module:
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
@@ -2076,21 +1777,18 @@ class YOLOV8Network(nn.Module):
                 activation=activation,
             )
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
+            return DetectionStage(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
             )
 
         self.backbone = backbone or YOLOV8Backbone(
-            widths=widths,
-            depth=depth,
-            activation=activation,
-            normalization=normalization,
+            widths=widths, depth=depth, activation=activation, normalization=normalization
         )
 
         w3 = widths[-3]
@@ -2138,9 +1836,9 @@ class YOLOV8Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        run_detection(self.detect3, self.out3(n3), targets, image_size, detections, losses, hits)
-        run_detection(self.detect4, self.out4(n4), targets, image_size, detections, losses, hits)
-        run_detection(self.detect5, self.out5(n5), targets, image_size, detections, losses, hits)
+        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
@@ -2171,14 +1869,7 @@ class YOLOXHead(nn.Module):
         super().__init__()
 
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride=1,
-                activation=activation,
-                norm=norm,
-            )
+            return Conv(in_channels, out_channels, kernel_size, stride=1, activation=activation, norm=norm)
 
         def linear(in_channels: int, out_channels: int) -> nn.Module:
             return nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -2192,14 +1883,7 @@ class YOLOXHead(nn.Module):
         def classprob(num_channels: int) -> nn.Module:
             num_outputs = anchors_per_cell * num_classes
             outputs = linear(num_channels, num_outputs)
-            return nn.Sequential(
-                OrderedDict(
-                    [
-                        ("convs", features(num_channels)),
-                        (f"outputs_{num_outputs}", outputs),
-                    ]
-                )
-            )
+            return nn.Sequential(OrderedDict([("convs", features(num_channels)), (f"outputs_{num_outputs}", outputs)]))
 
         self.stem = conv(in_channels, hidden_channels)
         self.feat = features(hidden_channels)
@@ -2233,9 +1917,9 @@ class YOLOXNetwork(nn.Module):
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
-            are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
-            that you typically want to sort the shapes from the smallest to the largest.
+            resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
+            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
+            you typically want to sort the shapes from the smallest to the largest.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -2290,24 +1974,10 @@ class YOLOXNetwork(nn.Module):
             return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                stride=2,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
-            return Conv(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride=1,
-                activation=activation,
-                norm=normalization,
-            )
+            return Conv(in_channels, out_channels, kernel_size, stride=1, activation=activation, norm=normalization)
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
@@ -2329,11 +1999,11 @@ class YOLOXNetwork(nn.Module):
                 norm=normalization,
             )
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionLayer:
+        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
-            return create_detection_layer(
-                prior_shapes,
-                prior_shape_idxs,
+            return DetectionStage(
+                prior_shapes=prior_shapes,
+                prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 **kwargs,
@@ -2393,9 +2063,9 @@ class YOLOXNetwork(nn.Module):
         x = torch.cat((self.downsample4(n4), p5), dim=1)
         n5 = self.pan5(x)
 
-        run_detection(self.detect3, self.out3(n3), targets, image_size, detections, losses, hits)
-        run_detection(self.detect4, self.out4(n4), targets, image_size, detections, losses, hits)
-        run_detection(self.detect5, self.out5(n5), targets, image_size, detections, losses, hits)
+        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
         return detections, losses, hits
 
 
