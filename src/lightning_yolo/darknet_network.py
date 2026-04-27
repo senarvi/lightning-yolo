@@ -10,6 +10,7 @@ from lightning.pytorch.utilities import rank_zero_info
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from torch import Tensor, nn
 
+from .initialization import detection_classprob_bias, detection_confidence_bias, initialize_yolo_logits
 from .layers import (
     Conv,
     DetectionLayer,
@@ -100,6 +101,8 @@ class DarknetNetwork(nn.Module):
         if weights_path is not None:
             with open(weights_path) as weight_file:
                 self.load_weights(weight_file)
+        else:
+            _initialize_detection_logits(self)
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         outputs: list[Tensor] = []  # Outputs from all layers
@@ -420,7 +423,7 @@ def _create_upsample(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) ->
 
 def _create_yolo(
     config: DARKNET_CONFIG,
-    num_inputs: list[int],
+    num_inputs: list[int],  # noqa: ARG001
     num_classes: int | None = None,
     prior_shapes: PRIOR_SHAPES | None = None,
     matching_algorithm: str | None = None,
@@ -524,3 +527,23 @@ def _create_yolo(
         input_is_normalized=config.get("new_coords", 0) > 0,
     )
     return layer, 0
+
+
+def _initialize_detection_logits(network: DarknetNetwork) -> None:
+    """Initializes output convolutions that directly precede Darknet detection layers.
+
+    For Darknet configurations, detection heads are represented by a ``DetectionLayer`` and the preceding
+    convolutional layer. This helper initializes those preceding convolutions when no pretrained Darknet
+    weights are loaded.
+
+    Args:
+        network: Parsed Darknet network to initialize.
+
+    """
+    confidence_bias = detection_confidence_bias()
+    for idx, layer in enumerate(network.layers):
+        if isinstance(layer, DetectionLayer) and idx > 0:
+            previous_layer = network.layers[idx - 1]
+            if isinstance(previous_layer, Conv):
+                classprob_bias = detection_classprob_bias(layer.num_classes)
+                initialize_yolo_logits(previous_layer.conv, layer.num_classes, confidence_bias, classprob_bias)

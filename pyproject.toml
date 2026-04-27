@@ -46,16 +46,17 @@ exclude = [".git", "docs"]
 
 [tool.ruff.lint]
 select = [
-    "E", "W",  # https://pypi.org/project/pycodestyle
-    "F",  # https://pypi.org/project/pyflakes
-    "S",  # https://pypi.org/project/flake8-bandit
-    "RUF018",  # https://docs.astral.sh/ruff/rules/assignment-in-assert
-    "UP", # https://docs.astral.sh/ruff/rules/#pyupgrade-up
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ARG",  # flake8-unused-arguments
+    "SIM",  # flake8-simplify
 ]
 extend-select = [
-    "I",  # isort
-    "C4",  # https://pypi.org/project/flake8-comprehensions
-    "SIM",  # https://pypi.org/project/flake8-simplify
     "RET",  # https://pypi.org/project/flake8-return
     "PT",  # https://pypi.org/project/flake8-pytest-style
     "RUF100",  # https://docs.astral.sh/ruff/rules/unused-noqa/

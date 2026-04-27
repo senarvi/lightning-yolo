@@ -303,8 +303,8 @@ class Conv(nn.Module):
             self.pad = nn.Identity()
 
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
-        self.norm = create_normalization_module(norm, out_channels)
-        self.act = create_activation_module(activation)
+        self.norm = _create_normalization_module(norm, out_channels)
+        self.act = _create_activation_module(activation)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.pad(x)
@@ -390,7 +390,7 @@ class ReOrg(nn.Module):
         return torch.cat((tl, bl, tr, br), dim=1)
 
 
-def create_activation_module(name: str | None) -> nn.Module:
+def _create_activation_module(name: str | None) -> nn.Module:
     """Creates a layer activation module given its type as a string.
 
     Args:
@@ -413,7 +413,7 @@ def create_activation_module(name: str | None) -> nn.Module:
     raise ValueError(f"Activation type `{name}´ is unknown.")
 
 
-def create_normalization_module(name: str | None, num_channels: int) -> nn.Module:
+def _create_normalization_module(name: str | None, num_channels: int) -> nn.Module:
     """Creates a layer normalization module given its type as a string.
 
     Group normalization uses always 8 channels. The most common network widths are divisible by this number.

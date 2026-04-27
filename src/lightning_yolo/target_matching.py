@@ -44,7 +44,7 @@ class ShapeMatching(ABC):
         preds: PredictionDict,
         targets: TargetDict,
         image_size: Tensor,
-        input_is_normalized: bool = False,
+        input_is_normalized: bool = False,  # noqa: ARG002
     ) -> tuple[PredSelector, Tensor, Tensor]:
         """For each target, selects predictions from the same grid cell, where the center of the target box is.
 
@@ -521,8 +521,8 @@ class TALMatching:
 
     def __init__(
         self,
-        prior_shapes: PRIOR_SHAPES,
-        prior_shape_idxs: Sequence[int],
+        prior_shapes: PRIOR_SHAPES,  # noqa: ARG002
+        prior_shape_idxs: Sequence[int],  # noqa: ARG002
         topk: int = 10,
         alpha: float = 0.5,
         beta: float = 6.0,

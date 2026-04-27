@@ -3,9 +3,15 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, nn
 
+from .initialization import (
+    detection_classprob_bias,
+    detection_confidence_bias,
+    initialize_constant_bias,
+    initialize_yolo_logits,
+    initialize_zero_bias,
+)
 from .layers import Conv, MaxPool, ReOrg, create_detection_layer
 from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS
 from .utils import get_image_size
@@ -853,6 +859,8 @@ class YOLOV4TinyNetwork(nn.Module):
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
         num_outputs = (5 + num_classes) * anchors_per_cell
+        confidence_bias = detection_confidence_bias()
+        classprob_bias = detection_classprob_bias(num_classes)
 
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size, stride=1, activation=activation, norm=normalization)
@@ -863,7 +871,9 @@ class YOLOV4TinyNetwork(nn.Module):
             return nn.Sequential(OrderedDict([("channels", channels), ("upsample", upsample)]))
 
         def outputs(in_channels: int) -> nn.Module:
-            return nn.Conv2d(in_channels, num_outputs, kernel_size=1, stride=1, bias=True)
+            result = nn.Conv2d(in_channels, num_outputs, kernel_size=1, stride=1, bias=True)
+            initialize_yolo_logits(result, num_classes, confidence_bias, classprob_bias)
+            return result
 
         def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
             assert prior_shapes is not None
@@ -994,6 +1004,8 @@ class YOLOV4Network(nn.Module):
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
         num_outputs = (5 + num_classes) * anchors_per_cell
+        confidence_bias = detection_confidence_bias()
+        classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPSPP(in_channels, out_channels, activation=activation, norm=normalization)
@@ -1014,6 +1026,7 @@ class YOLOV4Network(nn.Module):
         def out(in_channels: int) -> nn.Module:
             conv = Conv(in_channels, in_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
+            initialize_yolo_logits(outputs, num_classes, confidence_bias, classprob_bias)
             return nn.Sequential(OrderedDict([("conv", conv), (f"outputs_{num_outputs}", outputs)]))
 
         def upsample(in_channels: int, out_channels: int) -> nn.Module:
@@ -1173,6 +1186,8 @@ class YOLOV4P6Network(nn.Module):
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 4.")
         num_outputs = (5 + num_classes) * anchors_per_cell
+        confidence_bias = detection_confidence_bias()
+        classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPSPP(in_channels, out_channels, activation=activation, norm=normalization)
@@ -1193,6 +1208,7 @@ class YOLOV4P6Network(nn.Module):
         def out(in_channels: int) -> nn.Module:
             conv = Conv(in_channels, in_channels, kernel_size=3, stride=1, activation=activation, norm=normalization)
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
+            initialize_yolo_logits(outputs, num_classes, confidence_bias, classprob_bias)
             return nn.Sequential(OrderedDict([("conv", conv), (f"outputs_{num_outputs}", outputs)]))
 
         def upsample(in_channels: int, out_channels: int) -> nn.Module:
@@ -1368,6 +1384,8 @@ class YOLOV5Network(nn.Module):
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
         num_outputs = (5 + num_classes) * anchors_per_cell
+        confidence_bias = detection_confidence_bias()
+        classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
             return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
@@ -1380,6 +1398,7 @@ class YOLOV5Network(nn.Module):
 
         def out(in_channels: int) -> nn.Module:
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
+            initialize_yolo_logits(outputs, num_classes, confidence_bias, classprob_bias)
             return nn.Sequential(OrderedDict([(f"outputs_{num_outputs}", outputs)]))
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
@@ -1546,6 +1565,8 @@ class YOLOV7W6Network(nn.Module):
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 4.")
         num_outputs = (5 + num_classes) * anchors_per_cell
+        confidence_bias = detection_confidence_bias()
+        classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPSPP(in_channels, out_channels, activation=activation, norm=normalization)
@@ -1569,6 +1590,7 @@ class YOLOV7W6Network(nn.Module):
                 in_channels, hidden_channels, kernel_size=3, stride=1, activation=activation, norm=normalization
             )
             outputs = nn.Conv2d(hidden_channels, num_outputs, kernel_size=1)
+            initialize_yolo_logits(outputs, num_classes, confidence_bias, classprob_bias)
             return nn.Sequential(OrderedDict([("conv", conv), (f"outputs_{num_outputs}", outputs)]))
 
         def upsample(in_channels: int, out_channels: int) -> nn.Module:
@@ -1756,6 +1778,8 @@ class YOLOV8Network(nn.Module):
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
         num_outputs = (5 + num_classes) * anchors_per_cell
+        confidence_bias = detection_confidence_bias()
+        classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
             return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
@@ -1765,6 +1789,7 @@ class YOLOV8Network(nn.Module):
 
         def out(in_channels: int) -> nn.Module:
             outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
+            initialize_yolo_logits(outputs, num_classes, confidence_bias, classprob_bias)
             return nn.Sequential(OrderedDict([(f"outputs_{num_outputs}", outputs)]))
 
         def c2f(in_channels: int, out_channels: int) -> nn.Module:
@@ -1871,7 +1896,7 @@ class YOLOXHead(nn.Module):
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size, stride=1, activation=activation, norm=norm)
 
-        def linear(in_channels: int, out_channels: int) -> nn.Module:
+        def linear(in_channels: int, out_channels: int) -> nn.Conv2d:
             return nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
         def features(num_channels: int) -> nn.Module:
@@ -1880,9 +1905,10 @@ class YOLOXHead(nn.Module):
                 conv(num_channels, num_channels, kernel_size=3),
             )
 
-        def classprob(num_channels: int) -> nn.Module:
+        def classprob(num_channels: int) -> nn.Sequential:
             num_outputs = anchors_per_cell * num_classes
             outputs = linear(num_channels, num_outputs)
+            initialize_constant_bias(outputs, detection_classprob_bias(num_classes))
             return nn.Sequential(OrderedDict([("convs", features(num_channels)), (f"outputs_{num_outputs}", outputs)]))
 
         self.stem = conv(in_channels, hidden_channels)
@@ -1890,6 +1916,10 @@ class YOLOXHead(nn.Module):
         self.box = linear(hidden_channels, anchors_per_cell * 4)
         self.confidence = linear(hidden_channels, anchors_per_cell)
         self.classprob = classprob(hidden_channels)
+
+        confidence_bias = detection_confidence_bias()
+        initialize_zero_bias(self.box)
+        initialize_constant_bias(self.confidence, confidence_bias)
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.stem(x)

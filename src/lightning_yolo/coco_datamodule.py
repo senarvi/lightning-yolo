@@ -31,7 +31,7 @@ def collate_fn(batch: list[tuple[Tensor, TargetDict]]) -> BATCH:
         A tuple ``(images, targets)`` where both values are lists aligned by sample index.
 
     """
-    images, targets = zip(*batch)
+    images, targets = zip(*batch, strict=True)
     return list(images), list(targets)
 
 
@@ -161,13 +161,13 @@ class COCODetectionDataModule(LightningDataModule):
 
     def __init__(
         self,
-        data_dir: str | Path,
-        batch_size: int = 16,
-        num_workers: int = 8,
+        data_dir: str | Path,  # noqa: ARG002
+        batch_size: int = 16,  # noqa: ARG002
+        num_workers: int = 8,  # noqa: ARG002
         image_size: tuple[int, int] = (640, 640),
-        pin_memory: bool = True,
-        persistent_workers: bool = True,
-        include_crowd: bool = False,
+        pin_memory: bool = True,  # noqa: ARG002
+        persistent_workers: bool = True,  # noqa: ARG002
+        include_crowd: bool = False,  # noqa: ARG002
         train_transforms: TransformFn | None = None,
         val_transforms: TransformFn | None = None,
     ) -> None:
@@ -219,7 +219,7 @@ class COCODetectionDataModule(LightningDataModule):
 
             archive_path = data_dir / f"{name}.zip"
             if not archive_path.exists():
-                urlretrieve(url, archive_path)  # noqa: S310
+                urlretrieve(url, archive_path)
             with zipfile.ZipFile(archive_path, "r") as archive_file:
                 archive_file.extractall(data_dir)
 
