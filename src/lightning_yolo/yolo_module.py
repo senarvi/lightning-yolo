@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, override
 
 import torch
 import torch.nn as nn
@@ -157,9 +157,9 @@ class YOLO(LightningModule):
         confidence_loss_multiplier: float | None = None,
         class_loss_multiplier: float | None = None,
         xy_scale: float | None = None,
-        lr: float = 0.002,
-        warmup_epochs: int = 3,
-        weight_decay: float = 0.0005,
+        lr: float = 0.002,  # noqa: ARG002
+        warmup_epochs: int = 3,  # noqa: ARG002
+        weight_decay: float = 0.0005,  # noqa: ARG002
         confidence_threshold: float = 0.2,
         nms_threshold: float = 0.45,
         detections_per_image: int = 100,
@@ -235,6 +235,7 @@ class YOLO(LightningModule):
         self._val_map = MeanAveragePrecision(max_detection_thresholds=map_thresholds)
         self._test_map = MeanAveragePrecision(max_detection_thresholds=map_thresholds)
 
+    @override
     def forward(self, images: Tensor | IMAGES, targets: TARGETS | None = None) -> Tensor | tuple[Tensor, Tensor]:
         """Runs a forward pass through the network (all layers listed in ``self.network``), and if training targets are
         provided, computes the losses from the detection layers.
@@ -276,6 +277,7 @@ class YOLO(LightningModule):
         losses = torch.stack(losses).sum(0)
         return detections, losses
 
+    @override
     def configure_optimizers(
         self,
     ) -> tuple[list[optim.Optimizer], list[optim.lr_scheduler.LRScheduler]]:
@@ -321,6 +323,7 @@ class YOLO(LightningModule):
         )
         return [optimizer], [lr_scheduler]
 
+    @override
     def training_step(self, batch: BATCH, batch_idx: int) -> STEP_OUTPUT:
         """Computes the training loss.
 
@@ -343,6 +346,7 @@ class YOLO(LightningModule):
 
         return {"loss": losses.sum()}
 
+    @override
     def validation_step(self, batch: BATCH, batch_idx: int) -> STEP_OUTPUT | None:
         """Evaluates a batch of data from the validation set.
 
@@ -365,6 +369,7 @@ class YOLO(LightningModule):
         self._val_map.update(detections, targets)
         return None
 
+    @override
     def on_validation_epoch_end(self) -> None:
         # When continuing training from a checkpoint, it may happen that epoch_end is called without detections. In this
         # case the metrics cannot be computed.
@@ -380,6 +385,7 @@ class YOLO(LightningModule):
         self.log_dict(map_scores, sync_dist=True)
         self._val_map.reset()
 
+    @override
     def test_step(self, batch: BATCH, batch_idx: int) -> STEP_OUTPUT | None:
         """Evaluates a batch of data from the test set.
 
@@ -402,6 +408,7 @@ class YOLO(LightningModule):
         self._test_map.update(detections, targets)
         return None
 
+    @override
     def on_test_epoch_end(self) -> None:
         # When continuing training from a checkpoint, it may happen that epoch_end is called without detections. In this
         # case the metrics cannot be computed.
@@ -417,6 +424,7 @@ class YOLO(LightningModule):
         self.log_dict(map_scores, sync_dist=True)
         self._test_map.reset()
 
+    @override
     def predict_step(self, batch: BATCH, batch_idx: int, dataloader_idx: int = 0) -> list[dict[str, Tensor]]:
         """Feeds a batch of images to the network and returns the detected bounding boxes, confidence scores, and class
         labels.

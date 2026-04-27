@@ -1,15 +1,60 @@
 import warnings
 
+import numpy as np
 import pytest
+import torch
 import torch.nn as nn
 from lightning.pytorch.utilities.warnings import PossibleUserWarning
 
 from lightning_yolo.darknet_network import (
+    DarknetNetwork,
     _create_convolutional,
     _create_maxpool,
     _create_shortcut,
     _create_upsample,
 )
+from lightning_yolo.initialization import detection_classprob_bias, detection_confidence_bias
+
+
+def test_darknet_network(tmp_path) -> None:
+    config_path = tmp_path / "tiny.cfg"
+    config_path.write_text(
+        """
+[net]
+width=32
+height=32
+channels=3
+
+[convolutional]
+batch_normalize=0
+filters=7
+size=1
+stride=1
+pad=1
+activation=linear
+
+[yolo]
+mask=0
+anchors=10,10
+classes=2
+ignore_thresh=.7
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    weights_path = tmp_path / "tiny.conv"
+    with weights_path.open("wb") as weights_file:
+        np.array([0, 2, 5], dtype=np.int32).tofile(weights_file)
+        np.array([0], dtype=np.int64).tofile(weights_file)
+
+    network = DarknetNetwork(str(config_path), str(weights_path))
+    conv = network.layers[0].conv
+    assert conv.bias is not None
+    bias = conv.bias.view(1, 7)
+
+    torch.testing.assert_close(bias[:, :4], torch.zeros_like(bias[:, :4]))
+    torch.testing.assert_close(bias[:, 4], torch.full_like(bias[:, 4], detection_confidence_bias()))
+    torch.testing.assert_close(bias[:, 5:], torch.full_like(bias[:, 5:], detection_classprob_bias(2)))
 
 
 @pytest.mark.parametrize(

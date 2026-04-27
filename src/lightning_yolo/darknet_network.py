@@ -10,6 +10,7 @@ from lightning.pytorch.utilities import rank_zero_info
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from torch import Tensor, nn
 
+from .initialization import detection_classprob_bias, detection_confidence_bias, initialize_yolo_logits
 from .layers import (
     Conv,
     DetectionLayer,
@@ -97,8 +98,11 @@ class DarknetNetwork(nn.Module):
             self.layers.append(layer)
             num_inputs.append(num_outputs)
 
+        # Always initialize the output convolutions. Darknet weight files typically contain weights only for the layers
+        # up to the first detection layer and load_weights() leaves the rest of the layers unchanged.
+        _initialize_detection_logits(self)
         if weights_path is not None:
-            with open(weights_path) as weight_file:
+            with open(weights_path, "rb") as weight_file:
                 self.load_weights(weight_file)
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
@@ -158,6 +162,8 @@ class DarknetNetwork(nn.Module):
             np_array = np.fromfile(weight_file, count=tensor.numel(), dtype=np.float32)
             num_elements = np_array.size
             if num_elements > 0:
+                if num_elements < tensor.numel():
+                    raise EOFError("Darknet weight file ended in the middle of a tensor.")
                 source = torch.from_numpy(np_array).view_as(tensor)
                 with torch.no_grad():
                     tensor.copy_(source)
@@ -252,13 +258,22 @@ class DarknetNetwork(nn.Module):
         section = None
         sections = []
 
-        def convert(key: str, value: str) -> str | int | float | list[str | int | float]:
+        def parse_bool(value: str) -> bool:
+            if value == "1":
+                return True
+            if value == "0":
+                return False
+            raise ValueError(f"Invalid boolean value in Darknet configuration: {value}")
+
+        def convert(key: str, value: str) -> str | int | float | bool | list[str | int | float]:
             """Converts a value to the correct type based on key."""
             if key not in variable_types:
                 warn(f"Unknown YOLO configuration variable: {key}", stacklevel=2)
                 return value
             if key in list_variables:
                 return [variable_types[key](v) for v in value.split(",")]
+            if variable_types[key] is bool:
+                return parse_bool(value)
             return variable_types[key](value)
 
         for line in config_file:
@@ -420,7 +435,7 @@ def _create_upsample(config: DARKNET_CONFIG, num_inputs: list[int], **_: Any) ->
 
 def _create_yolo(
     config: DARKNET_CONFIG,
-    num_inputs: list[int],
+    num_inputs: list[int],  # noqa: ARG001
     num_classes: int | None = None,
     prior_shapes: PRIOR_SHAPES | None = None,
     matching_algorithm: str | None = None,
@@ -524,3 +539,19 @@ def _create_yolo(
         input_is_normalized=config.get("new_coords", 0) > 0,
     )
     return layer, 0
+
+
+def _initialize_detection_logits(network: DarknetNetwork) -> None:
+    """Initializes output convolutions that directly precede Darknet detection layers.
+
+    Args:
+        network: Parsed Darknet network to initialize.
+
+    """
+    confidence_bias = detection_confidence_bias()
+    for idx, layer in enumerate(network.layers):
+        if isinstance(layer, DetectionLayer) and idx > 0:
+            previous_layer = network.layers[idx - 1]
+            if isinstance(previous_layer, Conv):
+                classprob_bias = detection_classprob_bias(layer.num_classes)
+                initialize_yolo_logits(previous_layer.conv, layer.num_classes, confidence_bias, classprob_bias)
