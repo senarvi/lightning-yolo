@@ -68,6 +68,8 @@ uv run lightning-yolo fit \
 	--trainer.max_epochs 80
 ```
 
+The purpose of these examples is just to demonstrate the command-line interface. The hyperparameters have not been optimized and the data is augmented with just a few basic transforms. If you want good results, you should look into mosaic augmentation.
+
 ### Example 2: YOLOv8n
 
 This example trains a YOLOv8n model, starting from scratch.

@@ -29,13 +29,17 @@ def create_coco_data(data_dir: Path) -> tuple[Path, Path]:
                     {
                         "id": 1,
                         "image_id": 1,
-                        "category_id": 3,
+                        "category_id": 67,
                         "bbox": [1.0, 1.0, 2.0, 2.0],
                         "area": 4.0,
                         "iscrowd": 0,
                     }
                 ],
-                "categories": [{"id": 3, "name": "category-3"}],
+                "categories": [
+                    {"id": 65, "name": "bed"},
+                    {"id": 67, "name": "dining table"},
+                    {"id": 70, "name": "toilet"},
+                ],
             }
         ),
         encoding="utf-8",
@@ -46,19 +50,26 @@ def create_coco_data(data_dir: Path) -> tuple[Path, Path]:
 
 def test_convert_annotations() -> None:
     annotations = [
-        {"bbox": [10, 10, 20, 5], "category_id": 3, "iscrowd": 0},
-        {"bbox": [-5, -5, 8, 8], "category_id": 7, "iscrowd": 0},
-        {"bbox": [0, 0, 1, 1], "category_id": 99, "iscrowd": 1},
+        {"bbox": [10, 10, 20, 5], "category_id": 65, "iscrowd": 0},
+        {"bbox": [-5, -5, 8, 8], "category_id": 67, "iscrowd": 0},
+        {"bbox": [0, 0, 1, 1], "category_id": 70, "iscrowd": 1},
         {"bbox": [5, 5, 0, 10], "category_id": 8, "iscrowd": 0},
     ]
-    target = convert_annotations(annotations=annotations, width=20, height=20, include_crowd=False)
+    category_id_to_label = {8: 0, 65: 1, 67: 2, 70: 3}
+    target = convert_annotations(
+        annotations=annotations,
+        width=20,
+        height=20,
+        category_id_to_label=category_id_to_label,
+        include_crowd=False,
+    )
     expected_boxes = torch.tensor(
         [
             [10.0, 10.0, 20.0, 15.0],
             [0.0, 0.0, 3.0, 3.0],
         ]
     )
-    expected_labels = torch.tensor([2, 6])
+    expected_labels = torch.tensor([1, 2])
 
     torch.testing.assert_close(target["boxes"], expected_boxes)
     assert torch.equal(target["labels"], expected_labels)
@@ -100,7 +111,7 @@ def test_coco_detection_dataset(tmp_path: Path) -> None:
 
     assert image.shape == (3, 6, 10)
     torch.testing.assert_close(target["boxes"], torch.tensor([[7.0, 1.0, 9.0, 3.0]]))
-    assert torch.equal(target["labels"], torch.tensor([2]))
+    assert torch.equal(target["labels"], torch.tensor([1]))
 
 
 def test_coco_detection_datamodule(tmp_path: Path) -> None:

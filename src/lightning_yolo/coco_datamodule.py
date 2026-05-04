@@ -1,5 +1,5 @@
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
@@ -39,6 +39,7 @@ def convert_annotations(
     annotations: list[dict],
     width: int,
     height: int,
+    category_id_to_label: Mapping[int, int],
     include_crowd: bool = False,
 ) -> dict[str, Any]:
     """Convert COCO annotations into a target dictionary in Torchvision v2 transforms format.
@@ -47,12 +48,13 @@ def convert_annotations(
         annotations: Raw COCO annotations for one image.
         width: Image width in pixels.
         height: Image height in pixels.
+        category_id_to_label: Mapping from COCO category IDs to zero-based class labels.
         include_crowd: Whether annotations marked as crowd should be included.
 
     Returns:
         A dictionary containing:
         - ``boxes``: Tensor of shape ``(N, 4)`` in ``XYXY`` pixel coordinates.
-        - ``labels``: Tensor of shape ``(N,)`` with zero-based class ids (COCO category_id minus 1).
+        - ``labels``: Tensor of shape ``(N,)`` with zero-based class labels.
 
     """
     boxes: list[list[float]] = []
@@ -74,9 +76,7 @@ def convert_annotations(
         if x2 <= x1 or y2 <= y1:
             continue
 
-        label = int(annotation["category_id"]) - 1
-        assert label >= 0, f"Too small category ID {annotation['category_id']} in COCO annotations."
-        assert label < 80, f"Too large category ID {annotation['category_id']} in COCO annotations."
+        label = category_id_to_label[int(annotation["category_id"])]
 
         boxes.append([x1, y1, x2, y2])
         labels.append(label)
@@ -118,6 +118,7 @@ class COCODetectionDataset(CocoDetection):
         super().__init__(root=str(image_dir), annFile=str(ann_file), transforms=None)
         self.sample_transforms = transforms
         self.include_crowd = include_crowd
+        self.category_id_to_label = {category_id: label for label, category_id in enumerate(sorted(self.coco.cats))}
 
     def __getitem__(self, index: int) -> tuple[Tensor, TargetDict]:
         """Loads one sample and converts it to tensor-based detection targets.
@@ -132,7 +133,13 @@ class COCODetectionDataset(CocoDetection):
         image = self._load_image(self.ids[index])
         annotations = self._load_target(self.ids[index])
         width, height = image.size
-        target = convert_annotations(annotations, width=width, height=height, include_crowd=self.include_crowd)
+        target = convert_annotations(
+            annotations,
+            width=width,
+            height=height,
+            category_id_to_label=self.category_id_to_label,
+            include_crowd=self.include_crowd,
+        )
         image, target = self.sample_transforms(image, target)
 
         image_tensor = torch.as_tensor(image, dtype=torch.float32)
