@@ -131,7 +131,7 @@ class YOLO(LightningModule):
         warmup_epochs: Number of epochs for linear learning rate warmup.
         weight_decay: Weight decay for the convolutional layer weights.
         confidence_threshold: Postprocessing will remove bounding boxes whose confidence score is not higher than this
-            threshold.
+            threshold. Only applies during inference, not when calculating test metrics.
         nms_threshold: Non-maximum suppression will remove bounding boxes whose IoU with a higher confidence box is
             higher than this threshold, if the predicted categories are equal.
         detections_per_image: Keep at most this number of highest-confidence detections per image.
@@ -364,7 +364,8 @@ class YOLO(LightningModule):
         self.log("val/class_loss", losses[2], sync_dist=True, batch_size=len(images))
         self.log("val/total_loss", losses.sum(), sync_dist=True, batch_size=len(images))
 
-        detections = self.process_detections(detections)
+        # For computing the MAP metrics, we want to use a very low confidence threshold.
+        detections = self.process_detections(detections, 0.001)
         targets = self.process_targets(targets)
         self._val_map.update(detections, targets)
         return None
@@ -403,7 +404,8 @@ class YOLO(LightningModule):
         self.log("test/class_loss", losses[2], sync_dist=True)
         self.log("test/total_loss", losses.sum(), sync_dist=True)
 
-        detections = self.process_detections(detections)
+        # For computing the MAP metrics, we want to use a very low confidence threshold.
+        detections = self.process_detections(detections, 0.001)
         targets = self.process_targets(targets)
         self._test_map.update(detections, targets)
         return None
@@ -445,7 +447,7 @@ class YOLO(LightningModule):
         """
         images, _ = batch
         detections = self(images)
-        return self.process_detections(detections)
+        return self.process_detections(detections, self.hparams.confidence_threshold)  # type: ignore
 
     def infer(self, image: Tensor) -> dict[str, Tensor]:
         """Feeds an image to the network and returns the detected bounding boxes, confidence scores, and class labels.
@@ -468,14 +470,14 @@ class YOLO(LightningModule):
         self.eval()
 
         detections = self([image])
-        detections = self.process_detections(detections)
+        detections = self.process_detections(detections, self.hparams.confidence_threshold)  # type: ignore
         detections = detections[0]
 
         if was_training:
             self.train()
         return detections
 
-    def process_detections(self, preds: Tensor) -> list[dict[str, Tensor]]:
+    def process_detections(self, preds: Tensor, confidence_threshold: float) -> list[dict[str, Tensor]]:
         """Splits the detection tensor returned by a forward pass into a list of prediction dictionaries, and filters
         them based on confidence threshold, non-maximum suppression (NMS), and maximum number of predictions.
 
@@ -491,28 +493,25 @@ class YOLO(LightningModule):
 
         Args:
             preds: A tensor of detected bounding boxes and their attributes.
+            confidence_threshold: Remove bounding boxes whose confidence score is not higher than this threshold.
 
         Returns:
             Filtered detections. A list of prediction dictionaries, one for each image.
 
         """
 
-        def process(boxes: Tensor, confidences: Tensor, classprobs: Tensor) -> dict[str, Any]:
-            scores = classprobs * confidences[:, None]
+        def process(boxes: Tensor, confidences: Tensor, classprobs: Tensor) -> dict[str, Tensor]:
+            scores = classprobs * confidences[..., None]
 
             # Select predictions with high scores. If a prediction has a high score for more than one class, it will be
             # duplicated.
-            idxs, labels = (scores > self.confidence_threshold).nonzero().T
+            idxs, labels = (scores > confidence_threshold).nonzero().T
             boxes = boxes[idxs]
             scores = scores[idxs, labels]
 
             keep = batched_nms(boxes, scores, labels, self.nms_threshold)
             keep = keep[: self.detections_per_image]
-            return {
-                "boxes": boxes[keep],
-                "scores": scores[keep],
-                "labels": labels[keep],
-            }
+            return {"boxes": boxes[keep], "scores": scores[keep], "labels": labels[keep]}
 
         return [process(p[..., :4], p[..., 4], p[..., 5:]) for p in preds]
 

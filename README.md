@@ -49,7 +49,9 @@ A data module for the COCO object detection dataset is provided for demonstratio
 
 There's also a command line tool `lightning-yolo` that demonstrates training using Lightning CLI. It downloads the COCO dataset automatically.
 
-#### Train a Darnet architecture, starting from pretrained weights
+### Example 1: Darknet weights
+
+This example fine-tunes a YOLOv4-tiny model, loading the architecture and the pretrained weights from Darknet files.
 
 ```bash
 wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny-3l.cfg
@@ -66,7 +68,9 @@ uv run lightning-yolo fit \
 	--trainer.max_epochs 80
 ```
 
-#### Train a YOLOv8n model from scratch
+### Example 2: YOLOv8n
+
+This example trains a YOLOv8n model, starting from scratch.
 
 ```bash
 uv run lightning-yolo fit \
@@ -78,7 +82,15 @@ uv run lightning-yolo fit \
 	--trainer.max_epochs 200
 ```
 
-#### Display all available options
+### Configuration options
+
+You can provide training hyperparameters also in a YAML configuration file with `--config`. You can generate a configuration file that contains all the available parameters with `--print_config`.
+
+```bash
+uv run lightning-yolo fit --print_config >config.yaml
+```
+
+To display all the options:
 
 ```bash
 uv run lightning-yolo fit -h
