@@ -13,7 +13,7 @@ from .initialization import (
     initialize_zero_bias,
 )
 from .layers import Conv, MaxPool, ReOrg, create_detection_layer
-from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS
+from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS, DetectionLossRecord
 from .utils import get_image_size
 
 
@@ -694,8 +694,7 @@ class DetectionStage(nn.Module):
         targets: TARGETS | None,
         image_size: Tensor,
         detections: list[Tensor],
-        losses: list[Tensor],
-        hits: list[int],
+        losses: list[DetectionLossRecord],
     ) -> None:
         """Runs the detection layer on the inputs and appends the output to the ``detections`` list.
 
@@ -707,17 +706,13 @@ class DetectionStage(nn.Module):
             image_size: Width and height in a vector that defines the scale of the target coordinates.
             detections: A list where a tensor containing the detections will be appended to.
             losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
-            hits: A list where the number of targets that matched this layer will be appended to, if ``targets`` is
-                given.
 
         """
         output, preds = self.detection_layer(layer_input, image_size)
         detections.append(output)
 
         if targets is not None:
-            layer_losses, layer_hits = self.detection_layer.calculate_losses(preds, targets, image_size)
-            losses.append(layer_losses)
-            hits.append(layer_hits)
+            losses.append(self.detection_layer.calculate_losses(preds, targets, image_size))
 
 
 class DetectionStageWithAux(nn.Module):
@@ -747,8 +742,7 @@ class DetectionStageWithAux(nn.Module):
         targets: TARGETS | None,
         image_size: Tensor,
         detections: list[Tensor],
-        losses: list[Tensor],
-        hits: list[int],
+        losses: list[DetectionLossRecord],
     ) -> None:
         """Runs the detection layer and the auxiliary detection layer on their respective inputs and appends the outputs
         to the ``detections`` list.
@@ -762,8 +756,6 @@ class DetectionStageWithAux(nn.Module):
             image_size: Width and height in a vector that defines the scale of the target coordinates.
             detections: A list where a tensor containing the detections will be appended to.
             losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
-            hits: A list where the number of targets that matched this layer will be appended to, if ``targets`` is
-                given.
 
         """
         output, preds = self.detection_layer(layer_input, image_size)
@@ -771,17 +763,12 @@ class DetectionStageWithAux(nn.Module):
 
         if targets is not None:
             # Match lead head predictions to targets and calculate losses from lead head outputs.
-            layer_losses, layer_hits = self.detection_layer.calculate_losses(preds, targets, image_size)
-            losses.append(layer_losses)
-            hits.append(layer_hits)
+            losses.append(self.detection_layer.calculate_losses(preds, targets, image_size))
 
             # Match lead head predictions to targets and calculate losses from auxiliary head outputs.
             _, aux_preds = self.aux_detection_layer(aux_input, image_size)
-            layer_losses, layer_hits = self.aux_detection_layer.calculate_losses(
-                preds, targets, image_size, loss_preds=aux_preds
-            )
-            losses.append(layer_losses * self.aux_weight)
-            hits.append(layer_hits)
+            layer_losses = self.aux_detection_layer.calculate_losses(preds, targets, image_size, loss_preds=aux_preds)
+            losses.append(layer_losses.scaled(self.aux_weight))
 
 
 class YOLOV4TinyNetwork(nn.Module):
@@ -911,8 +898,7 @@ class YOLOV4TinyNetwork(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -924,10 +910,10 @@ class YOLOV4TinyNetwork(nn.Module):
         x = torch.cat((self.upsample4(p4), c3), dim=1)
         p3 = self.fpn3(x)
 
-        self.detect5(self.out5(p5), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(p4), targets, image_size, detections, losses, hits)
-        self.detect3(self.out3(p3), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect5(self.out5(p5), targets, image_size, detections, losses)
+        self.detect4(self.out4(p4), targets, image_size, detections, losses)
+        self.detect3(self.out3(p3), targets, image_size, detections, losses)
+        return detections, losses
 
 
 class YOLOV4Network(nn.Module):
@@ -1082,8 +1068,7 @@ class YOLOV4Network(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -1099,10 +1084,10 @@ class YOLOV4Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect3(self.out3(n3), targets, image_size, detections, losses)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses)
+        return detections, losses
 
 
 class YOLOV4P6Network(nn.Module):
@@ -1276,8 +1261,7 @@ class YOLOV4P6Network(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -1297,11 +1281,11 @@ class YOLOV4P6Network(nn.Module):
         x = torch.cat((self.downsample5(n5), c6), dim=1)
         n6 = self.pan6(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
-        self.detect6(self.out6(n6), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect3(self.out3(n3), targets, image_size, detections, losses)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses)
+        self.detect6(self.out6(n6), targets, image_size, detections, losses)
+        return detections, losses
 
 
 class YOLOV5Network(nn.Module):
@@ -1456,8 +1440,7 @@ class YOLOV5Network(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -1475,10 +1458,10 @@ class YOLOV5Network(nn.Module):
         x = torch.cat((self.downsample4(n4), p5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect3(self.out3(n3), targets, image_size, detections, losses)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses)
+        return detections, losses
 
 
 class YOLOV7W6Network(nn.Module):
@@ -1662,8 +1645,7 @@ class YOLOV7W6Network(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -1683,11 +1665,11 @@ class YOLOV7W6Network(nn.Module):
         x = torch.cat((self.downsample5(n5), c6), dim=1)
         n6 = self.pan6(x)
 
-        self.detect3(self.out3(n3), self.aux_out3(n3), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(n4), self.aux_out4(p4), targets, image_size, detections, losses, hits)
-        self.detect5(self.out5(n5), self.aux_out5(p5), targets, image_size, detections, losses, hits)
-        self.detect6(self.out6(n6), self.aux_out6(c6), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect3(self.out3(n3), self.aux_out3(n3), targets, image_size, detections, losses)
+        self.detect4(self.out4(n4), self.aux_out4(p4), targets, image_size, detections, losses)
+        self.detect5(self.out5(n5), self.aux_out5(p5), targets, image_size, detections, losses)
+        self.detect6(self.out6(n6), self.aux_out6(c6), targets, image_size, detections, losses)
+        return detections, losses
 
 
 class YOLOV8Network(nn.Module):
@@ -1843,8 +1825,7 @@ class YOLOV8Network(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -1861,10 +1842,10 @@ class YOLOV8Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect3(self.out3(n3), targets, image_size, detections, losses)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses)
+        return detections, losses
 
 
 class YOLOXHead(nn.Module):
@@ -2074,8 +2055,7 @@ class YOLOXNetwork(nn.Module):
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -2093,10 +2073,10 @@ class YOLOXNetwork(nn.Module):
         x = torch.cat((self.downsample4(n4), p5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses, hits)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses, hits)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses, hits)
-        return detections, losses, hits
+        self.detect3(self.out3(n3), targets, image_size, detections, losses)
+        self.detect4(self.out4(n4), targets, image_size, detections, losses)
+        self.detect5(self.out5(n5), targets, image_size, detections, losses)
+        return detections, losses
 
 
 def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Module:

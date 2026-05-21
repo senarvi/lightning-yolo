@@ -34,11 +34,10 @@ def test_create_network(architecture):
 
     images = torch.rand(1, 3, 128, 128)
     with torch.no_grad():
-        detections, losses, hits = model(images, targets=None)
+        detections, losses = model(images, targets=None)
 
     assert len(detections) > 0
     assert losses == []
-    assert hits == []
 
     for output in detections:
         assert output.shape[0] == 1

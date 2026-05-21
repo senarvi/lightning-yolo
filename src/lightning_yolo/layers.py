@@ -19,6 +19,7 @@ from .types import (
     PREDICTIONS,
     PRIOR_SHAPES,
     TARGETS,
+    DetectionLossRecord,
     MatchedPredictionDict,
     MatchedTargetDict,
 )
@@ -99,11 +100,6 @@ class DetectionLayer(nn.Module):
         anchors, converts the center coordinates to corner coordinates, and maps probabilities to the `]0, 1[` range
         using sigmoid.
 
-        If targets are given, computes also losses from the predictions and the targets. This layer is responsible only
-        for the targets that best match one of the anchors assigned to this layer. Training losses will be saved to the
-        ``losses`` attribute. ``hits`` attribute will be set to the number of targets that this layer was responsible
-        for. ``losses`` is a tensor of three elements: the overlap, confidence, and classification loss.
-
         Args:
             x: The output from the previous layer. The size of this tensor has to be
                 ``[batch_size, anchors_per_cell * (num_classes + 5), height, width]``.
@@ -165,7 +161,7 @@ class DetectionLayer(nn.Module):
         return_preds: PREDICTIONS,
         targets: TARGETS,
         image_size: Tensor,
-    ) -> tuple[MatchedPredictionDict, MatchedTargetDict]:
+    ) -> tuple[MatchedPredictionDict, MatchedTargetDict, int | float]:
         """Matches the predictions to targets.
 
         Args:
@@ -178,29 +174,29 @@ class DetectionLayer(nn.Module):
             image_size: Width and height in a vector that defines the scale of the target coordinates.
 
         Returns:
-            Two dictionaries, the matched predictions and targets.
+            The matched predictions and targets, and the sum of assignment weights.
 
         """
         batch_size = len(preds)
         if (len(targets) != batch_size) or (len(return_preds) != batch_size):
             raise ValueError("Different batch size for predictions and targets.")
 
-        matches = []
+        matches: list[tuple[MatchedPredictionDict, MatchedTargetDict]] = []
+        assignment_weight_sums: list[int | float] = []
         for image_preds, image_return_preds, image_targets in zip(preds, return_preds, targets, strict=True):
             if image_targets["boxes"].shape[0] > 0:
-                pred_selector, background_selector, target_selector = self.matching_func(
-                    image_preds, image_targets, image_size, self.input_is_normalized
-                )
+                matching_result = self.matching_func(image_preds, image_targets, image_size, self.input_is_normalized)
                 matched_preds: MatchedPredictionDict = {
-                    "boxes": image_return_preds["boxes"][pred_selector],
-                    "confidences": image_return_preds["confidences"][pred_selector],
-                    "bg_confidences": image_return_preds["confidences"][background_selector],
-                    "classprobs": image_return_preds["classprobs"][pred_selector],
+                    "boxes": image_return_preds["boxes"][matching_result.pred_selector],
+                    "confidences": image_return_preds["confidences"][matching_result.pred_selector],
+                    "bg_confidences": image_return_preds["confidences"][matching_result.background_selector],
+                    "classprobs": image_return_preds["classprobs"][matching_result.pred_selector],
                 }
                 matched_targets: MatchedTargetDict = {
-                    "boxes": image_targets["boxes"][target_selector],
-                    "labels": image_targets["labels"][target_selector],
+                    "boxes": image_targets["boxes"][matching_result.target_selector],
+                    "labels": image_targets["labels"][matching_result.target_selector],
                 }
+                assignment_weight_sums.append(matching_result.assignment_weight_sum)
             else:
                 matched_preds = {
                     "boxes": torch.empty((0, 4), device=image_return_preds["boxes"].device),
@@ -215,6 +211,7 @@ class DetectionLayer(nn.Module):
                     "boxes": torch.empty((0, 4), device=image_targets["boxes"].device),
                     "labels": torch.empty(0, dtype=torch.int64, device=image_targets["labels"].device),
                 }
+                assignment_weight_sums.append(0)
             matches.append((matched_preds, matched_targets))
 
         matched_preds = {
@@ -227,7 +224,8 @@ class DetectionLayer(nn.Module):
             "boxes": torch.cat(tuple(m[1]["boxes"] for m in matches)),
             "labels": torch.cat(tuple(m[1]["labels"] for m in matches)),
         }
-        return matched_preds, matched_targets
+        assignment_weight_sum = sum(assignment_weight_sums)
+        return matched_preds, matched_targets, assignment_weight_sum
 
     def calculate_losses(
         self,
@@ -235,7 +233,7 @@ class DetectionLayer(nn.Module):
         targets: TARGETS,
         image_size: Tensor,
         loss_preds: PREDICTIONS | None = None,
-    ) -> tuple[Tensor, int]:
+    ) -> DetectionLossRecord:
         """Matches the predictions to targets and computes the losses.
 
         Args:
@@ -248,21 +246,26 @@ class DetectionLayer(nn.Module):
                 of the same predictions that were used for matching. This is needed for deep supervision in YOLOv7.
 
         Returns:
-            A vector of the overlap, confidence, and classification loss, normalized by batch size, and the number of
-            targets that were matched to this layer.
+            Loss sums and normalization counts for this layer.
 
         """
         if loss_preds is None:
             loss_preds = preds
 
-        matched_preds, matched_targets = self.match_targets(preds, loss_preds, targets, image_size)
+        matched_preds, matched_targets, assignment_weight_sum = self.match_targets(
+            preds, loss_preds, targets, image_size
+        )
 
         losses = self.loss_func.elementwise_sums(matched_preds, matched_targets, self.input_is_normalized, image_size)
-        losses = torch.stack((losses.overlap, losses.confidence, losses.classification)) / len(preds)
+        loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
 
-        hits = len(matched_targets["boxes"])
-
-        return losses, hits
+        matched_count = len(matched_targets["boxes"])
+        # Matchers may return a Python integer count or a Python floating-point soft assignment weight; create the
+        # normalizer tensor with the loss dtype so division preserves fractional TAL weights.
+        normalizers = torch.tensor(
+            (matched_count, assignment_weight_sum, matched_count), dtype=loss_sums.dtype, device=loss_sums.device
+        )
+        return DetectionLossRecord(loss_sums=loss_sums, normalizers=normalizers)
 
 
 class Conv(nn.Module):

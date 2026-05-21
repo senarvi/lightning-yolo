@@ -86,13 +86,14 @@ uv run lightning-yolo fit \
 
 ### Configuration options
 
-You can provide training hyperparameters also in a YAML configuration file with `--config`. You can generate a configuration file that contains all the available parameters with `--print_config`.
+You can provide training hyperparameters also in a YAML configuration file. Add `--print_config` to the command to print the full configuration in YAML. To read the configuration from a file, pass the `--config` argument.
 
 ```bash
 uv run lightning-yolo fit --print_config >config.yaml
+uv run lightning-yolo fit --config config.yaml
 ```
 
-To display all the options:
+To display all the available options, use `-h`.
 
 ```bash
 uv run lightning-yolo fit -h

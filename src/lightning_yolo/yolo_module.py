@@ -258,23 +258,15 @@ class YOLO(LightningModule):
         """
         self.validate_batch(images, targets)
         images_tensor = images if isinstance(images, Tensor) else torch.stack(images)
-        detections, losses, hits = self.network(images_tensor, targets)
+        detections, loss_records = self.network(images_tensor, targets)
 
         detections = torch.cat(detections, 1)
         if targets is None:
             return detections
 
-        total_hits = sum(hits)
-        for layer_idx, layer_hits in enumerate(hits):
-            hit_rate: Tensor | float = torch.true_divide(layer_hits, total_hits) if total_hits > 0 else 1.0
-            self.log(
-                f"layer_{layer_idx}_hit_rate",
-                hit_rate,
-                sync_dist=True,
-                batch_size=len(images),
-            )
-
-        losses = torch.stack(losses).sum(0)
+        loss_sums = torch.stack([record.loss_sums for record in loss_records]).sum(0)
+        normalizers = torch.stack([record.normalizers for record in loss_records]).sum(0)
+        losses = loss_sums / normalizers.clamp_min(1e-9)
         return detections, losses
 
     @override

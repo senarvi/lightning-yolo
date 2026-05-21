@@ -83,10 +83,11 @@ def test_tal_match() -> None:
             [True, True],
         ]
     )
-    pred_mask, target_selector = _tal_match(align_metric, ious, inside_selector, topk=1)
+    pred_mask, target_selector, assignment_weight_sum = _tal_match(align_metric, ious, inside_selector, topk=1)
 
     assert torch.equal(pred_mask, torch.tensor([True, True, False]))
     assert torch.equal(target_selector, torch.tensor([1, 0]))
+    assert assignment_weight_sum == pytest.approx(1.7)
 
 
 def test_probability_of_labels() -> None:
@@ -154,7 +155,7 @@ def test_sim_ota_matching() -> None:
         "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
         "labels": torch.tensor([0], dtype=torch.int64),
     }
-    pred_selector, background_mask, target_selector = matcher(
+    result = matcher(
         preds,
         targets,
         image_size=torch.tensor([2.0, 2.0]),
@@ -162,9 +163,10 @@ def test_sim_ota_matching() -> None:
     )
 
     # The only prediction matches the only target.
-    assert torch.equal(pred_selector, torch.tensor([[[True]]]))
-    assert torch.equal(background_mask, torch.tensor([[[False]]]))
-    assert torch.equal(target_selector, torch.tensor([0]))
+    assert torch.equal(result.pred_selector, torch.tensor([[[True]]]))
+    assert torch.equal(result.background_selector, torch.tensor([[[False]]]))
+    assert torch.equal(result.target_selector, torch.tensor([0]))
+    assert result.assignment_weight_sum == 1
 
 
 @pytest.mark.parametrize("input_is_normalized", [False, True])
@@ -191,7 +193,7 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
         "polygons": torch.empty((0, 8)),
     }
     image_size = torch.tensor([2.0, 1.0])
-    pred_selector, background_mask, target_selector = matcher(
+    result = matcher(
         preds,
         targets,
         image_size,
@@ -201,11 +203,12 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
     # The first prediction matches the first target and the second prediction matches the second target, because they
     # have the same IoU and the same probability of the target labels, but the first prediction has a smaller center
     # distance to the first target and the second prediction has a smaller center distance to the second target.
-    anchor_y, anchor_x, anchor_idx = pred_selector
+    anchor_y, anchor_x, anchor_idx = result.pred_selector
     assert torch.equal(anchor_y, torch.tensor([0, 0]))
     assert torch.equal(anchor_x, torch.tensor([0, 1]))
     assert torch.equal(anchor_idx, torch.tensor([0, 0]))
-    assert torch.equal(target_selector, torch.tensor([0, 1]))
-    assert background_mask.shape == torch.Size([1, 2, 1])
-    assert not background_mask[0, 0, 0]
-    assert not background_mask[0, 1, 0]
+    assert torch.equal(result.target_selector, torch.tensor([0, 1]))
+    assert result.assignment_weight_sum == 2.0
+    assert result.background_selector.shape == torch.Size([1, 2, 1])
+    assert not result.background_selector[0, 0, 0]
+    assert not result.background_selector[0, 1, 0]

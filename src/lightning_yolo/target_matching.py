@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -14,9 +15,20 @@ from .utils import aligned_iou, box_size_ratio, grid_centers, iou_below, is_insi
 # 2) a boolean mask tensor that can be used directly for indexing.
 PredSelector = tuple[Tensor, Tensor, Tensor] | Tensor
 
+
+@dataclass(frozen=True)
+class MatchingResult:
+    """Predictions and targets selected by a target matcher."""
+
+    pred_selector: PredSelector
+    background_selector: Tensor
+    target_selector: Tensor
+    assignment_weight_sum: int | float
+
+
 # A matching function takes predictions, targets, image size, and a boolean indicating whether the probabilities are
-# normalized, and returns a selector for the matched predictions, background mask, and the indices of matched targets.
-MatchingFn = Callable[[PredictionDict, TargetDict, Tensor, bool], tuple[PredSelector, Tensor, Tensor]]
+# normalized, and returns the matched predictions and targets.
+MatchingFn = Callable[[PredictionDict, TargetDict, Tensor, bool], MatchingResult]
 
 
 class ShapeMatching(ABC):
@@ -28,6 +40,9 @@ class ShapeMatching(ABC):
     the targets to each prior shape (regardless of the location where the target is). When the model includes multiple
     detection layers, different shapes are defined for each layer. Usually there are three detection layers and three
     prior shapes per layer.
+
+    The assignment weight sum returned by these hard-assignment matchers is the number of selected foreground anchors.
+    It is used as the confidence loss normalizer.
 
     Args:
         ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the prior shape has IoU
@@ -45,7 +60,7 @@ class ShapeMatching(ABC):
         targets: TargetDict,
         image_size: Tensor,
         input_is_normalized: bool = False,  # noqa: ARG002
-    ) -> tuple[PredSelector, Tensor, Tensor]:
+    ) -> MatchingResult:
         """For each target, selects predictions from the same grid cell, where the center of the target box is.
 
         Typically there are three predictions per grid cell. Subclasses implement ``match()``, which selects the
@@ -63,10 +78,8 @@ class ShapeMatching(ABC):
 
         """
         height, width = preds["boxes"].shape[:2]
-        device = preds["boxes"].device
-
         # A multiplier for scaling image coordinates to feature map coordinates
-        grid_size = torch.tensor([width, height], device=device)
+        grid_size = torch.tensor([width, height], device=preds["boxes"].device)
         image_to_grid = torch.true_divide(grid_size, image_size)
 
         # Bounding box center coordinates are converted to the feature map dimensions so that the whole number tells the
@@ -88,7 +101,10 @@ class ShapeMatching(ABC):
 
         pred_selector = (cell_j, cell_i, anchor_selector)
 
-        return pred_selector, background_mask, target_selector
+        # Shape-based matchers make hard assignments, so each matched foreground anchor contributes one normalizer unit.
+        assignment_weight_sum = cell_i.numel()
+
+        return MatchingResult(pred_selector, background_mask, target_selector, assignment_weight_sum)
 
     @abstractmethod
     def match(self, wh: Tensor) -> tuple[Tensor, Tensor] | Tensor:
@@ -242,7 +258,7 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
 
         # For each target, select k predictions with the lowest cost.
         for target_idx, (target_costs, k) in enumerate(zip(costs.T, ks, strict=True)):
-            pred_idx = torch.topk(target_costs, k, largest=False).indices
+            pred_idx = torch.topk(target_costs, int(k.item()), largest=False).indices
             matching_matrix[pred_idx, target_idx] = True
 
         # If there's more than one match for some prediction, match it with the best target. Now we consider all
@@ -258,7 +274,9 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
     return pred_mask, target_selector
 
 
-def _tal_match(align_metric: Tensor, ious: Tensor, inside_selector: Tensor, topk: int) -> tuple[Tensor, Tensor]:
+def _tal_match(
+    align_metric: Tensor, ious: Tensor, inside_selector: Tensor, topk: int, eps: float = 1e-9
+) -> tuple[Tensor, Tensor, float]:
     """Implements the TAL matching rule.
 
     For each target, this method considers only anchors whose center point is inside the target box, ranks them using
@@ -272,8 +290,9 @@ def _tal_match(align_metric: Tensor, ious: Tensor, inside_selector: Tensor, topk
         topk: Number of top-scoring anchors to select per target.
 
     Returns:
-        A mask of predictions that were matched, and the indices of the matched targets. The latter contains as many
-        elements as there are ``True`` values in the mask.
+        A mask of predictions that were matched, the indices of the matched targets, and the sum of normalized
+        assignment weights. There are as many indices in the second tensor as there are ``True`` values in the first
+        tensor.
 
     """
     matching_matrix = torch.zeros_like(ious, dtype=torch.bool, device=ious.device)
@@ -300,7 +319,14 @@ def _tal_match(align_metric: Tensor, ious: Tensor, inside_selector: Tensor, topk
     # For those predictions that were matched, get the index of the target.
     pred_mask = matching_matrix.sum(1) > 0
     target_selector = matching_matrix[pred_mask, :].int().argmax(1)
-    return pred_mask, target_selector
+
+    # Normalize each matched alignment score by the best matched alignment score for the same target, then scale it by
+    # that target's best matched IoU.
+    matched_align_metric = align_metric * matching_matrix
+    best_alignment_per_target = matched_align_metric.amax(dim=0, keepdim=True)
+    best_iou_per_target = (ious * matching_matrix).amax(dim=0, keepdim=True)
+    assignment_weights = (matched_align_metric * best_iou_per_target / (best_alignment_per_target + eps)).amax(dim=1)
+    return pred_mask, target_selector, float(assignment_weights.sum().item())
 
 
 def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
@@ -355,6 +381,9 @@ class SimOTAMatching:
 
     This is the matching rule used by YOLOX.
 
+    The assignment weight sum is the number of anchors selected by dynamic-k matching after conflict resolution, with
+    one unit per matched foreground anchor.
+
     Args:
         prior_shapes: A list of all the prior box dimensions. The list should contain (width, height) tuples in the
             network input resolution.
@@ -392,7 +421,7 @@ class SimOTAMatching:
         targets: TargetDict,
         image_size: Tensor,
         input_is_normalized: bool = False,
-    ) -> tuple[PredSelector, Tensor, Tensor]:
+    ) -> MatchingResult:
         """For each target, selects predictions using the SimOTA matching rule.
 
         Args:
@@ -420,6 +449,9 @@ class SimOTAMatching:
         costs += 100000.0 * ~anchor_inside_target
         pred_mask, target_selector = _sim_ota_match(costs, ious)
 
+        # SimOTA makes hard assignments, so each selected foreground anchor contributes one normalizer unit.
+        assignment_weight_sum = int(pred_mask.sum().item())
+
         # Replace True values with the results of the actual SimOTA matching.
         prior_mask[prior_mask.nonzero(as_tuple=True)] = pred_mask
 
@@ -429,7 +461,7 @@ class SimOTAMatching:
         background_mask = iou_below(preds["boxes"], targets["boxes"], self.ignore_bg_threshold)
         background_mask[prior_mask] = False
 
-        return prior_mask, background_mask, target_selector
+        return MatchingResult(prior_mask, background_mask, target_selector, assignment_weight_sum)
 
     def _get_prior_mask(
         self,
@@ -507,6 +539,8 @@ class TALMatching:
     task-aligned score. For each target, top-k anchors by alignment score are selected from anchors whose center point
     is inside the target box.
 
+    The assignment weight sum is the sum of normalized alignment scores for the matched foreground anchors.
+
     Args:
         prior_shapes: A list of all the prior box dimensions. Included for API compatibility with other matchers.
         prior_shape_idxs: List of indices to ``prior_shapes`` that this layer uses. Included for API compatibility.
@@ -527,11 +561,13 @@ class TALMatching:
         alpha: float = 0.5,
         beta: float = 6.0,
         ignore_bg_threshold: float = 0.7,
+        eps: float = 1e-9,
     ) -> None:
         self.topk = topk
         self.alpha = alpha
         self.beta = beta
         self.ignore_bg_threshold = ignore_bg_threshold
+        self.eps = eps
 
     def __call__(
         self,
@@ -539,7 +575,7 @@ class TALMatching:
         targets: TargetDict,
         image_size: Tensor,
         input_is_normalized: bool = False,
-    ) -> tuple[PredSelector, Tensor, Tensor]:
+    ) -> MatchingResult:
         """For each target, selects predictions using task-aligned matching.
 
         Args:
@@ -575,7 +611,9 @@ class TALMatching:
         ious = box_iou(pred_boxes, targets["boxes"])
         class_scores = _probability_of_labels(pred_probs, targets["labels"])
         align_metric = class_scores.pow(self.alpha) * ious.pow(self.beta)
-        pred_mask, target_selector = _tal_match(align_metric, ious, inside_selector, self.topk)
+        pred_mask, target_selector, assignment_weight_sum = _tal_match(
+            align_metric, ious, inside_selector, self.topk, self.eps
+        )
 
         # Add the anchor dimension to the mask and replace True values with the results of the actual TAL matching.
         flat_idx = pred_mask.nonzero().squeeze(-1)  # 0...(grid_cells * boxes_per_cell - 1)
@@ -592,4 +630,4 @@ class TALMatching:
 
         pred_selector = (anchor_y, anchor_x, anchor_idx)
 
-        return pred_selector, background_mask, target_selector
+        return MatchingResult(pred_selector, background_mask, target_selector, assignment_weight_sum)

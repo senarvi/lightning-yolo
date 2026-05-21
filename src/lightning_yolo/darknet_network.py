@@ -19,8 +19,7 @@ from .layers import (
     ShortcutLayer,
     create_detection_layer,
 )
-from .torch_networks import NETWORK_OUTPUT
-from .types import PRIOR_SHAPES, TARGETS
+from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS, DetectionLossRecord
 from .utils import get_image_size
 
 DARKNET_CONFIG = dict[str, Any]
@@ -108,8 +107,7 @@ class DarknetNetwork(nn.Module):
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         outputs: list[Tensor] = []  # Outputs from all layers
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[Tensor] = []  # Losses from detection layers
-        hits: list[int] = []  # Number of targets each detection layer was responsible for
+        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
         image_size = get_image_size(x)
 
@@ -120,15 +118,13 @@ class DarknetNetwork(nn.Module):
                 x, preds = layer(x, image_size)
                 detections.append(x)
                 if targets is not None:
-                    layer_losses, layer_hits = layer.calculate_losses(preds, targets, image_size)
-                    losses.append(layer_losses)
-                    hits.append(layer_hits)
+                    losses.append(layer.calculate_losses(preds, targets, image_size))
             else:
                 x = layer(x)
 
             outputs.append(x)
 
-        return detections, losses, hits
+        return detections, losses
 
     def load_weights(self, weight_file: io.IOBase) -> None:
         """Loads weights to layer modules from a pretrained Darknet model.
