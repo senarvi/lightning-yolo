@@ -97,6 +97,7 @@ class YOLO(LightningModule):
             values are "yolov4", "yolov4-tiny", "yolov4-p6", "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x",
             "yolov7-w6", "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolox-tiny", "yolox-s",
             "yolox-m", and "yolox-l".
+        num_channels: Number of input image channels.
         num_classes: Number of object classes.
         prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
             matching the targets to the anchors. The list should contain (width, height) tuples in the network input
@@ -143,6 +144,7 @@ class YOLO(LightningModule):
         darknet_config: str | None = None,
         darknet_weights: str | None = None,
         architecture: str | None = None,
+        num_channels: int = 3,
         num_classes: int | None = None,
         prior_shapes: PRIOR_SHAPES | None = None,
         matching_algorithm: str | None = None,
@@ -174,6 +176,7 @@ class YOLO(LightningModule):
             self.network: nn.Module = DarknetNetwork(
                 darknet_config,
                 darknet_weights,
+                in_channels=num_channels,
                 num_classes=num_classes,
                 prior_shapes=prior_shapes,
                 matching_algorithm=matching_algorithm,
@@ -212,6 +215,7 @@ class YOLO(LightningModule):
             self.network = create_network(
                 architecture=architecture,
                 num_classes=num_classes,
+                in_channels=num_channels,
                 prior_shapes=prior_shapes,
                 matching_algorithm=matching_algorithm,
                 matching_threshold=matching_threshold,

@@ -777,6 +777,7 @@ class YOLOV4TinyNetwork(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         width: The number of channels in the narrowest convolutional layer. The wider convolutional layers will use a
             number of channels that is a multiple of this value.
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
@@ -819,6 +820,7 @@ class YOLOV4TinyNetwork(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         width: int = 32,
         activation: str | None = "leaky",
         normalization: str | None = "batchnorm",
@@ -872,7 +874,12 @@ class YOLOV4TinyNetwork(nn.Module):
                 **kwargs,
             )
 
-        self.backbone = backbone or YOLOV4TinyBackbone(width=width, activation=activation, normalization=normalization)
+        self.backbone = backbone or YOLOV4TinyBackbone(
+            in_channels=in_channels,
+            width=width,
+            activation=activation,
+            normalization=normalization,
+        )
 
         self.fpn5 = conv(width * 16, width * 8)
         self.out5 = nn.Sequential(
@@ -922,6 +929,7 @@ class YOLOV4Network(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         widths: Number of channels at each network stage.
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
             "linear", or "none".
@@ -963,6 +971,7 @@ class YOLOV4Network(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         widths: Sequence[int] = (32, 64, 128, 256, 512, 1024),
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
@@ -1036,7 +1045,12 @@ class YOLOV4Network(nn.Module):
         if backbone is not None:
             self.backbone = backbone
         else:
-            self.backbone = YOLOV4Backbone(widths=widths, activation=activation, normalization=normalization)
+            self.backbone = YOLOV4Backbone(
+                in_channels=in_channels,
+                widths=widths,
+                activation=activation,
+                normalization=normalization,
+            )
 
         w3 = widths[-3]
         w4 = widths[-2]
@@ -1096,6 +1110,7 @@ class YOLOV4P6Network(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         widths: Number of channels at each network stage.
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
             "linear", or "none".
@@ -1137,6 +1152,7 @@ class YOLOV4P6Network(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         widths: Sequence[int] = (32, 64, 128, 256, 512, 1024, 1024),
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
@@ -1218,7 +1234,11 @@ class YOLOV4P6Network(nn.Module):
             self.backbone = backbone
         else:
             self.backbone = YOLOV4Backbone(
-                widths=widths, depths=(1, 1, 3, 15, 15, 7, 7), activation=activation, normalization=normalization
+                in_channels=in_channels,
+                widths=widths,
+                depths=(1, 1, 3, 15, 15, 7, 7),
+                activation=activation,
+                normalization=normalization,
             )
 
         w3 = widths[-4]
@@ -1295,6 +1315,7 @@ class YOLOV5Network(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         width: Number of channels in the narrowest convolutional layer. The wider convolutional layers will use a number
             of channels that is a multiple of this value. The values used by the different variants are 16 (yolov5n), 32
             (yolov5s), 48 (yolov5m), 64 (yolov5l), and 80 (yolov5x).
@@ -1340,6 +1361,7 @@ class YOLOV5Network(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         width: int = 64,
         depth: int = 3,
         activation: str | None = "silu",
@@ -1406,7 +1428,11 @@ class YOLOV5Network(nn.Module):
             )
 
         self.backbone = backbone or YOLOV5Backbone(
-            depth=depth, width=width, activation=activation, normalization=normalization
+            in_channels=in_channels,
+            depth=depth,
+            width=width,
+            activation=activation,
+            normalization=normalization,
         )
 
         self.spp = spp(width * 16, width * 16)
@@ -1470,6 +1496,7 @@ class YOLOV7W6Network(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         widths: Number of channels at each network stage.
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
             "linear", or "none".
@@ -1514,6 +1541,7 @@ class YOLOV7W6Network(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         widths: Sequence[int] = (64, 128, 256, 512, 768, 1024),
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
@@ -1598,7 +1626,12 @@ class YOLOV7W6Network(nn.Module):
             self.backbone = backbone
         else:
             self.backbone = YOLOV7Backbone(
-                widths=widths, depth=2, block_depth=2, activation=activation, normalization=normalization
+                in_channels=in_channels,
+                widths=widths,
+                depth=2,
+                block_depth=2,
+                activation=activation,
+                normalization=normalization,
             )
 
         w3 = widths[-4]
@@ -1687,6 +1720,7 @@ class YOLOV8Network(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         widths: Number of channels at each network stage.
         depth: Repeat the bottleneck layers this many times. Can be used to make the network deeper. The values used by
             the different variants are 1 (yolov8n, yolov8s), 2 (yolov8m), and 3 (yolov8l, yolov8x).
@@ -1729,6 +1763,7 @@ class YOLOV8Network(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         widths: Sequence[int] = (64, 128, 256, 512, 512),
         depth: int = 3,
         activation: str | None = "silu",
@@ -1795,7 +1830,11 @@ class YOLOV8Network(nn.Module):
             )
 
         self.backbone = backbone or YOLOV8Backbone(
-            widths=widths, depth=depth, activation=activation, normalization=normalization
+            in_channels=in_channels,
+            widths=widths,
+            depth=depth,
+            activation=activation,
+            normalization=normalization,
         )
 
         w3 = widths[-3]
@@ -1918,6 +1957,7 @@ class YOLOXNetwork(nn.Module):
     Args:
         num_classes: Number of different classes that this model predicts.
         backbone: A backbone network that returns the output from each stage.
+        in_channels: Number of channels in the input image, used when default-constructing the backbone.
         width: Number of channels in the narrowest convolutional layer. The wider convolutional layers will use a number
             of channels that is a multiple of this value. The values used by the different variants are 24 (yolox-tiny),
             32 (yolox-s), 48 (yolox-m), and 64 (yolox-l).
@@ -1963,6 +2003,7 @@ class YOLOXNetwork(nn.Module):
         self,
         num_classes: int,
         backbone: nn.Module | None = None,
+        in_channels: int = 3,
         width: int = 64,
         depth: int = 3,
         activation: str | None = "silu",
@@ -2021,7 +2062,11 @@ class YOLOXNetwork(nn.Module):
             )
 
         self.backbone = backbone or YOLOV5Backbone(
-            depth=depth, width=width, activation=activation, normalization=normalization
+            in_channels=in_channels,
+            depth=depth,
+            width=width,
+            activation=activation,
+            normalization=normalization,
         )
 
         self.spp = spp(width * 16, width * 16)

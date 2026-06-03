@@ -27,12 +27,13 @@ from lightning_yolo.torch_networks import create_network
         "yolox-l",
     ],
 )
-def test_create_network(architecture):
+@pytest.mark.parametrize("in_channels", [1, 3])
+def test_create_network(architecture, in_channels):
     num_classes = 2
-    model = create_network(architecture=architecture, num_classes=num_classes)
+    model = create_network(architecture=architecture, num_classes=num_classes, in_channels=in_channels)
     model.eval()
 
-    images = torch.rand(1, 3, 128, 128)
+    images = torch.rand(1, in_channels, 128, 128)
     with torch.no_grad():
         detections, losses = model(images, targets=None)
 

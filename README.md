@@ -59,16 +59,18 @@ wget https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4-tiny.co
 sed -i 's/iou_normalizer=.*/iou_normalizer=5.0/' yolov4-tiny-3l.cfg
 
 uv run lightning-yolo fit \
-	--model.darknet_config yolov4-tiny-3l.cfg \
-	--model.darknet_weights yolov4-tiny.conv.29 \
-	--model.num_classes 80 \
-	--data.data_dir data \
-	--data.batch_size 16 \
-    --trainer.accumulate_grad_batches 4 \
-	--trainer.max_epochs 80
+  --model.darknet_config yolov4-tiny-3l.cfg \
+  --model.darknet_weights yolov4-tiny.conv.29 \
+  --model.num_classes 80 \
+  --data.data_dir data \
+  --data.batch_size 64 \
+  --trainer.precision 16-mixed \
+  --trainer.accumulate_grad_batches 2 \
+  --trainer.gradient_clip_val 10.0 \
+  --trainer.max_epochs 20
 ```
 
-The purpose of these examples is just to demonstrate the command-line interface. The hyperparameters have not been optimized and the data is augmented with just a few basic transforms. If you want good results, you should look into mosaic augmentation.
+The purpose of these examples is just to demonstrate the command-line interface. The hyperparameters have not been optimized and the data is augmented with just a few basic transforms. The above command reaches validation mAP of 0.17. If you want good results, you should look into mosaic augmentation.
 
 ### Example 2: YOLOv8n
 
@@ -76,12 +78,14 @@ This example trains a YOLOv8n model, starting from scratch.
 
 ```bash
 uv run lightning-yolo fit \
-	--model.architecture yolov8n \
-	--model.num_classes 80 \
-	--model.matching_algorithm tal \
-	--data.data_dir data \
-	--data.batch_size 64 \
-	--trainer.max_epochs 200
+  --model.architecture yolov8n \
+  --model.num_classes 80 \
+  --model.matching_algorithm simota \
+  --data.data_dir data \
+  --data.batch_size 128 \
+  --trainer.precision 16-mixed \
+  --trainer.gradient_clip_val 10.0 \
+  --trainer.max_epochs 50
 ```
 
 ### Configuration options
