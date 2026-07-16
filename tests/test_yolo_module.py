@@ -1,6 +1,9 @@
 import onnx
+import pytest
 import torch
 from torch import nn
+from torch.optim import SGD
+from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
 from lightning_yolo.initialization import detection_classprob_bias
 from lightning_yolo.torch_networks import YOLOXHead
@@ -71,3 +74,35 @@ def test_yolox_bias_init() -> None:
         assert torch.allclose(head.box.bias, torch.zeros_like(head.box.bias))
         assert torch.all(head.confidence.bias < 0)
         assert torch.allclose(classprob_output.bias, torch.full_like(classprob_output.bias, classprob_bias))
+
+
+def test_yolo_get_optimizer() -> None:
+    module = YOLO(architecture="yolov8n", num_classes=2)
+
+    optimizer = module._get_optimizer()
+
+    assert isinstance(optimizer, SGD)
+    assert optimizer.defaults["momentum"] == 0.9
+    assert optimizer.defaults["nesterov"] is True
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.0, 0.0005]
+
+
+def test_yolo_get_lr_scheduler() -> None:
+    module = YOLO(architecture="yolov8n", num_classes=2)
+    optimizer = module._get_optimizer()
+    total_steps = 2000
+    total_epochs = 10
+
+    scheduler = module._get_lr_scheduler(optimizer, total_steps, total_epochs)
+
+    assert isinstance(scheduler, SequentialLR)
+    assert all(isinstance(stage, LinearLR) for stage in scheduler._schedulers)
+
+    base_lr = module.hparams["lr"]
+    warmup_steps = round(module.hparams["warmup_epochs"] * total_steps / total_epochs)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(base_lr / warmup_steps)
+
+    optimizer.step()
+    for _ in range(total_steps - 1):
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(base_lr * module.hparams["final_lr_multiplier"])

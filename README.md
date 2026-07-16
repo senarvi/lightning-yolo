@@ -49,7 +49,7 @@ A data module for the COCO object detection dataset is provided for demonstratio
 
 There's also a command line tool `lightning-yolo` that demonstrates training using Lightning CLI. It downloads the COCO dataset automatically.
 
-### Example 1: Darknet weights
+### Darknet fine-tuning example
 
 This example fine-tunes a YOLOv4-tiny model, loading the architecture and the pretrained weights from Darknet files.
 
@@ -70,38 +70,33 @@ uv run lightning-yolo fit \
   --trainer.max_epochs 20
 ```
 
-The purpose of these examples is just to demonstrate the command-line interface. The hyperparameters have not been optimized and the data is augmented with just a few basic transforms. The above command reaches validation mAP of 0.17. If you want good results, you should look into mosaic augmentation.
+### Configuration files
 
-### Example 2: YOLOv8n
+Training hyperparameters can be provided through Lightning YAML config files.
 
-This example trains a YOLOv8n model, starting from scratch.
-
-```bash
-uv run lightning-yolo fit \
-  --model.architecture yolov8n \
-  --model.num_classes 80 \
-  --model.matching_algorithm simota \
-  --data.data_dir data \
-  --data.batch_size 128 \
-  --trainer.precision 16-mixed \
-  --trainer.gradient_clip_val 10.0 \
-  --trainer.max_epochs 50
-```
-
-### Configuration options
-
-You can provide training hyperparameters also in a YAML configuration file. Add `--print_config` to the command to print the full configuration in YAML. To read the configuration from a file, pass the `--config` argument.
+You can also print the full default config and customize it:
 
 ```bash
 uv run lightning-yolo fit --print_config >config.yaml
 uv run lightning-yolo fit --config config.yaml
 ```
 
-To display all the available options, use `-h`.
+To list all available CLI options:
 
 ```bash
 uv run lightning-yolo fit -h
 ```
+
+### Example configurations
+
+Ready-to-run YOLOv8 examples are available in the [cfg directory](cfg). For example:
+
+```bash
+uv run lightning-yolo fit --config cfg/yolov8n.yaml
+```
+
+Metrics are written to `runs/<recipe>/csv/version_0/metrics.csv`, and checkpoints are written under
+`runs/<recipe>/checkpoints/`.
 
 ## Inference
 

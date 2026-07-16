@@ -1,24 +1,21 @@
 import zipfile
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import cast
 from urllib.request import urlretrieve
 
 import torch
-from lightning.pytorch import LightningDataModule
-from PIL import Image
+from lightning.pytorch import LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.utilities.rank_zero import rank_zero_warn
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torchvision import tv_tensors
 from torchvision.datasets import CocoDetection
 from torchvision.transforms import v2
 
+from .transforms import DetectionSample, LetterBox, MixUp, Mosaic
 from .types import BATCH, IMAGES, TARGETS, TargetDict
-
-TransformFn = Callable[
-    [Image.Image, dict[str, Tensor | tv_tensors.BoundingBoxes]],
-    tuple[Image.Image, dict[str, Tensor | tv_tensors.BoundingBoxes]],
-]
 
 
 def collate_fn(batch: list[tuple[Tensor, TargetDict]]) -> BATCH:
@@ -41,7 +38,7 @@ def convert_annotations(
     height: int,
     category_id_to_label: Mapping[int, int],
     include_crowd: bool = False,
-) -> dict[str, Any]:
+) -> TargetDict:
     """Convert COCO annotations into a target dictionary in Torchvision v2 transforms format.
 
     Args:
@@ -100,9 +97,12 @@ class COCODetectionDataset(CocoDetection):
     Args:
         image_dir: Directory containing image files.
         ann_file: Path to the COCO annotation JSON file.
-        transforms: Optional transform pipeline receiving ``(image, target)`` and returning transformed
-            ``(image, target)``.
+        image_size: Output image size as ``(height, width)``.
+        training: Whether to apply the fixed training augmentation pipeline.
         include_crowd: Whether to keep annotations marked as "crowd". These are boxes the contain multiple objects.
+        translate: Maximum affine translation as a fraction of image width and height.
+        scale: Maximum affine scale variation around one.
+        mixup: Probability of applying MixUp to a training sample.
 
     """
 
@@ -110,15 +110,55 @@ class COCODetectionDataset(CocoDetection):
         self,
         image_dir: Path,
         ann_file: Path,
-        transforms: TransformFn,
+        image_size: tuple[int, int],
+        training: bool,
         include_crowd: bool = False,
+        translate: float = 0.1,
+        scale: float = 0.9,
+        mixup: float = 0.1,
     ) -> None:
         # Keep VisionDataset transforms disabled. The transforms will be applied after converting raw COCO annotations
         # into the correct format.
         super().__init__(root=str(image_dir), annFile=str(ann_file), transforms=None)
-        self.sample_transforms = transforms
+        if not 0.0 <= translate <= 1.0:
+            raise ValueError("translate must be between zero and one.")
+        if not 0.0 <= scale < 1.0:
+            raise ValueError("scale must be at least zero and less than one.")
+        if not 0.0 <= mixup <= 1.0:
+            raise ValueError("mixup must be between zero and one.")
+        self.image_size = image_size
+        self.training = training
         self.include_crowd = include_crowd
+        self.mixup_p = mixup
+        self.mosaic_enabled = torch.tensor(True).share_memory_()
         self.category_id_to_label = {category_id: label for label, category_id in enumerate(sorted(self.coco.cats))}
+        self.mosaic = Mosaic(image_size=image_size, fill=114)
+        self.mixup = MixUp(alpha=32.0)
+        self.letterbox = LetterBox(image_size=image_size, fill=114)
+        self.random_affine = v2.RandomAffine(
+            degrees=0.0,
+            translate=(translate, translate),
+            scale=(1.0 - scale, 1.0 + scale),
+            shear=0.0,
+            interpolation=v2.InterpolationMode.BILINEAR,
+            fill=114,
+        )
+        self.train_transforms = v2.Compose(
+            [
+                v2.ColorJitter(brightness=0.4, saturation=0.7, hue=0.015),
+                v2.RandomHorizontalFlip(p=0.5),
+                v2.ClampBoundingBoxes(),
+                v2.SanitizeBoundingBoxes(min_size=2.0, min_area=4.0),
+                v2.ToDtype(torch.float32, scale=True),
+            ]
+        )
+        self.test_transforms = v2.Compose(
+            [
+                self.letterbox,
+                v2.SanitizeBoundingBoxes(),
+                v2.ToDtype(torch.float32, scale=True),
+            ]
+        )
 
     def __getitem__(self, index: int) -> tuple[Tensor, TargetDict]:
         """Loads one sample and converts it to tensor-based detection targets.
@@ -128,6 +168,31 @@ class COCODetectionDataset(CocoDetection):
 
         Returns:
             A tuple ``(image, target)`` where ``target`` contains ``boxes`` and ``labels`` tensors.
+
+        """
+        if self.training:
+            image, target = self._load_augmented_sample(index)
+            if bool(self.mosaic_enabled) and torch.rand(()) < self.mixup_p:
+                mixup_index = int(torch.randint(len(self), ()).item())
+                image, target = self.mixup([(image, target), self._load_augmented_sample(mixup_index)])
+            image, target = self.train_transforms(image, target)
+        else:
+            image, target = self._load_sample(index)
+            image, target = self.test_transforms(image, target)
+
+        image_tensor = torch.as_tensor(image, dtype=torch.float32)
+        boxes_tensor = torch.as_tensor(target["boxes"], dtype=torch.float32)
+        labels_tensor = torch.as_tensor(target["labels"], dtype=torch.int64)
+        return image_tensor, {"boxes": boxes_tensor, "labels": labels_tensor}
+
+    def _load_sample(self, index: int) -> DetectionSample:
+        """Load and pre-transform one sample without dataset-aware augmentation.
+
+        Args:
+            index: Zero-based sample index.
+
+        Returns:
+            Tensor image and converted detection target.
 
         """
         image = self._load_image(self.ids[index])
@@ -140,12 +205,34 @@ class COCODetectionDataset(CocoDetection):
             category_id_to_label=self.category_id_to_label,
             include_crowd=self.include_crowd,
         )
-        image, target = self.sample_transforms(image, target)
+        return cast(Tensor, v2.functional.to_image(image)), target
 
-        image_tensor = torch.as_tensor(image, dtype=torch.float32)
-        boxes_tensor = torch.as_tensor(target["boxes"], dtype=torch.float32)
-        labels_tensor = torch.as_tensor(target["labels"], dtype=torch.int64)
-        return image_tensor, {"boxes": boxes_tensor, "labels": labels_tensor}
+    def set_mosaic_enabled(self, enabled: bool) -> None:
+        """Enable or disable Mosaic and MixUp augmentation.
+
+        Args:
+            enabled: Whether dataset-aware mixing augmentations should be applied.
+
+        """
+        self.mosaic_enabled.fill_(enabled)
+
+    def _load_augmented_sample(self, index: int) -> DetectionSample:
+        """Load a four-image mosaic and apply random affine augmentation.
+
+        Args:
+            index: Index of the primary sample.
+
+        Returns:
+            Augmented image-target pair at the configured image size.
+
+        """
+        if bool(self.mosaic_enabled):
+            auxiliary_indices = torch.randint(len(self), (3,)).tolist()
+            samples = [self._load_sample(sample_index) for sample_index in [index, *auxiliary_indices]]
+            image, target = self.mosaic(samples)
+        else:
+            image, target = self.letterbox(*self._load_sample(index))
+        return self.random_affine(image, target)
 
 
 class COCODetectionDataModule(LightningDataModule):
@@ -159,8 +246,9 @@ class COCODetectionDataModule(LightningDataModule):
         pin_memory: Whether DataLoaders should pin memory.
         persistent_workers: Whether worker processes persist across epochs.
         include_crowd: Whether to include crowd annotations.
-        train_transforms: Optional custom transform pipeline for training.
-        val_transforms: Optional custom transform pipeline for validation/test.
+        translate: Maximum affine translation as a fraction of image width and height.
+        scale: Maximum affine scale variation around one.
+        mixup: Probability of applying MixUp to a training sample.
 
     """
 
@@ -175,34 +263,16 @@ class COCODetectionDataModule(LightningDataModule):
         data_dir: str | Path,  # noqa: ARG002
         batch_size: int = 16,  # noqa: ARG002
         num_workers: int = 8,  # noqa: ARG002
-        image_size: tuple[int, int] = (640, 640),
+        image_size: tuple[int, int] = (640, 640),  # noqa: ARG002
         pin_memory: bool = True,  # noqa: ARG002
         persistent_workers: bool = True,  # noqa: ARG002
         include_crowd: bool = False,  # noqa: ARG002
-        train_transforms: TransformFn | None = None,
-        val_transforms: TransformFn | None = None,
+        translate: float = 0.1,  # noqa: ARG002
+        scale: float = 0.9,  # noqa: ARG002
+        mixup: float = 0.1,  # noqa: ARG002
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
-
-        self.train_transforms = train_transforms or v2.Compose(
-            [
-                v2.ToImage(),
-                v2.RandomHorizontalFlip(p=0.5),
-                v2.RandomPhotometricDistort(p=0.8),
-                v2.Resize(size=image_size),
-                v2.SanitizeBoundingBoxes(),
-                v2.ToDtype(torch.float32, scale=True),
-            ]
-        )
-        self.test_transforms = val_transforms or v2.Compose(
-            [
-                v2.ToImage(),
-                v2.Resize(size=image_size),
-                v2.SanitizeBoundingBoxes(),
-                v2.ToDtype(torch.float32, scale=True),
-            ]
-        )
 
         self.train_dataset: COCODetectionDataset | None = None
         self.val_dataset: COCODetectionDataset | None = None
@@ -244,6 +314,7 @@ class COCODetectionDataModule(LightningDataModule):
         """
         data_dir = Path(self.hparams.data_dir)  # type: ignore[attr-defined]
         include_crowd = self.hparams.include_crowd  # type: ignore[attr-defined]
+        image_size = tuple(self.hparams.image_size)  # type: ignore[attr-defined]
 
         train_images = data_dir / "train2017"
         val_images = data_dir / "val2017"
@@ -254,13 +325,18 @@ class COCODetectionDataModule(LightningDataModule):
             self.train_dataset = COCODetectionDataset(
                 image_dir=train_images,
                 ann_file=train_ann,
-                transforms=self.train_transforms,
+                image_size=image_size,
+                training=True,
                 include_crowd=include_crowd,
+                translate=self.hparams.translate,  # type: ignore[attr-defined]
+                scale=self.hparams.scale,  # type: ignore[attr-defined]
+                mixup=self.hparams.mixup,  # type: ignore[attr-defined]
             )
             self.val_dataset = COCODetectionDataset(
                 image_dir=val_images,
                 ann_file=val_ann,
-                transforms=self.test_transforms,
+                image_size=image_size,
+                training=False,
                 include_crowd=include_crowd,
             )
 
@@ -268,7 +344,8 @@ class COCODetectionDataModule(LightningDataModule):
             self.val_dataset = COCODetectionDataset(
                 image_dir=val_images,
                 ann_file=val_ann,
-                transforms=self.test_transforms,
+                image_size=image_size,
+                training=False,
                 include_crowd=include_crowd,
             )
 
@@ -276,7 +353,8 @@ class COCODetectionDataModule(LightningDataModule):
             self.test_dataset = COCODetectionDataset(
                 image_dir=val_images,
                 ann_file=val_ann,
-                transforms=self.test_transforms,
+                image_size=image_size,
+                training=False,
                 include_crowd=include_crowd,
             )
 
@@ -339,3 +417,37 @@ class COCODetectionDataModule(LightningDataModule):
             persistent_workers=self.hparams.persistent_workers and self.hparams.num_workers > 0,  # type: ignore[attr-defined]
             collate_fn=collate_fn,
         )
+
+
+class CloseMosaic(Callback):
+    """Disable Mosaic and MixUp for the final training epochs.
+
+    Args:
+        epochs: Number of final epochs without Mosaic and MixUp. Zero keeps them enabled.
+
+    """
+
+    def __init__(self, epochs: int = 10) -> None:
+        if epochs < 0:
+            raise ValueError("epochs must be non-negative.")
+        self.epochs = epochs
+
+    def on_train_epoch_start(self, trainer: Trainer, _pl_module: LightningModule) -> None:
+        """Disable dataset-aware mixing augmentations for the configured final epochs.
+
+        Args:
+            trainer: Trainer running the current epoch.
+            _pl_module: Model being trained.
+
+        """
+        datamodule = getattr(trainer, "datamodule", None)
+        if (
+            isinstance(datamodule, COCODetectionDataModule)
+            and datamodule.train_dataset is not None
+            and trainer.max_epochs is not None
+        ):
+            if trainer.max_epochs == -1:
+                rank_zero_warn("CloseMosaic cannot disable Mosaic and MixUp when max_epochs=-1.", stacklevel=2)
+                return
+            mosaic_enabled = self.epochs == 0 or trainer.current_epoch < trainer.max_epochs - self.epochs
+            datamodule.train_dataset.set_mosaic_enabled(mosaic_enabled)

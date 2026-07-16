@@ -3,9 +3,10 @@ from typing import Any, override
 import torch
 import torch.nn as nn
 from lightning.pytorch import LightningModule
-from lightning.pytorch.utilities.types import STEP_OUTPUT
+from lightning.pytorch.callbacks import Callback, WeightAveraging
+from lightning.pytorch.utilities.types import STEP_OUTPUT, OptimizerLRScheduler
 from torch import Tensor, optim
-from torch.optim.optimizer import ParamsT as OptimizerParamsT
+from torch.optim.swa_utils import get_ema_multi_avg_fn
 from torchmetrics.detection import MeanAveragePrecision
 from torchvision.ops import batched_nms
 from torchvision.transforms import functional as T
@@ -130,7 +131,10 @@ class YOLO(LightningModule):
             to produce coordinate values close to one.
         lr: Learning rate after warmup.
         warmup_epochs: Number of epochs for linear learning rate warmup.
-        weight_decay: Weight decay for the convolutional layer weights.
+        final_lr_multiplier: Learning rate at the end of training as a fraction of ``lr``.
+        momentum: SGD momentum.
+        weight_decay: Weight decay for convolution weights.
+        ema_decay: Exponential moving average decay.
         confidence_threshold: Postprocessing will remove bounding boxes whose confidence score is not higher than this
             threshold. Only applies during inference, not when calculating test metrics.
         nms_threshold: Non-maximum suppression will remove bounding boxes whose IoU with a higher confidence box is
@@ -159,9 +163,12 @@ class YOLO(LightningModule):
         confidence_loss_multiplier: float | None = None,
         class_loss_multiplier: float | None = None,
         xy_scale: float | None = None,
-        lr: float = 0.002,  # noqa: ARG002
-        warmup_epochs: int = 3,  # noqa: ARG002
+        lr: float = 0.01,  # noqa: ARG002
+        warmup_epochs: float = 3.0,  # noqa: ARG002
+        final_lr_multiplier: float = 0.01,  # noqa: ARG002
+        momentum: float = 0.9,  # noqa: ARG002
         weight_decay: float = 0.0005,  # noqa: ARG002
+        ema_decay: float = 0.9999,  # noqa: ARG002
         confidence_threshold: float = 0.2,
         nms_threshold: float = 0.45,
         detections_per_image: int = 100,
@@ -274,50 +281,131 @@ class YOLO(LightningModule):
         return detections, losses
 
     @override
-    def configure_optimizers(
-        self,
-    ) -> tuple[list[optim.Optimizer], list[optim.lr_scheduler.LRScheduler]]:
-        """Constructs the optimizer and learning rate scheduler based on ``self.optimizer_params`` and
-        ``self.lr_scheduler_params``.
+    def configure_optimizers(self) -> OptimizerLRScheduler:
+        """Construct SGD parameter groups and a step-based warmup plus linear decay schedule.
 
-        If weight decay is specified, it will be applied only to convolutional layer weights, as they contain much more
-        parameters than the biases and batch normalization parameters. Regularizing all parameters could lead to
-        underfitting.
+        Returns:
+            Optimizer and scheduler configuration accepted by Lightning.
 
         """
-        if self.hparams.weight_decay != 0.0:  # type: ignore[attr-defined]
-            default_group = []
-            wd_group = []
-            for name, tensor in self.named_parameters():
-                if not tensor.requires_grad:
-                    continue
-                if name.endswith(".conv.weight"):
-                    wd_group.append(tensor)
-                else:
-                    default_group.append(tensor)
-            params: OptimizerParamsT = [
-                {"params": default_group, "weight_decay": 0.0},
-                {"params": wd_group, "weight_decay": self.hparams.weight_decay},  # type: ignore[attr-defined]
-            ]
-        else:
-            params = self.parameters()
+        optimizer = self._get_optimizer()
+        scheduler = self._get_lr_scheduler(
+            optimizer, int(self.trainer.estimated_stepping_batches), self.trainer.max_epochs
+        )
+        if scheduler is None:
+            return optimizer
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
 
-        optimizer = optim.AdamW(params, lr=self.hparams.lr)  # type: ignore[attr-defined]
+    def _get_optimizer(self) -> optim.Optimizer:
+        """Construct the SGD optimizer with weight decay applied only to convolution weights.
+
+        Returns:
+            SGD optimizer with Nesterov momentum whose convolution weights use weight decay.
+
+        """
+        convolution_weights, no_decay = self._get_parameter_groups()
+        momentum = float(self.hparams["momentum"])
+        optimizer = optim.SGD(
+            no_decay,
+            lr=float(self.hparams["lr"]),
+            momentum=momentum,
+            nesterov=momentum > 0.0,
+            weight_decay=0.0,
+        )
+        optimizer.add_param_group({"params": convolution_weights, "weight_decay": float(self.hparams["weight_decay"])})
+        return optimizer
+
+    def _get_lr_scheduler(
+        self, optimizer: optim.Optimizer, total_steps: int, total_epochs: int | None
+    ) -> optim.lr_scheduler.LRScheduler | None:
+        """Construct a step-based linear warmup plus linear decay scheduler.
+
+        Args:
+            optimizer: Optimizer whose learning rate is scheduled.
+            total_steps: Total number of optimizer steps over the whole training run.
+            total_epochs: Total number of training epochs, or ``None`` if unknown.
+
+        Returns:
+            Learning-rate scheduler stepped once per optimizer step, or ``None`` if the given
+            step and epoch counts are insufficient to construct one.
+
+        """
+        if total_steps <= 0 or total_epochs is None or total_epochs <= 0:
+            return None
+
+        warmup_epochs = float(self.hparams["warmup_epochs"])
+        warmup_steps = round(warmup_epochs * total_steps / total_epochs) if warmup_epochs > 0.0 else 0
+        warmup_steps = min(warmup_steps, total_steps)
+        decay_steps = total_steps - warmup_steps
+        final_lr_multiplier = float(self.hparams["final_lr_multiplier"])
+
+        if warmup_steps < 2:
+            return optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1.0,
+                end_factor=final_lr_multiplier,
+                total_iters=max(total_steps - 1, 1),
+            )
+
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             optimizer,
-            start_factor=0.1,
+            start_factor=1.0 / warmup_steps,
             end_factor=1.0,
-            total_iters=self.hparams.warmup_epochs,  # type: ignore[attr-defined]
+            total_iters=warmup_steps - 1,
         )
-        lr_scheduler = optim.lr_scheduler.SequentialLR(
+        if decay_steps <= 0:
+            return warmup_scheduler
+
+        decay_scheduler = optim.lr_scheduler.LinearLR(
             optimizer,
-            schedulers=[
-                warmup_scheduler,
-                optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95),
-            ],
-            milestones=[self.hparams.warmup_epochs],  # type: ignore[attr-defined]
+            start_factor=1.0,
+            end_factor=final_lr_multiplier,
+            total_iters=decay_steps,
         )
-        return [optimizer], [lr_scheduler]
+        return optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, decay_scheduler],
+            milestones=[warmup_steps - 1],
+        )
+
+    def _get_parameter_groups(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        """Group trainable parameters by weight-decay behavior.
+
+        Returns:
+            Convolution weights and all remaining parameters.
+
+        """
+        convolution_weights: list[nn.Parameter] = []
+        no_decay: list[nn.Parameter] = []
+
+        for module in self.modules():
+            for parameter_name, parameter in module.named_parameters(recurse=False):
+                if not parameter.requires_grad:
+                    continue
+                if isinstance(module, nn.Conv2d) and parameter_name == "weight":
+                    convolution_weights.append(parameter)
+                else:
+                    no_decay.append(parameter)
+
+        return convolution_weights, no_decay
+
+    @override
+    def configure_callbacks(self) -> list[Callback]:
+        """Configure exponential moving average weights for training and evaluation.
+
+        Returns:
+            The EMA callback.
+
+        """
+        return [
+            WeightAveraging(
+                use_buffers=True,
+                multi_avg_fn=get_ema_multi_avg_fn(decay=float(self.hparams["ema_decay"])),
+            )
+        ]
 
     @override
     def training_step(self, batch: BATCH, batch_idx: int) -> STEP_OUTPUT:
