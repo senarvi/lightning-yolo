@@ -10,4 +10,9 @@ __all__ = [
 
 
 def main() -> None:
-    LightningCLI(YOLO, COCODetectionDataModule, seed_everything_default=42)
+    LightningCLI(
+        YOLO,
+        COCODetectionDataModule,
+        seed_everything_default=42,
+        save_config_kwargs={"overwrite": True},
+    )
