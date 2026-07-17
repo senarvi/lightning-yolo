@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import cast
 from urllib.request import urlretrieve
 
+import numpy as np
 import torch
 from lightning.pytorch import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.callbacks import Callback
@@ -41,6 +42,9 @@ def convert_annotations(
 ) -> TargetDict:
     """Convert COCO annotations into a target dictionary in Torchvision v2 transforms format.
 
+    If a polygon segmentation is available, the box is derived from polygon extents, otherwise COCO ``bbox`` is used.
+    Duplicate ``(class, box)`` rows are removed.
+
     Args:
         annotations: Raw COCO annotations for one image.
         width: Image width in pixels.
@@ -56,6 +60,7 @@ def convert_annotations(
     """
     boxes: list[list[float]] = []
     labels: list[int] = []
+    seen_rows: set[tuple[int, float, float, float, float]] = set()
 
     for annotation in annotations:
         if not include_crowd and annotation.get("iscrowd", 0):
@@ -65,15 +70,34 @@ def convert_annotations(
         if w <= 0 or h <= 0:
             continue
 
-        x1 = max(0.0, min(float(width), float(x)))
-        y1 = max(0.0, min(float(height), float(y)))
-        x2 = max(0.0, min(float(width), float(x + w)))
-        y2 = max(0.0, min(float(height), float(y + h)))
+        x1, y1, x2, y2 = float(x), float(y), float(x + w), float(y + h)
+        segmentation = annotation.get("segmentation")
+        if isinstance(segmentation, list) and len(segmentation) > 0:
+            polygon_points: list[np.ndarray] = []
+            for segment in segmentation:
+                if not isinstance(segment, list) or len(segment) < 6:
+                    continue
+                points = np.asarray(segment, dtype=np.float32).reshape(-1, 2)
+                polygon_points.append(points)
+            if polygon_points:
+                merged_points = np.concatenate(polygon_points, axis=0)
+                x_values, y_values = merged_points.T
+                x1, y1 = float(x_values.min()), float(y_values.min())
+                x2, y2 = float(x_values.max()), float(y_values.max())
+
+        x1 = max(0.0, min(float(width), x1))
+        y1 = max(0.0, min(float(height), y1))
+        x2 = max(0.0, min(float(width), x2))
+        y2 = max(0.0, min(float(height), y2))
 
         if x2 <= x1 or y2 <= y1:
             continue
 
         label = category_id_to_label[int(annotation["category_id"])]
+        row = (label, x1, y1, x2, y2)
+        if row in seen_rows:
+            continue
+        seen_rows.add(row)
 
         boxes.append([x1, y1, x2, y2])
         labels.append(label)

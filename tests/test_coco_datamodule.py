@@ -59,6 +59,33 @@ def test_convert_annotations() -> None:
         {"bbox": [-5, -5, 8, 8], "category_id": 67, "iscrowd": 0},
         {"bbox": [0, 0, 1, 1], "category_id": 70, "iscrowd": 1},
         {"bbox": [5, 5, 0, 10], "category_id": 8, "iscrowd": 0},
+        {
+            "bbox": [0.0, 0.0, 10.0, 10.0],
+            "segmentation": [[2.0, 1.0, 9.0, 1.0, 9.0, 7.0, 2.0, 7.0]],
+            "category_id": 67,
+            "iscrowd": 0,
+        },
+        {
+            "bbox": [0.0, 0.0, 10.0, 10.0],
+            "segmentation": [[2.0, 1.0, 9.0, 1.0, 9.0, 7.0, 2.0, 7.0]],
+            "category_id": 67,
+            "iscrowd": 0,
+        },
+        {
+            "bbox": [0.0, 0.0, 10.0, 10.0],
+            "segmentation": [
+                [1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 1.0, 4.0],
+                [6.0, 5.0, 8.0, 5.0, 8.0, 9.0, 6.0, 9.0],
+            ],
+            "category_id": 65,
+            "iscrowd": 0,
+        },
+        {
+            "bbox": [4.0, 6.0, 3.0, 5.0],
+            "segmentation": [],
+            "category_id": 65,
+            "iscrowd": 0,
+        },
     ]
     category_id_to_label = {8: 0, 65: 1, 67: 2, 70: 3}
     target = convert_annotations(
@@ -72,9 +99,12 @@ def test_convert_annotations() -> None:
         [
             [10.0, 10.0, 20.0, 15.0],
             [0.0, 0.0, 3.0, 3.0],
+            [2.0, 1.0, 9.0, 7.0],
+            [1.0, 2.0, 8.0, 9.0],
+            [4.0, 6.0, 7.0, 11.0],
         ]
     )
-    expected_labels = torch.tensor([1, 2])
+    expected_labels = torch.tensor([1, 2, 2, 1, 1])
 
     torch.testing.assert_close(target["boxes"], expected_boxes)
     assert torch.equal(target["labels"], expected_labels)
