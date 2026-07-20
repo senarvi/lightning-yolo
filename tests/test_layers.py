@@ -10,10 +10,10 @@ from lightning_yolo.layers import (
     ShortcutLayer,
 )
 from lightning_yolo.loss import YOLOLoss
-from lightning_yolo.target_matching import HighestIoUMatching
+from lightning_yolo.target_matching import HighestIoUMatching, TALMatching
 
 
-def test_detection_layer_forward_shapes():
+def test_detection_layer_forward():
     prior_shapes = [(10, 12), (20, 24)]
     layer = DetectionLayer(
         num_classes=2,
@@ -30,6 +30,28 @@ def test_detection_layer_forward_shapes():
     assert preds[0]["boxes"].shape == (2, 2, 2, 4)
     assert preds[0]["confidences"].shape == (2, 2, 2)
     assert preds[0]["classprobs"].shape == (2, 2, 2, 2)
+    assert torch.isfinite(output).all()
+
+
+def test_detection_layer_forward_no_confidence():
+    prior_shapes = [(10, 12), (20, 24)]
+    layer = DetectionLayer(
+        num_classes=2,
+        prior_shapes=prior_shapes,
+        matching_func=TALMatching(prior_shapes, [0, 1]),
+        loss_func=YOLOLoss("ciou", predict_confidence=False),
+        predict_confidence=False,
+    )
+    # Confidence-free heads predict num_classes + 4 attributes per anchor (no objectness channel).
+    x = torch.randn(1, 2 * (2 + 4), 2, 2)
+    image_size = torch.tensor([64, 64])
+    output, preds = layer(x, image_size)
+
+    # The public output keeps the num_classes + 5 layout with a constant confidence of one.
+    assert output.shape == (1, 8, 7)
+    torch.testing.assert_close(output[..., 4], torch.ones_like(output[..., 4]))
+    assert preds[0]["classprobs"].shape == (2, 2, 2, 2)
+    assert torch.equal(preds[0]["confidences"], torch.ones_like(preds[0]["confidences"]))
     assert torch.isfinite(output).all()
 
 

@@ -7,7 +7,7 @@ from torch import Tensor
 from torchvision.ops import box_convert, box_iou
 
 from .loss import YOLOLoss
-from .types import PRIOR_SHAPES, PredictionDict, TargetDict
+from .types import PREDICTIONS, PRIOR_SHAPES, TARGETS, PredictionDict, TargetDict
 from .utils import aligned_iou, box_size_ratio, grid_centers, iou_below, is_inside_box
 
 # A selector for matched predictions. Matchers may return either:
@@ -26,9 +26,9 @@ class MatchingResult:
     assignment_weight_sum: int | float
 
 
-# A matching function takes predictions, targets, image size, and a boolean indicating whether the probabilities are
-# normalized, and returns the matched predictions and targets.
-MatchingFn = Callable[[PredictionDict, TargetDict, Tensor, bool], MatchingResult]
+# A matching function takes batched predictions and targets, image size, and a boolean indicating whether the
+# probabilities are normalized, and returns one matching result per image.
+MatchingFn = Callable[[PREDICTIONS, TARGETS, Tensor, bool], list[MatchingResult]]
 
 
 class ShapeMatching(ABC):
@@ -56,29 +56,35 @@ class ShapeMatching(ABC):
 
     def __call__(
         self,
-        preds: PredictionDict,
-        targets: TargetDict,
+        preds: PREDICTIONS,
+        targets: TARGETS,
         image_size: Tensor,
         input_is_normalized: bool = False,  # noqa: ARG002
-    ) -> MatchingResult:
+    ) -> list[MatchingResult]:
         """For each target, selects predictions from the same grid cell, where the center of the target box is.
 
         Typically there are three predictions per grid cell. Subclasses implement ``match()``, which selects the
         predictions within the grid cell.
 
         Args:
-            preds: Predictions for a single image.
-            targets: Training targets for a single image.
+            preds: Predictions for each image.
+            targets: Training targets for each image.
             image_size: Input image width and height.
             input_is_normalized: The predicted confidences and class probabilities have been normalized by logistic
                 activation. This is used by the Darknet configurations of Scaled-YOLOv4.
 
         Returns:
-            The indices of the matched predictions, background mask, and a mask for selecting the matched targets.
+            One matching result per image.
 
         """
+        return [
+            self._match_image(image_preds, image_targets, image_size)
+            for image_preds, image_targets in zip(preds, targets, strict=True)
+        ]
+
+    def _match_image(self, preds: PredictionDict, targets: TargetDict, image_size: Tensor) -> MatchingResult:
         height, width = preds["boxes"].shape[:2]
-        # A multiplier for scaling image coordinates to feature map coordinates
+        # This multiplier scales image coordinates to feature map coordinates.
         grid_size = torch.tensor([width, height], device=preds["boxes"].device)
         image_to_grid = torch.true_divide(grid_size, image_size)
 
@@ -145,7 +151,8 @@ class HighestIoUMatching(ShapeMatching):
     ) -> None:
         super().__init__(ignore_bg_threshold)
         self.prior_shapes = prior_shapes
-        # anchor_map maps the anchor indices to anchors in this layer, or to -1 if it's not an anchor of this layer.
+        # anchor_map maps each global anchor index to an anchor in this layer, or to -1 if the anchor belongs to a
+        # different layer.
         # This layer ignores the target if all the selected anchors are in another layer.
         self.anchor_map = [
             prior_shape_idxs.index(idx) if idx in prior_shape_idxs else -1 for idx in range(len(prior_shapes))
@@ -242,24 +249,21 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
         ious: A ``[predictions, targets]`` matrix of IoUs.
 
     Returns:
-        A mask of predictions that were matched, and the indices of the matched targets. The latter contains as many
-        elements as there are ``True`` values in the mask.
+        A mask of matched predictions and the target index selected for each matched prediction.
 
     """
-    num_preds, num_targets = ious.shape
-
+    num_preds, _num_targets = ious.shape
     matching_matrix = torch.zeros_like(costs, dtype=torch.bool)
 
     if ious.numel() > 0:
-        # For each target, define k as the sum of the 10 highest IoUs.
+        # For each target, k is the sum of the 10 highest IoUs.
         top10_iou = torch.topk(ious, min(10, num_preds), dim=0).values.sum(0)
         ks = torch.clip(top10_iou.int(), min=1)
-        assert len(ks) == num_targets
 
         # For each target, select k predictions with the lowest cost.
-        for target_idx, (target_costs, k) in enumerate(zip(costs.T, ks, strict=True)):
-            pred_idx = torch.topk(target_costs, int(k.item()), largest=False).indices
-            matching_matrix[pred_idx, target_idx] = True
+        sorted_preds = torch.argsort(costs, dim=0)
+        selected_ranks = torch.arange(num_preds, device=costs.device).unsqueeze(1) < ks.unsqueeze(0)
+        matching_matrix.scatter_(0, sorted_preds, selected_ranks)
 
         # If there's more than one match for some prediction, match it with the best target. Now we consider all
         # targets, regardless of whether they were originally matched with the prediction or not.
@@ -268,65 +272,81 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
         matching_matrix[more_than_one_match, :] = False
         matching_matrix[more_than_one_match, best_targets] = True
 
-    # For those predictions that were matched, get the index of the target.
+    # For each matched prediction, select the index of the assigned target.
     pred_mask = matching_matrix.sum(1) > 0
-    target_selector = matching_matrix[pred_mask, :].int().argmax(1)
+    target_selector = (
+        matching_matrix[pred_mask, :].int().argmax(1)
+        if matching_matrix.shape[1] > 0
+        else torch.empty(0, dtype=torch.int64, device=costs.device)
+    )
     return pred_mask, target_selector
 
 
 def _tal_match(
-    align_metric: Tensor, ious: Tensor, inside_selector: Tensor, topk: int, eps: float = 1e-9
-) -> tuple[Tensor, Tensor, float]:
+    align_metric: Tensor,
+    ious: Tensor,
+    inside_selector: Tensor,
+    target_mask: Tensor,
+    topk: int,
+    eps: float = 1e-9,
+) -> tuple[Tensor, Tensor, Tensor]:
     """Implements the TAL matching rule.
 
     For each target, this method considers only anchors whose center point is inside the target box, ranks them using
-    the TAL alignment score, and marks the ``topk`` highest-scoring anchors as matched. The ``k`` is a fixed parameter.
+    the TAL alignment score, and marks the ``topk`` highest-scoring anchors as matched. If an anchor is selected by
+    more than one target, it is assigned to the target with the highest IoU.
 
     Args:
-        align_metric: A ``[predictions, targets]`` matrix of TAL alignment scores.
-        ious: A ``[predictions, targets]`` matrix of IoUs.
-        inside_selector: A ``[predictions, targets]`` boolean matrix that indicates which anchor centers are inside
-            target boxes.
-        topk: Number of top-scoring anchors to select per target.
+        align_metric: ``[B, N, T_max]`` alignment scores.
+        ious: ``[B, N, T_max]`` IoU values.
+        inside_selector: ``[B, N, T_max]`` bool — True when an anchor centre is inside the target box.
+        target_mask: ``[B, T_max]`` bool — True for real targets, False for padding.
+        topk: Maximum number of anchors to select per target.
 
     Returns:
-        A mask of predictions that were matched, the indices of the matched targets, and the sum of normalized
-        assignment weights. There are as many indices in the second tensor as there are ``True`` values in the first
-        tensor.
+        pred_mask ``[B, N]``, target_selector ``[B, N]`` (meaningful only where pred_mask is True), and
+        assignment_weights ``[B, N]`` used for loss normalisation.
 
     """
-    matching_matrix = torch.zeros_like(ious, dtype=torch.bool, device=ious.device)
+    batch_size, num_preds, max_targets = align_metric.shape
+
+    # Anchors outside the target box and padded targets are excluded from top-k selection.
+    masked_metric = align_metric.clone()
+    masked_metric[~inside_selector] = -1.0
+    masked_metric[~target_mask[:, None, :].expand(batch_size, num_preds, max_targets)] = -1.0
 
     # For each target, select top-k anchors by the alignment metric among anchors that are inside the target box.
-    for target_idx in range(align_metric.shape[1]):
-        valid_mask = inside_selector[:, target_idx]
-        valid_indices = valid_mask.nonzero().squeeze(-1)
-        if valid_indices.numel() == 0:
-            continue
+    masked_t = masked_metric.permute(0, 2, 1)  # [B, T_max, N]
+    k = min(topk, num_preds)
+    _, topk_indices = torch.topk(masked_t, k=k, dim=2)  # [B, T_max, k]
 
-        target_scores = align_metric[valid_indices, target_idx]
-        k = min(topk, target_scores.numel())
-        topk_indices = torch.topk(target_scores, k=k, largest=True).indices
-        matching_matrix[valid_indices[topk_indices], target_idx] = True
+    valid = torch.gather(inside_selector.permute(0, 2, 1), 2, topk_indices)
 
-    # If there's more than one match for some prediction, match it with the best target. Now we consider all
-    # targets, regardless of whether they were originally matched with the prediction or not.
-    more_than_one_match = matching_matrix.sum(1) > 1
-    best_targets = ious[more_than_one_match, :].argmax(1)
-    matching_matrix[more_than_one_match, :] = False
-    matching_matrix[more_than_one_match, best_targets] = True
+    # Scatter topk selections back into the [B, N, T_max] matching matrix.
+    # topk_indices: [B, T_max, k] → transpose to [B, k, T_max] for scatter on dim 1.
+    idx = topk_indices.permute(0, 2, 1)  # [B, k, T_max]
+    val = valid.permute(0, 2, 1)  # [B, k, T_max]
+    matching_matrix = torch.zeros_like(align_metric, dtype=torch.bool)
+    matching_matrix.scatter_(1, idx, val)
+
+    # If there is more than one match for some prediction, match it with the target that has the highest IoU.
+    multiple = matching_matrix.sum(dim=2) > 1  # [B, N]
+    best_targets = ious.argmax(dim=2, keepdim=True)
+    best_matches = torch.zeros_like(matching_matrix).scatter_(2, best_targets, True)
+    matching_matrix = torch.where(multiple.unsqueeze(-1), best_matches, matching_matrix)
 
     # For those predictions that were matched, get the index of the target.
-    pred_mask = matching_matrix.sum(1) > 0
-    target_selector = matching_matrix[pred_mask, :].int().argmax(1)
+    pred_mask = matching_matrix.any(dim=2)  # [B, N]
+    target_selector = matching_matrix.int().argmax(dim=2)  # [B, N]
 
     # Normalize each matched alignment score by the best matched alignment score for the same target, then scale it by
     # that target's best matched IoU.
-    matched_align_metric = align_metric * matching_matrix
-    best_alignment_per_target = matched_align_metric.amax(dim=0, keepdim=True)
-    best_iou_per_target = (ious * matching_matrix).amax(dim=0, keepdim=True)
-    assignment_weights = (matched_align_metric * best_iou_per_target / (best_alignment_per_target + eps)).amax(dim=1)
-    return pred_mask, target_selector, float(assignment_weights.sum().item())
+    matched_metric = align_metric * matching_matrix.float()
+    best_align = matched_metric.amax(dim=1, keepdim=True).clamp(min=eps)  # [B, 1, T_max]
+    best_iou = (ious * matching_matrix.float()).amax(dim=1, keepdim=True)  # [B, 1, T_max]
+    assignment_weights = (matched_metric * best_iou / best_align).amax(dim=2)  # [B, N]
+
+    return pred_mask, target_selector, assignment_weights
 
 
 def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
@@ -417,25 +437,36 @@ class SimOTAMatching:
 
     def __call__(
         self,
-        preds: PredictionDict,
-        targets: TargetDict,
+        preds: PREDICTIONS,
+        targets: TARGETS,
         image_size: Tensor,
         input_is_normalized: bool = False,
-    ) -> MatchingResult:
+    ) -> list[MatchingResult]:
         """For each target, selects predictions using the SimOTA matching rule.
 
         Args:
-            preds: Predictions for a single image.
-            targets: Training targets for a single image.
+            preds: Predictions for each image.
+            targets: Training targets for each image.
             image_size: Input image width and height.
             input_is_normalized: The predicted confidences and class probabilities have been normalized by logistic
                 activation. This is used by the Darknet configurations of Scaled-YOLOv4.
 
         Returns:
-            A mask of predictions that were matched, background mask, and the indices of the matched targets. The last
-            tensor contains as many elements as there are ``True`` values in the first mask.
+            One matching result per image.
 
         """
+        return [
+            self._match_image(image_preds, image_targets, image_size, input_is_normalized)
+            for image_preds, image_targets in zip(preds, targets, strict=True)
+        ]
+
+    def _match_image(
+        self,
+        preds: PredictionDict,
+        targets: TargetDict,
+        image_size: Tensor,
+        input_is_normalized: bool,
+    ) -> MatchingResult:
         height, width, boxes_per_cell, _ = preds["boxes"].shape
         prior_mask, anchor_inside_target = self._get_prior_mask(targets, image_size, width, height, boxes_per_cell)
         prior_preds: PredictionDict = {
@@ -452,7 +483,7 @@ class SimOTAMatching:
         # SimOTA makes hard assignments, so each selected foreground anchor contributes one normalizer unit.
         assignment_weight_sum = int(pred_mask.sum().item())
 
-        # Replace True values with the results of the actual SimOTA matching.
+        # Replace the candidate-prior True values with the actual SimOTA matches.
         prior_mask[prior_mask.nonzero(as_tuple=True)] = pred_mask
 
         # Background mask is used to select anchors that are not responsible for predicting any object, for
@@ -489,11 +520,11 @@ class SimOTAMatching:
             those anchors.
 
         """
-        # A multiplier for scaling feature map coordinates to image coordinates
+        # This multiplier scales feature map coordinates to image coordinates.
         grid_size = torch.tensor([grid_width, grid_height], device=targets["boxes"].device)
         grid_to_image = torch.true_divide(image_size, grid_size)
 
-        # Get target center coordinates and dimensions.
+        # Convert target boxes to center coordinates and dimensions.
         xywh = box_convert(targets["boxes"], in_fmt="xyxy", out_fmt="cxcywh")
         xy = xywh[:, :2]
         wh = xywh[:, 2:]
@@ -571,63 +602,107 @@ class TALMatching:
 
     def __call__(
         self,
-        preds: PredictionDict,
-        targets: TargetDict,
+        preds: PREDICTIONS,
+        targets: TARGETS,
         image_size: Tensor,
         input_is_normalized: bool = False,
-    ) -> MatchingResult:
-        """For each target, selects predictions using task-aligned matching.
+    ) -> list[MatchingResult]:
+        """Selects predictions for a batch using task-aligned matching.
 
         Args:
-            preds: Predictions for a single image.
-            targets: Training targets for a single image.
+            preds: Predictions for each image.
+            targets: Training targets for each image.
             image_size: Input image width and height.
             input_is_normalized: The predicted confidences and class probabilities have been normalized by logistic
                 activation. This is used by the Darknet configurations of Scaled-YOLOv4.
 
         Returns:
-            The indices of the matched predictions, background mask, and the indices of matched targets.
+            One matching result per image.
 
         """
-        grid_height, grid_width, boxes_per_cell, _ = preds["boxes"].shape
-        num_classes = preds["classprobs"].shape[-1]
+        batch_size = len(preds)
+        device = preds[0]["boxes"].device
+        grid_height, grid_width, boxes_per_cell, _ = preds[0]["boxes"].shape
+        num_preds = grid_height * grid_width * boxes_per_cell
+        num_classes = preds[0]["classprobs"].shape[-1]
 
-        # A multiplier for scaling feature map coordinates to image coordinates
-        grid_size = torch.tensor([grid_width, grid_height], device=targets["boxes"].device)
+        # This multiplier scales feature map coordinates to image coordinates.
+        grid_size = torch.tensor([grid_width, grid_height], device=device)
         grid_to_image = torch.true_divide(image_size, grid_size)
 
-        # Flatten the predictions to [grid_cells * boxes_per_cell, ...].
-        pred_boxes = preds["boxes"].reshape(-1, 4)
-        pred_probs = preds["classprobs"] if input_is_normalized else preds["classprobs"].sigmoid()
-        pred_probs = pred_probs.reshape(-1, num_classes)
-
-        # Create a [grid_cells * boxes_per_cell, targets] tensor for selecting spatial locations that are inside target
-        # bounding boxes.
+        # Create the anchor centers in image coordinates. The centers are the same for all images in the batch.
         centers = grid_centers(grid_size).view(-1, 2) * grid_to_image  # [grid_cells, 2]
-        centers = centers[:, None, :].repeat(1, boxes_per_cell, 1).view(-1, 2)  # [grid_cells * boxes_per_cell, 2]
-        inside_selector = is_inside_box(centers, targets["boxes"])  # [grid_cells * boxes_per_cell, targets]
+        centers = centers[:, None, :].repeat(1, boxes_per_cell, 1).view(-1, 2)  # [num_preds, 2]
 
-        # Calculate the TAL alignment metric for anchors that are inside the target box and select the top-k anchors.
-        ious = box_iou(pred_boxes, targets["boxes"])
-        class_scores = _probability_of_labels(pred_probs, targets["labels"])
+        # Flatten the spatial and anchor dimensions, then stack predictions so that TAL can process the whole batch.
+        pred_boxes_batch = torch.stack([pred["boxes"].reshape(-1, 4) for pred in preds])
+        pred_probs_batch = torch.stack([pred["classprobs"].reshape(-1, num_classes) for pred in preds])
+        if not input_is_normalized:
+            pred_probs_batch = pred_probs_batch.sigmoid()
+
+        # Pad targets to the maximum target count in the batch.
+        target_counts = [target["boxes"].shape[0] for target in targets]
+        max_targets = max(max(target_counts, default=0), 1)
+        padded_boxes = pred_boxes_batch.new_zeros(batch_size, max_targets, 4)
+        target_mask = torch.zeros(batch_size, max_targets, dtype=torch.bool, device=device)
+        for image_idx, target in enumerate(targets):
+            num_targets = target["boxes"].shape[0]
+            padded_boxes[image_idx, :num_targets] = target["boxes"]
+            target_mask[image_idx, :num_targets] = True
+
+        # Create a [batch, predictions, targets] tensor that indicates which anchor centers are inside each target box.
+        # The centers and padded boxes are broadcast across the batch and prediction dimensions, respectively.
+        pts = centers[None, :, None, :]  # [1, N, 1, 2]
+        lt = pts[..., :2] - padded_boxes[:, None, :, :2]  # [B, N, T_max, 2]
+        rb = padded_boxes[:, None, :, 2:] - pts[..., :2]  # [B, N, T_max, 2]
+        inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0  # [B, N, T_max]
+        inside_selector = inside_selector & target_mask[:, None, :]
+
+        # Calculate the TAL alignment metric from the target-class probabilities and IoUs. Padded targets are masked so
+        # that they cannot contribute to matching.
+        ious = box_iou(pred_boxes_batch, padded_boxes)  # [B, N, T_max]
+        ious = ious * target_mask[:, None, :].float()
+
+        # For each prediction-target pair, select the predicted probability of that target's class. Each image is
+        # handled separately because its target labels and target count may differ.
+        class_scores = pred_boxes_batch.new_zeros(batch_size, num_preds, max_targets)
+        for image_idx, target in enumerate(targets):
+            num_targets = target["boxes"].shape[0]
+            class_scores[image_idx, :, :num_targets] = _probability_of_labels(
+                pred_probs_batch[image_idx], target["labels"]
+            )
+
         align_metric = class_scores.pow(self.alpha) * ious.pow(self.beta)
-        pred_mask, target_selector, assignment_weight_sum = _tal_match(
-            align_metric, ious, inside_selector, self.topk, self.eps
-        )
 
-        # Add the anchor dimension to the mask and replace True values with the results of the actual TAL matching.
-        flat_idx = pred_mask.nonzero().squeeze(-1)  # 0...(grid_cells * boxes_per_cell - 1)
-        spatial_idx = flat_idx // boxes_per_cell  # 0...(grid_cells - 1)
-        anchor_idx = flat_idx % boxes_per_cell  # 0...(boxes_per_cell - 1)
-        anchor_y = spatial_idx // grid_width  # 0...(grid_height - 1)
-        anchor_x = spatial_idx % grid_width  # 0...(grid_width - 1)
+        # Run TAL matching for the whole batch.
+        pred_mask_b, target_sel_b, weights_b = _tal_match(
+            align_metric, ious, inside_selector, target_mask, self.topk, self.eps
+        )  # [B, N], [B, N], [B, N]
 
-        # Background mask is used to select anchors that are not responsible for predicting any object, for
-        # calculating the part of the confidence loss with zero as the target confidence. It is set to False, if a
-        # predicted box overlaps any target significantly, or if a prediction is matched to a target.
-        background_mask = iou_below(preds["boxes"], targets["boxes"], self.ignore_bg_threshold)
-        background_mask[anchor_y, anchor_x, anchor_idx] = False
+        # The background IoU mask for confidence suppression has shape [B, grid_h, grid_w, boxes_per_cell].
+        best_iou = ious.amax(dim=2).view(batch_size, grid_height, grid_width, boxes_per_cell)
 
-        pred_selector = (anchor_y, anchor_x, anchor_idx)
+        results: list[MatchingResult] = []
+        for image_idx in range(batch_size):
+            # Convert flat matched indices back to grid-row, grid-column, and anchor selectors.
+            flat_idx = pred_mask_b[image_idx].nonzero().squeeze(-1)  # 0...(grid_cells * boxes_per_cell - 1)
+            spatial_idx = flat_idx // boxes_per_cell  # 0...(grid_cells - 1)
+            anchor_idx = flat_idx % boxes_per_cell  # 0...(boxes_per_cell - 1)
+            anchor_y = spatial_idx // grid_width  # 0...(grid_height - 1)
+            anchor_x = spatial_idx % grid_width  # 0...(grid_width - 1)
 
-        return MatchingResult(pred_selector, background_mask, target_selector, assignment_weight_sum)
+            # The background mask selects anchors that are not responsible for a target. Anchors are excluded when a
+            # predicted box overlaps a target significantly or when TAL assigns the anchor to a target.
+            background_mask = best_iou[image_idx] <= self.ignore_bg_threshold
+            background_mask[anchor_y, anchor_x, anchor_idx] = False
+
+            results.append(
+                MatchingResult(
+                    pred_selector=(anchor_y, anchor_x, anchor_idx),
+                    background_selector=background_mask,
+                    target_selector=target_sel_b[image_idx][pred_mask_b[image_idx]],
+                    assignment_weight_sum=float(weights_b[image_idx].sum().item()),
+                )
+            )
+
+        return results

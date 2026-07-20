@@ -1,9 +1,11 @@
+import pytest
 import torch
 from torch.nn.functional import binary_cross_entropy_with_logits
 from torchvision.ops import box_iou
 
 from lightning_yolo.loss import (
     YOLOLoss,
+    _background_class_loss,
     _background_confidence_loss,
     _foreground_confidence_loss,
     _pairwise_confidence_loss,
@@ -60,6 +62,14 @@ def test_background_confidence_loss():
     torch.testing.assert_close(result, expected)
 
 
+def test_background_class_loss():
+    preds = torch.tensor([[0.2, -0.3], [1.0, 0.5]])
+    result = _background_class_loss(preds, binary_cross_entropy_with_logits)
+    expected = binary_cross_entropy_with_logits(preds, torch.zeros_like(preds), reduction="sum")
+
+    torch.testing.assert_close(result, expected)
+
+
 def test_target_labels_to_probs():
     # In case a label is greater than the number of predicted classes, it will be mapped to the last class.
     labels = torch.tensor([0, 2, 3])
@@ -77,47 +87,52 @@ def test_target_labels_to_probs_class_probabilities():
     assert torch.equal(result, probs)
 
 
-def test_yolo_loss_pairwise_shapes_and_overlap_values():
-    loss = YOLOLoss("iou", overlap_multiplier=2.0, confidence_multiplier=3.0, class_multiplier=4.0)
-    preds = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0], [1.0, 1.0, 3.0, 3.0]]),
-        "confidences": torch.tensor([0.1, -0.2]),
-        "classprobs": torch.tensor([[0.3, -0.7], [0.6, -0.4]]),
-    }
-    targets = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 4.0, 4.0]]),
-        "labels": torch.tensor([0, 1]),
-    }
+@pytest.mark.parametrize(
+    ("loss", "preds", "targets", "input_is_normalized", "expected_shape"),
+    [
+        pytest.param(
+            YOLOLoss("iou", overlap_multiplier=2.0, confidence_multiplier=3.0, class_multiplier=4.0),
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0], [1.0, 1.0, 3.0, 3.0]]),
+                "confidences": torch.tensor([0.1, -0.2]),
+                "classprobs": torch.tensor([[0.3, -0.7], [0.6, -0.4]]),
+            },
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 4.0, 4.0]]),
+                "labels": torch.tensor([0, 1]),
+            },
+            False,
+            (2, 2),
+            id="logits",
+        ),
+        pytest.param(
+            YOLOLoss("iou"),
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
+                "confidences": torch.tensor([0.8]),
+                "classprobs": torch.tensor([[0.7, 0.2]]),
+            },
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
+                "labels": torch.tensor([1]),
+            },
+            True,
+            (1, 1),
+            id="normalized",
+        ),
+    ],
+)
+def test_yolo_loss_pairwise(loss, preds, targets, input_is_normalized, expected_shape):
+    losses, overlap = loss.pairwise(preds, targets, input_is_normalized=input_is_normalized)
 
-    losses, overlap = loss.pairwise(preds, targets, input_is_normalized=False)
-
-    assert overlap.shape == (2, 2)
+    assert overlap.shape == expected_shape
     torch.testing.assert_close(overlap, box_iou(preds["boxes"], targets["boxes"]))
-    assert losses.overlap.shape == (2, 2)
-    assert losses.confidence.shape == (2, 2)
-    assert losses.classification.shape == (2, 2)
+    assert losses.overlap.shape == expected_shape
+    assert losses.confidence.shape == expected_shape
+    assert losses.classification.shape == expected_shape
     assert torch.isfinite(losses.overlap).all()
     assert torch.isfinite(losses.confidence).all()
     assert torch.isfinite(losses.classification).all()
-
-
-def test_yolo_loss_pairwise():
-    loss = YOLOLoss("iou")
-    preds = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-        "confidences": torch.tensor([0.8]),
-        "classprobs": torch.tensor([[0.7, 0.2]]),
-    }
-    targets = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-        "labels": torch.tensor([1]),
-    }
-    losses, overlap = loss.pairwise(preds, targets, input_is_normalized=True)
-
-    assert overlap.shape == (1, 1)
-    assert losses.overlap.shape == (1, 1)
-    assert losses.confidence.shape == (1, 1)
-    assert losses.classification.shape == (1, 1)
 
 
 def test_yolo_loss_elementwise_sums():
@@ -142,3 +157,27 @@ def test_yolo_loss_elementwise_sums():
     assert torch.isfinite(result.overlap)
     assert torch.isfinite(result.confidence)
     assert torch.isfinite(result.classification)
+
+
+def test_yolo_loss_no_confidence():
+    image_size = torch.tensor([64.0, 64.0])
+    preds = {
+        "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+        "confidences": torch.empty(0),
+        "bg_confidences": torch.empty(0),
+        "classprobs": torch.tensor([[2.0, -1.0]]),
+        "bg_classprobs": torch.tensor([[0.3, -0.2], [-1.0, 0.5]]),
+    }
+    targets = {"boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]), "labels": torch.tensor([0])}
+
+    losses = YOLOLoss("ciou", predict_confidence=False, confidence_multiplier=1.0).elementwise_sums(
+        preds, targets, input_is_normalized=False, image_size=image_size
+    )
+
+    # Confidence-free heads emit no confidence loss; background anchors are supervised through the class loss.
+    assert float(losses.confidence) == 0.0
+    foreground = binary_cross_entropy_with_logits(preds["classprobs"], torch.tensor([[1.0, 0.0]]), reduction="sum")
+    background = binary_cross_entropy_with_logits(
+        preds["bg_classprobs"], torch.zeros_like(preds["bg_classprobs"]), reduction="sum"
+    )
+    torch.testing.assert_close(losses.classification, foreground + background)

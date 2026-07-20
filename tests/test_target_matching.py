@@ -83,11 +83,17 @@ def test_tal_match() -> None:
             [True, True],
         ]
     )
-    pred_mask, target_selector, assignment_weight_sum = _tal_match(align_metric, ious, inside_selector, topk=1)
+    pred_mask, target_selector, assignment_weights = _tal_match(
+        align_metric.unsqueeze(0),
+        ious.unsqueeze(0),
+        inside_selector.unsqueeze(0),
+        torch.tensor([[True, True]]),
+        topk=1,
+    )
 
-    assert torch.equal(pred_mask, torch.tensor([True, True, False]))
-    assert torch.equal(target_selector, torch.tensor([1, 0]))
-    assert assignment_weight_sum == pytest.approx(1.7)
+    assert torch.equal(pred_mask[0], torch.tensor([True, True, False]))
+    assert torch.equal(target_selector[0][pred_mask[0]], torch.tensor([1, 0]))
+    assert assignment_weights.sum().item() == pytest.approx(1.7)
 
 
 def test_probability_of_labels() -> None:
@@ -155,18 +161,27 @@ def test_sim_ota_matching() -> None:
         "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
         "labels": torch.tensor([0], dtype=torch.int64),
     }
-    result = matcher(
-        preds,
-        targets,
+    empty_targets = {
+        "boxes": torch.empty((0, 4)),
+        "labels": torch.empty(0, dtype=torch.int64),
+    }
+    results = matcher(
+        [preds, preds],
+        [targets, empty_targets],
         image_size=torch.tensor([2.0, 2.0]),
         input_is_normalized=False,
     )
+    result, empty_result = results
 
     # The only prediction matches the only target.
     assert torch.equal(result.pred_selector, torch.tensor([[[True]]]))
     assert torch.equal(result.background_selector, torch.tensor([[[False]]]))
     assert torch.equal(result.target_selector, torch.tensor([0]))
     assert result.assignment_weight_sum == 1
+    assert not empty_result.pred_selector.any()
+    assert empty_result.background_selector.all()
+    assert empty_result.target_selector.numel() == 0
+    assert empty_result.assignment_weight_sum == 0
 
 
 @pytest.mark.parametrize("input_is_normalized", [False, True])
@@ -194,11 +209,11 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
     }
     image_size = torch.tensor([2.0, 1.0])
     result = matcher(
-        preds,
-        targets,
+        [preds],
+        [targets],
         image_size,
         input_is_normalized=input_is_normalized,
-    )
+    )[0]
 
     # The first prediction matches the first target and the second prediction matches the second target, because they
     # have the same IoU and the same probability of the target labels, but the first prediction has a smaller center
@@ -212,3 +227,23 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
     assert result.background_selector.shape == torch.Size([1, 2, 1])
     assert not result.background_selector[0, 0, 0]
     assert not result.background_selector[0, 1, 0]
+
+
+def test_tal_matching_empty_targets() -> None:
+    matcher = TALMatching(prior_shapes=[[2, 2]], prior_shape_idxs=[0], topk=1)
+    preds = {
+        "boxes": torch.tensor([[[[0.0, 0.0, 1.0, 1.0]]]]),
+        "confidences": torch.zeros((1, 1, 1)),
+        "classprobs": torch.zeros((1, 1, 1, 2)),
+    }
+    targets = {
+        "boxes": torch.empty((0, 4)),
+        "labels": torch.empty(0, dtype=torch.int64),
+    }
+
+    result = matcher([preds], [targets], torch.tensor([1.0, 1.0]))[0]
+
+    assert all(selector.numel() == 0 for selector in result.pred_selector)
+    assert result.background_selector.all()
+    assert result.target_selector.numel() == 0
+    assert result.assignment_weight_sum == 0

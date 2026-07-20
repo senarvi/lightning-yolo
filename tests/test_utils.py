@@ -91,6 +91,10 @@ def test_iou_below():
     assert not result[1, 1, 0]
     assert not result[3, 5, 1]
 
+    result = iou_below(pred_boxes, torch.empty((0, 4)), 0.9)
+    assert result.shape == (10, 10, 3)
+    assert result.all()
+
 
 def test_is_inside_box():
     """

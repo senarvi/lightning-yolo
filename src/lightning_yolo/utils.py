@@ -82,7 +82,7 @@ def iou_below(pred_boxes: Tensor, target_boxes: Tensor, threshold: float) -> Ten
 
     Args:
         pred_boxes: The predicted corner coordinates. Tensor of size ``[height, width, boxes_per_cell, 4]``.
-        target_boxes: Corner coordinates of the target boxes. Tensor of size ``[height, width, boxes_per_cell, 4]``.
+        target_boxes: Corner coordinates of the target boxes. Tensor of size ``[num_targets, 4]``.
 
     Returns:
         A boolean tensor sized ``[height, width, boxes_per_cell]``, with ``False`` where the predicted box overlaps a
@@ -90,6 +90,9 @@ def iou_below(pred_boxes: Tensor, target_boxes: Tensor, threshold: float) -> Ten
 
     """
     shape = pred_boxes.shape[:-1]
+    if target_boxes.shape[0] == 0:
+        return torch.ones(shape, dtype=torch.bool, device=pred_boxes.device)
+
     pred_boxes = pred_boxes.view(-1, 4)
     ious = box_iou(pred_boxes, target_boxes)
     best_iou = ious.max(-1).values

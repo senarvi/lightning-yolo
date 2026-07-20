@@ -105,6 +105,8 @@ class YOLO(LightningModule):
             resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
+        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to drop
+            confidence supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -169,6 +171,7 @@ class YOLO(LightningModule):
         momentum: float = 0.9,  # noqa: ARG002
         weight_decay: float = 0.0005,  # noqa: ARG002
         ema_decay: float = 0.9999,  # noqa: ARG002
+        predict_confidence: bool = True,
         confidence_threshold: float = 0.2,
         nms_threshold: float = 0.45,
         detections_per_image: int = 100,
@@ -236,6 +239,7 @@ class YOLO(LightningModule):
                 confidence_loss_multiplier=confidence_loss_multiplier,
                 class_loss_multiplier=class_loss_multiplier,
                 xy_scale=xy_scale,
+                predict_confidence=predict_confidence,
             )
 
         self.confidence_threshold = confidence_threshold
@@ -397,13 +401,16 @@ class YOLO(LightningModule):
         """Configure exponential moving average weights for training and evaluation.
 
         Returns:
-            The EMA callback.
+            The EMA callback, or an empty list when ``ema_decay`` is not positive (EMA disabled).
 
         """
+        ema_decay = float(self.hparams["ema_decay"])
+        if ema_decay <= 0.0:
+            return []
         return [
             WeightAveraging(
                 use_buffers=True,
-                multi_avg_fn=get_ema_multi_avg_fn(decay=float(self.hparams["ema_decay"])),
+                multi_avg_fn=get_ema_multi_avg_fn(decay=ema_decay),
             )
         ]
 
@@ -422,13 +429,14 @@ class YOLO(LightningModule):
         """
         images, targets = batch
         _, losses = self(images, targets)
+        total_loss = losses.sum()
 
         self.log("train/overlap_loss", losses[0], prog_bar=True, sync_dist=True)
         self.log("train/confidence_loss", losses[1], prog_bar=True, sync_dist=True)
         self.log("train/class_loss", losses[2], prog_bar=True, sync_dist=True)
-        self.log("train/total_loss", losses.sum(), sync_dist=True)
+        self.log("train/total_loss", total_loss, sync_dist=True)
 
-        return {"loss": losses.sum()}
+        return {"loss": total_loss}
 
     @override
     def validation_step(self, batch: BATCH, batch_idx: int) -> STEP_OUTPUT | None:

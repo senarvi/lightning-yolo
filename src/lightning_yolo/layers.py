@@ -83,6 +83,7 @@ class DetectionLayer(nn.Module):
         loss_func: YOLOLoss,
         xy_scale: float = 1.0,
         input_is_normalized: bool = False,
+        predict_confidence: bool = True,
     ) -> None:
         super().__init__()
 
@@ -92,6 +93,7 @@ class DetectionLayer(nn.Module):
         self.loss_func = loss_func
         self.xy_scale = xy_scale
         self.input_is_normalized = input_is_normalized
+        self.predict_confidence = predict_confidence
 
     def forward(self, x: Tensor, image_size: Tensor) -> tuple[Tensor, PREDICTIONS]:
         """Runs a forward pass through this YOLO detection layer.
@@ -112,7 +114,8 @@ class DetectionLayer(nn.Module):
 
         """
         batch_size, num_features, height, width = x.shape
-        num_attrs = self.num_classes + 5
+        box_attrs = 5 if self.predict_confidence else 4
+        num_attrs = self.num_classes + box_attrs
         anchors_per_cell = num_features // num_attrs
         if anchors_per_cell != len(self.prior_shapes):
             raise ValueError(
@@ -130,10 +133,18 @@ class DetectionLayer(nn.Module):
         norm_x = x if self.input_is_normalized else torch.sigmoid(x)
         xy = norm_x[..., :2]
         wh = x[..., 2:4]
-        confidence = x[..., 4]
-        classprob = x[..., 5:]
-        norm_confidence = norm_x[..., 4]
-        norm_classprob = norm_x[..., 5:]
+        if self.predict_confidence:
+            confidence = x[..., 4]
+            norm_confidence = norm_x[..., 4]
+            classprob = x[..., 5:]
+            norm_classprob = norm_x[..., 5:]
+        else:
+            # Confidence-free heads predict no confidence channel. A constant confidence of one keeps the public output
+            # layout and detection post-processing unchanged, so the detection score equals the class probability.
+            classprob = x[..., 4:]
+            norm_classprob = norm_x[..., 4:]
+            confidence = x.new_ones(x.shape[:-1])
+            norm_confidence = confidence
 
         # Eliminate grid sensitivity. The previous layer should output extremely high values for the sigmoid to produce
         # x/y coordinates close to one. YOLOv4 solves this by scaling the x/y coordinates.
@@ -145,7 +156,7 @@ class DetectionLayer(nn.Module):
         box = torch.cat((image_xy, image_wh), -1)
         box = box_convert(box, in_fmt="cxcywh", out_fmt="xyxy")
         output = torch.cat((box, norm_confidence.unsqueeze(-1), norm_classprob), -1)
-        output = output.reshape(batch_size, height * width * anchors_per_cell, num_attrs)
+        output = output.reshape(batch_size, height * width * anchors_per_cell, self.num_classes + 5)
 
         # It's better to use binary_cross_entropy_with_logits() for loss computation, so we'll provide the unnormalized
         # confidence and classprob, when available.
@@ -181,51 +192,50 @@ class DetectionLayer(nn.Module):
         if (len(targets) != batch_size) or (len(return_preds) != batch_size):
             raise ValueError("Different batch size for predictions and targets.")
 
+        results = self.matching_func(preds, targets, image_size, self.input_is_normalized)
         matches: list[tuple[MatchedPredictionDict, MatchedTargetDict]] = []
         assignment_weight_sums: list[int | float] = []
-        for image_preds, image_return_preds, image_targets in zip(preds, return_preds, targets, strict=True):
-            if image_targets["boxes"].shape[0] > 0:
-                matching_result = self.matching_func(image_preds, image_targets, image_size, self.input_is_normalized)
+        for matching_result, image_return_preds, image_targets in zip(results, return_preds, targets, strict=True):
+            device = image_return_preds["boxes"].device
+            empty_confidences = torch.empty(0, device=device)
+            empty_classprobs = torch.empty((0, self.num_classes), device=device)
+            foreground = matching_result.pred_selector
+            background = matching_result.background_selector
+            if self.predict_confidence:
                 matched_preds: MatchedPredictionDict = {
-                    "boxes": image_return_preds["boxes"][matching_result.pred_selector],
-                    "confidences": image_return_preds["confidences"][matching_result.pred_selector],
-                    "bg_confidences": image_return_preds["confidences"][matching_result.background_selector],
-                    "classprobs": image_return_preds["classprobs"][matching_result.pred_selector],
+                    "boxes": image_return_preds["boxes"][foreground],
+                    "confidences": image_return_preds["confidences"][foreground],
+                    "bg_confidences": image_return_preds["confidences"][background],
+                    "classprobs": image_return_preds["classprobs"][foreground],
+                    "bg_classprobs": empty_classprobs,
                 }
-                matched_targets: MatchedTargetDict = {
-                    "boxes": image_targets["boxes"][matching_result.target_selector],
-                    "labels": image_targets["labels"][matching_result.target_selector],
-                }
-                assignment_weight_sums.append(matching_result.assignment_weight_sum)
             else:
                 matched_preds = {
-                    "boxes": torch.empty((0, 4), device=image_return_preds["boxes"].device),
-                    "confidences": torch.empty(0, device=image_return_preds["confidences"].device),
-                    "bg_confidences": image_return_preds["confidences"].flatten(),
-                    "classprobs": torch.empty(
-                        (0, self.num_classes),
-                        device=image_return_preds["classprobs"].device,
-                    ),
+                    "boxes": image_return_preds["boxes"][foreground],
+                    "confidences": empty_confidences,
+                    "bg_confidences": empty_confidences,
+                    "classprobs": image_return_preds["classprobs"][foreground],
+                    "bg_classprobs": image_return_preds["classprobs"][background],
                 }
-                matched_targets = {
-                    "boxes": torch.empty((0, 4), device=image_targets["boxes"].device),
-                    "labels": torch.empty(0, dtype=torch.int64, device=image_targets["labels"].device),
-                }
-                assignment_weight_sums.append(0)
+            matched_targets: MatchedTargetDict = {
+                "boxes": image_targets["boxes"][matching_result.target_selector],
+                "labels": image_targets["labels"][matching_result.target_selector],
+            }
             matches.append((matched_preds, matched_targets))
+            assignment_weight_sums.append(matching_result.assignment_weight_sum)
 
         matched_preds = {
-            "boxes": torch.cat(tuple(m[0]["boxes"] for m in matches)),
-            "confidences": torch.cat(tuple(m[0]["confidences"] for m in matches)),
-            "bg_confidences": torch.cat(tuple(m[0]["bg_confidences"] for m in matches)),
-            "classprobs": torch.cat(tuple(m[0]["classprobs"] for m in matches)),
+            "boxes": torch.cat(tuple(match[0]["boxes"] for match in matches)),
+            "confidences": torch.cat(tuple(match[0]["confidences"] for match in matches)),
+            "bg_confidences": torch.cat(tuple(match[0]["bg_confidences"] for match in matches)),
+            "classprobs": torch.cat(tuple(match[0]["classprobs"] for match in matches)),
+            "bg_classprobs": torch.cat(tuple(match[0]["bg_classprobs"] for match in matches)),
         }
         matched_targets = {
-            "boxes": torch.cat(tuple(m[1]["boxes"] for m in matches)),
-            "labels": torch.cat(tuple(m[1]["labels"] for m in matches)),
+            "boxes": torch.cat(tuple(match[1]["boxes"] for match in matches)),
+            "labels": torch.cat(tuple(match[1]["labels"] for match in matches)),
         }
-        assignment_weight_sum = sum(assignment_weight_sums)
-        return matched_preds, matched_targets, assignment_weight_sum
+        return matched_preds, matched_targets, sum(assignment_weight_sums)
 
     def calculate_losses(
         self,
@@ -252,11 +262,15 @@ class DetectionLayer(nn.Module):
         if loss_preds is None:
             loss_preds = preds
 
-        matched_preds, matched_targets, assignment_weight_sum = self.match_targets(
-            preds, loss_preds, targets, image_size
-        )
+        with torch.profiler.record_function("match_targets"):
+            matched_preds, matched_targets, assignment_weight_sum = self.match_targets(
+                preds, loss_preds, targets, image_size
+            )
 
-        losses = self.loss_func.elementwise_sums(matched_preds, matched_targets, self.input_is_normalized, image_size)
+        with torch.profiler.record_function("elementwise_sums"):
+            losses = self.loss_func.elementwise_sums(
+                matched_preds, matched_targets, self.input_is_normalized, image_size
+            )
         loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
 
         matched_count = len(matched_targets["boxes"])
@@ -452,6 +466,7 @@ def create_detection_layer(
     overlap_loss_multiplier: float = 5.0,
     confidence_loss_multiplier: float = 1.0,
     class_loss_multiplier: float = 1.0,
+    predict_confidence: bool = True,
     **kwargs: Any,
 ) -> DetectionLayer:
     """Creates a detection layer module and the required loss function and target matching objects.
@@ -488,6 +503,8 @@ def create_detection_layer(
         overlap_loss_multiplier: Overlap loss will be scaled by this value.
         confidence_loss_multiplier: Confidence loss will be scaled by this value.
         class_loss_multiplier: Classification loss will be scaled by this value.
+        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
+            drop objectness supervision and supervise all anchors via classification loss only.
         num_classes: Number of different classes that this layer predicts.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
             to produce coordinate values close to one.
@@ -499,6 +516,10 @@ def create_detection_layer(
     """
     matching_func: ShapeMatching | SimOTAMatching | TALMatching
     if matching_algorithm == "simota":
+        if not predict_confidence:
+            raise ValueError(
+                "predict_confidence=False is incompatible with SimOTA matching, which relies on the confidence cost."
+            )
         loss_func = YOLOLoss(
             overlap_func, None, None, overlap_loss_multiplier, confidence_loss_multiplier, class_loss_multiplier
         )
@@ -532,6 +553,13 @@ def create_detection_layer(
         overlap_loss_multiplier,
         confidence_loss_multiplier,
         class_loss_multiplier,
+        predict_confidence=predict_confidence,
     )
     layer_shapes = [prior_shapes[i] for i in prior_shape_idxs]
-    return DetectionLayer(prior_shapes=layer_shapes, matching_func=matching_func, loss_func=loss_func, **kwargs)
+    return DetectionLayer(
+        prior_shapes=layer_shapes,
+        matching_func=matching_func,
+        loss_func=loss_func,
+        predict_confidence=predict_confidence,
+        **kwargs,
+    )

@@ -37,6 +37,7 @@ class MatchedPredictionDict(TypedDict):
     confidences: Tensor
     bg_confidences: Tensor
     classprobs: Tensor
+    bg_classprobs: Tensor
 
 
 class MatchedTargetDict(TypedDict):

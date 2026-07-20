@@ -146,6 +146,24 @@ def _background_confidence_loss(preds: Tensor, bce_func: Callable) -> Tensor:
     return bce_func(preds, targets, reduction="sum")
 
 
+def _background_class_loss(preds: Tensor, bce_func: Callable) -> Tensor:
+    """Calculates the sum of the classification losses for background anchors.
+
+    Confidence-free heads (as in YOLOv8) have no separate confidence output, so background anchors are instead
+    supervised by driving all of their class probabilities toward zero. This replaces the background confidence loss.
+
+    Args:
+        preds: An ``[N, C]`` matrix of predicted class scores for background anchors.
+        bce_func: A function for calculating binary cross entropy.
+
+    Returns:
+        The sum of the background classification losses.
+
+    """
+    targets = torch.zeros_like(preds)
+    return bce_func(preds, targets, reduction="sum")
+
+
 def _target_labels_to_probs(
     targets: Tensor, num_classes: int, dtype: torch.dtype, label_smoothing: float | None = None
 ) -> Tensor:
@@ -223,6 +241,7 @@ class YOLOLoss:
         overlap_multiplier: float = 5.0,
         confidence_multiplier: float = 1.0,
         class_multiplier: float = 1.0,
+        predict_confidence: bool = True,
     ):
         if callable(overlap_func):
             self._pairwise_overlap = overlap_func
@@ -235,6 +254,7 @@ class YOLOLoss:
         self.overlap_multiplier = overlap_multiplier
         self.confidence_multiplier = confidence_multiplier
         self.class_multiplier = class_multiplier
+        self.predict_confidence = predict_confidence
 
     def pairwise(
         self,
@@ -316,8 +336,13 @@ class YOLOLoss:
         overlap = 1.0 - overlap_loss
         overlap_loss = (overlap_loss * _size_compensation(targets["boxes"], image_size)).sum()
 
-        confidence_loss = _foreground_confidence_loss(preds["confidences"], overlap, bce_func, self.predict_overlap)
-        confidence_loss += _background_confidence_loss(preds["bg_confidences"], bce_func)
+        if self.predict_confidence:
+            confidence_loss = _foreground_confidence_loss(preds["confidences"], overlap, bce_func, self.predict_overlap)
+            confidence_loss += _background_confidence_loss(preds["bg_confidences"], bce_func)
+        else:
+            # Confidence-free heads have no confidence output; background anchors are supervised by the classification
+            # loss below instead, so the confidence component is zero.
+            confidence_loss = overlap_loss.new_zeros(())
 
         pred_probs = preds["classprobs"]
         target_probs = _target_labels_to_probs(
@@ -327,6 +352,8 @@ class YOLOLoss:
             self.label_smoothing,
         )
         class_loss = bce_func(pred_probs, target_probs, reduction="sum")
+        if not self.predict_confidence:
+            class_loss = class_loss + _background_class_loss(preds["bg_classprobs"], bce_func)
 
         return YOLOLosses(
             overlap_loss * self.overlap_multiplier,
