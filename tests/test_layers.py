@@ -10,7 +10,8 @@ from lightning_yolo.layers import (
     ShortcutLayer,
 )
 from lightning_yolo.loss import YOLOLoss
-from lightning_yolo.target_matching import HighestIoUMatching, TALMatching
+from lightning_yolo.matching_result import DenseMatchingResult
+from lightning_yolo.target_matching import HighestIoUMatching
 
 
 def test_detection_layer_forward():
@@ -35,10 +36,28 @@ def test_detection_layer_forward():
 
 def test_detection_layer_forward_no_confidence():
     prior_shapes = [(10, 12), (20, 24)]
+
+    def weighted_matching(preds, targets, image_size, input_is_normalized):  # noqa: ARG001
+        foreground = torch.zeros((1, 8), dtype=torch.bool)
+        foreground[0, :2] = True
+        target_boxes = torch.zeros((1, 8, 4))
+        target_boxes[0, :2] = torch.tensor([[1.0, 1.0, 20.0, 20.0], [3.0, 3.0, 30.0, 30.0]])
+        target_labels = torch.zeros((1, 8), dtype=torch.int64)
+        target_labels[0, 1] = 1
+        assignment_weights = torch.zeros((1, 8))
+        assignment_weights[0, :2] = torch.tensor([0.25, 0.75])
+        return DenseMatchingResult(
+            foreground=foreground,
+            background=~foreground,
+            target_boxes=target_boxes,
+            target_labels=target_labels,
+            assignment_weights=assignment_weights,
+        )
+
     layer = DetectionLayer(
         num_classes=2,
         prior_shapes=prior_shapes,
-        matching_func=TALMatching(prior_shapes, [0, 1]),
+        matching_func=weighted_matching,
         loss_func=YOLOLoss("ciou", predict_confidence=False),
         predict_confidence=False,
     )
@@ -53,6 +72,10 @@ def test_detection_layer_forward_no_confidence():
     assert preds[0]["classprobs"].shape == (2, 2, 2, 2)
     assert torch.equal(preds[0]["confidences"], torch.ones_like(preds[0]["confidences"]))
     assert torch.isfinite(output).all()
+
+    targets = [{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}]
+    loss_record = layer.calculate_losses(preds, targets, image_size)
+    torch.testing.assert_close(loss_record.normalizers, torch.tensor([1.0, 1.0, 1.0]))
 
 
 def test_conv_layer_output_shape():

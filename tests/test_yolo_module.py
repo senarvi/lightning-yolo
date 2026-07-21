@@ -10,6 +10,24 @@ from lightning_yolo.torch_networks import YOLOXHead
 from lightning_yolo.yolo_module import YOLO
 
 
+@pytest.mark.parametrize("predict_confidence", [False, True])
+def test_yolo(predict_confidence: bool) -> None:
+    module = YOLO(
+        architecture="yolov8n",
+        num_classes=2,
+        matching_algorithm="tal",
+        predict_confidence=predict_confidence,
+    )
+    images = torch.rand(1, 3, 64, 64)
+    targets = [{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}]
+
+    _, losses = module(images, targets)
+
+    # Finite losses with empty targets.
+    assert torch.isfinite(losses).all()
+    assert losses.max() < 100
+
+
 def test_yolo_to_onnx(tmp_path):
     output_path = tmp_path / "yolov4-tiny.onnx"
     model = YOLO(architecture="yolov4-tiny", num_classes=2)

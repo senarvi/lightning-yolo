@@ -13,6 +13,7 @@ from lightning_yolo.loss import (
     _target_labels_to_probs,
     box_iou_loss,
 )
+from lightning_yolo.matching_result import DenseMatchingResult, ImageMatch, SparseMatchingResult
 
 
 def test_box_iou_loss():
@@ -135,49 +136,132 @@ def test_yolo_loss_pairwise(loss, preds, targets, input_is_normalized, expected_
     assert torch.isfinite(losses.classification).all()
 
 
-def test_yolo_loss_elementwise_sums():
-    loss = YOLOLoss("iou")
-    preds = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-        "confidences": torch.tensor([0.7]),
-        "bg_confidences": torch.tensor([0.1, 0.2]),
-        "classprobs": torch.tensor([[0.8, 0.1]]),
-    }
-    targets = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-        "labels": torch.tensor([1]),
-    }
-    result = loss.elementwise_sums(
-        preds,
-        targets,
-        input_is_normalized=True,
-        image_size=torch.tensor([64.0, 64.0]),
+def test_yolo_loss_sums() -> None:
+    loss_func = YOLOLoss("ciou", predict_confidence=False)
+    pred_boxes = torch.tensor(
+        [
+            [[0.0, 0.0, 2.0, 2.0], [2.0, 0.0, 4.0, 2.0], [4.0, 0.0, 6.0, 2.0]],
+            [[0.0, 0.0, 2.0, 2.0], [2.0, 0.0, 4.0, 2.0], [4.0, 0.0, 6.0, 2.0]],
+        ],
+        requires_grad=True,
     )
-
-    assert torch.isfinite(result.overlap)
-    assert torch.isfinite(result.confidence)
-    assert torch.isfinite(result.classification)
-
-
-def test_yolo_loss_no_confidence():
-    image_size = torch.tensor([64.0, 64.0])
-    preds = {
-        "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
-        "confidences": torch.empty(0),
-        "bg_confidences": torch.empty(0),
-        "classprobs": torch.tensor([[2.0, -1.0]]),
-        "bg_classprobs": torch.tensor([[0.3, -0.2], [-1.0, 0.5]]),
-    }
-    targets = {"boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]), "labels": torch.tensor([0])}
-
-    losses = YOLOLoss("ciou", predict_confidence=False, confidence_multiplier=1.0).elementwise_sums(
-        preds, targets, input_is_normalized=False, image_size=image_size
+    pred_classprobs = torch.tensor(
+        [
+            [[2.0, -1.0], [-1.0, 2.0], [0.5, -0.5]],
+            [[0.2, -0.3], [-0.4, 0.6], [1.0, -1.5]],
+        ],
+        requires_grad=True,
     )
+    image_size = torch.tensor([6.0, 2.0])
+
+    # The first image has two foreground anchors; the second image has no targets, so dense TAL padding leaves
+    # zero-area target boxes behind the background anchors.
+    target_boxes = torch.tensor(
+        [
+            [[0.0, 0.0, 2.0, 2.0], [2.0, 0.0, 4.0, 2.0], [0.0, 0.0, 2.0, 2.0]],
+            [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+        ]
+    )
+    target_labels = torch.tensor([[0, 1, 0], [0, 0, 0]])
+    foreground = torch.tensor([[True, True, False], [False, False, False]])
+    dense = DenseMatchingResult(
+        foreground=foreground,
+        background=torch.tensor([[False, False, True], [True, True, True]]),
+        target_boxes=target_boxes,
+        target_labels=target_labels,
+        assignment_weights=foreground.float(),
+    )
+    sparse = SparseMatchingResult(
+        [
+            ImageMatch(
+                foreground=torch.tensor([0, 1]),
+                background=torch.tensor([False, False, True]),
+                target_boxes=target_boxes[0, :2],
+                target_labels=target_labels[0, :2],
+            ),
+            ImageMatch(
+                foreground=torch.empty(0, dtype=torch.int64),
+                background=torch.tensor([True, True, True]),
+                target_boxes=torch.empty((0, 4)),
+                target_labels=torch.empty(0, dtype=torch.int64),
+            ),
+        ]
+    )
+    preds = [
+        {"boxes": boxes, "confidences": torch.ones(3), "classprobs": classprobs}
+        for boxes, classprobs in zip(pred_boxes, pred_classprobs, strict=True)
+    ]
+
+    dense_losses = loss_func.sums(dense, preds, False, image_size)
+    sparse_losses = loss_func.sums(sparse, preds, False, image_size)
+
+    # Overlap loss covers only the foreground anchors.
+    expected_overlap = loss_func._elementwise_overlap_loss(target_boxes[0, :2], pred_boxes[0, :2])
+    expected_overlap = (
+        expected_overlap * (2 - target_boxes[0, :2, 2] / image_size[0] * target_boxes[0, :2, 3] / image_size[1])
+    ).sum()
+    torch.testing.assert_close(dense_losses.overlap, expected_overlap * loss_func.overlap_multiplier)
 
     # Confidence-free heads emit no confidence loss; background anchors are supervised through the class loss.
-    assert float(losses.confidence) == 0.0
-    foreground = binary_cross_entropy_with_logits(preds["classprobs"], torch.tensor([[1.0, 0.0]]), reduction="sum")
-    background = binary_cross_entropy_with_logits(
-        preds["bg_classprobs"], torch.zeros_like(preds["bg_classprobs"]), reduction="sum"
+    assert float(dense_losses.confidence) == 0.0
+    expected_foreground_class = binary_cross_entropy_with_logits(
+        pred_classprobs[0:1, :2], torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]), reduction="sum"
     )
-    torch.testing.assert_close(losses.classification, foreground + background)
+    expected_background_class = binary_cross_entropy_with_logits(
+        torch.cat((pred_classprobs[0, 2:], pred_classprobs[1])),
+        torch.zeros((4, 2)),
+        reduction="sum",
+    )
+    torch.testing.assert_close(dense_losses.classification, expected_foreground_class + expected_background_class)
+
+    # Background anchors do not contribute to the overlap gradient; all classification gradients are finite.
+    grads = torch.autograd.grad(dense_losses.overlap + dense_losses.classification, (pred_boxes, pred_classprobs))
+    assert torch.equal(grads[0][0, 2], torch.zeros_like(grads[0][0, 2]))
+    assert torch.equal(grads[0][1], torch.zeros_like(grads[0][1]))
+    assert torch.isfinite(grads[0]).all()
+    assert torch.isfinite(grads[1]).all()
+
+    # Dense and sparse matching produce identical loss sums.
+    torch.testing.assert_close(dense_losses.overlap, sparse_losses.overlap)
+    torch.testing.assert_close(dense_losses.classification, sparse_losses.classification)
+    torch.testing.assert_close(dense_losses.confidence, sparse_losses.confidence)
+
+    weighted_dense = DenseMatchingResult(
+        foreground=foreground,
+        background=torch.tensor([[False, False, True], [True, True, True]]),
+        target_boxes=target_boxes,
+        target_labels=target_labels,
+        assignment_weights=torch.tensor([[0.25, 0.75, 0.0], [0.0, 0.0, 0.0]]),
+    )
+    weighted_losses = loss_func.sums(weighted_dense, preds, False, image_size)
+    expected_weighted_overlap = loss_func._elementwise_overlap_loss(target_boxes[0, :2], pred_boxes[0, :2])
+    expected_weighted_overlap = (
+        expected_weighted_overlap
+        * (2 - target_boxes[0, :2, 2] / image_size[0] * target_boxes[0, :2, 3] / image_size[1])
+        * torch.tensor([0.25, 0.75])
+    ).sum()
+    expected_weighted_foreground_class = binary_cross_entropy_with_logits(
+        pred_classprobs[0:1, :2], torch.tensor([[[0.25, 0.0], [0.0, 0.75]]]), reduction="sum"
+    )
+    torch.testing.assert_close(weighted_losses.overlap, expected_weighted_overlap * loss_func.overlap_multiplier)
+    torch.testing.assert_close(
+        weighted_losses.classification, expected_weighted_foreground_class + expected_background_class
+    )
+
+    all_empty_dense = DenseMatchingResult(
+        foreground=torch.tensor([[False, False, False]]),
+        background=torch.tensor([[True, True, True]]),
+        target_boxes=torch.zeros((1, 3, 4)),
+        target_labels=torch.zeros((1, 3), dtype=torch.int64),
+        assignment_weights=torch.zeros((1, 3)),
+    )
+    all_empty_losses = loss_func.sums(all_empty_dense, preds[1:], False, image_size)
+    all_empty_grads = torch.autograd.grad(
+        all_empty_losses.overlap + all_empty_losses.classification,
+        (pred_boxes, pred_classprobs),
+        allow_unused=True,
+    )
+    assert all_empty_grads[0] is not None
+    assert torch.equal(all_empty_grads[0], torch.zeros_like(pred_boxes))
+    assert all_empty_grads[1] is not None
+    assert torch.isfinite(all_empty_grads[1]).all()

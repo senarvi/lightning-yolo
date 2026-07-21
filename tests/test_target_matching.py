@@ -165,23 +165,23 @@ def test_sim_ota_matching() -> None:
         "boxes": torch.empty((0, 4)),
         "labels": torch.empty(0, dtype=torch.int64),
     }
-    results = matcher(
+    result = matcher(
         [preds, preds],
         [targets, empty_targets],
         image_size=torch.tensor([2.0, 2.0]),
         input_is_normalized=False,
     )
-    result, empty_result = results
 
+    matched, empty = result.images
     # The only prediction matches the only target.
-    assert torch.equal(result.pred_selector, torch.tensor([[[True]]]))
-    assert torch.equal(result.background_selector, torch.tensor([[[False]]]))
-    assert torch.equal(result.target_selector, torch.tensor([0]))
+    assert torch.equal(matched.foreground, torch.tensor([0]))
+    assert torch.equal(matched.background, torch.tensor([False]))
+    assert torch.equal(matched.target_boxes, targets["boxes"])
+    assert torch.equal(matched.target_labels, targets["labels"])
+    # The second image has no targets, so nothing is matched and every anchor is background.
+    assert empty.foreground.numel() == 0
+    assert torch.equal(empty.background, torch.tensor([True]))
     assert result.assignment_weight_sum == 1
-    assert not empty_result.pred_selector.any()
-    assert empty_result.background_selector.all()
-    assert empty_result.target_selector.numel() == 0
-    assert empty_result.assignment_weight_sum == 0
 
 
 @pytest.mark.parametrize("input_is_normalized", [False, True])
@@ -195,7 +195,7 @@ def test_sim_ota_matching() -> None:
 )
 def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) -> None:
     matcher = TALMatching(prior_shapes=[[2, 2]], prior_shape_idxs=[0], topk=1, alpha=0.5, beta=6.0)
-    class_logits = torch.tensor([[[[8.0, -8.0]], [[-8.0, 8.0]]]])
+    class_logits = torch.tensor([[[[8.0, -8.0]], [[-8.0, 8.0]]]], requires_grad=True)
     classprobs = class_logits.sigmoid() if input_is_normalized else class_logits
     preds = {
         "boxes": torch.tensor([[[[0.0, 0.0, 1.0, 1.0]], [[1.0, 0.0, 2.0, 1.0]]]]),
@@ -213,20 +213,18 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
         [targets],
         image_size,
         input_is_normalized=input_is_normalized,
-    )[0]
+    )
 
     # The first prediction matches the first target and the second prediction matches the second target, because they
     # have the same IoU and the same probability of the target labels, but the first prediction has a smaller center
     # distance to the first target and the second prediction has a smaller center distance to the second target.
-    anchor_y, anchor_x, anchor_idx = result.pred_selector
-    assert torch.equal(anchor_y, torch.tensor([0, 0]))
-    assert torch.equal(anchor_x, torch.tensor([0, 1]))
-    assert torch.equal(anchor_idx, torch.tensor([0, 0]))
-    assert torch.equal(result.target_selector, torch.tensor([0, 1]))
-    assert result.assignment_weight_sum == 2.0
-    assert result.background_selector.shape == torch.Size([1, 2, 1])
-    assert not result.background_selector[0, 0, 0]
-    assert not result.background_selector[0, 1, 0]
+    assert torch.equal(result.foreground, torch.tensor([[True, True]]))
+    assert torch.equal(result.target_boxes[0], targets["boxes"])
+    assert torch.equal(result.target_labels[0], target_labels)
+    assert result.assignment_weights.sum() == 2.0
+    assert not result.assignment_weights.requires_grad
+    assert result.background.shape == torch.Size([1, 2])
+    assert not result.background.any()
 
 
 def test_tal_matching_empty_targets() -> None:
@@ -241,9 +239,8 @@ def test_tal_matching_empty_targets() -> None:
         "labels": torch.empty(0, dtype=torch.int64),
     }
 
-    result = matcher([preds], [targets], torch.tensor([1.0, 1.0]))[0]
+    result = matcher([preds], [targets], torch.tensor([1.0, 1.0]))
 
-    assert all(selector.numel() == 0 for selector in result.pred_selector)
-    assert result.background_selector.all()
-    assert result.target_selector.numel() == 0
-    assert result.assignment_weight_sum == 0
+    assert not result.foreground.any()
+    assert result.background.all()
+    assert result.assignment_weights.sum() == 0

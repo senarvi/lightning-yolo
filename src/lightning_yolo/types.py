@@ -32,19 +32,6 @@ class TargetDict(TypedDict):
     labels: Tensor
 
 
-class MatchedPredictionDict(TypedDict):
-    boxes: Tensor
-    confidences: Tensor
-    bg_confidences: Tensor
-    classprobs: Tensor
-    bg_classprobs: Tensor
-
-
-class MatchedTargetDict(TypedDict):
-    boxes: Tensor
-    labels: Tensor
-
-
 IMAGES = tuple[Tensor, ...] | list[Tensor]
 PREDICTIONS = tuple[PredictionDict, ...] | list[PredictionDict]
 PRIOR_SHAPES = list[tuple[int, int]]

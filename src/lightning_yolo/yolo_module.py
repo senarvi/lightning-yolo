@@ -281,7 +281,9 @@ class YOLO(LightningModule):
 
         loss_sums = torch.stack([record.loss_sums for record in loss_records]).sum(0)
         normalizers = torch.stack([record.normalizers for record in loss_records]).sum(0)
-        losses = loss_sums / normalizers.clamp_min(1e-9)
+        # Empty batches still supervise background predictions, so a minimum denominator of one keeps those losses
+        # finite without changing non-empty batches.
+        losses = loss_sums / normalizers.clamp_min(1)
         return detections, losses
 
     @override

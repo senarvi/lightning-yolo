@@ -20,8 +20,6 @@ from .types import (
     PRIOR_SHAPES,
     TARGETS,
     DetectionLossRecord,
-    MatchedPredictionDict,
-    MatchedTargetDict,
 )
 from .utils import global_xy
 
@@ -166,77 +164,6 @@ class DetectionLayer(nn.Module):
 
         return output, preds
 
-    def match_targets(
-        self,
-        preds: PREDICTIONS,
-        return_preds: PREDICTIONS,
-        targets: TARGETS,
-        image_size: Tensor,
-    ) -> tuple[MatchedPredictionDict, MatchedTargetDict, int | float]:
-        """Matches the predictions to targets.
-
-        Args:
-            preds: List of predictions for each image, as returned by the ``forward()`` method of this layer. These will
-                be matched to the training targets.
-            return_preds: List of predictions for each image. The matched predictions will be returned from this list.
-                When calculating the auxiliary loss for deep supervision, predictions from a different layer are used
-                for loss computation.
-            targets: List of training targets for each image.
-            image_size: Width and height in a vector that defines the scale of the target coordinates.
-
-        Returns:
-            The matched predictions and targets, and the sum of assignment weights.
-
-        """
-        batch_size = len(preds)
-        if (len(targets) != batch_size) or (len(return_preds) != batch_size):
-            raise ValueError("Different batch size for predictions and targets.")
-
-        results = self.matching_func(preds, targets, image_size, self.input_is_normalized)
-        matches: list[tuple[MatchedPredictionDict, MatchedTargetDict]] = []
-        assignment_weight_sums: list[int | float] = []
-        for matching_result, image_return_preds, image_targets in zip(results, return_preds, targets, strict=True):
-            device = image_return_preds["boxes"].device
-            empty_confidences = torch.empty(0, device=device)
-            empty_classprobs = torch.empty((0, self.num_classes), device=device)
-            foreground = matching_result.pred_selector
-            background = matching_result.background_selector
-            if self.predict_confidence:
-                matched_preds: MatchedPredictionDict = {
-                    "boxes": image_return_preds["boxes"][foreground],
-                    "confidences": image_return_preds["confidences"][foreground],
-                    "bg_confidences": image_return_preds["confidences"][background],
-                    "classprobs": image_return_preds["classprobs"][foreground],
-                    "bg_classprobs": empty_classprobs,
-                }
-            else:
-                matched_preds = {
-                    "boxes": image_return_preds["boxes"][foreground],
-                    "confidences": empty_confidences,
-                    "bg_confidences": empty_confidences,
-                    "classprobs": image_return_preds["classprobs"][foreground],
-                    "bg_classprobs": image_return_preds["classprobs"][background],
-                }
-            matched_targets: MatchedTargetDict = {
-                "boxes": image_targets["boxes"][matching_result.target_selector],
-                "labels": image_targets["labels"][matching_result.target_selector],
-            }
-            matches.append((matched_preds, matched_targets))
-            assignment_weight_sums.append(matching_result.assignment_weight_sum)
-
-        matched_preds = {
-            "boxes": torch.cat(tuple(match[0]["boxes"] for match in matches)),
-            "confidences": torch.cat(tuple(match[0]["confidences"] for match in matches)),
-            "bg_confidences": torch.cat(tuple(match[0]["bg_confidences"] for match in matches)),
-            "classprobs": torch.cat(tuple(match[0]["classprobs"] for match in matches)),
-            "bg_classprobs": torch.cat(tuple(match[0]["bg_classprobs"] for match in matches)),
-        }
-        matched_targets = {
-            "boxes": torch.cat(tuple(match[1]["boxes"] for match in matches)),
-            "labels": torch.cat(tuple(match[1]["labels"] for match in matches)),
-        }
-        return matched_preds, matched_targets, sum(assignment_weight_sums)
-
     def calculate_losses(
         self,
         preds: PREDICTIONS,
@@ -263,22 +190,18 @@ class DetectionLayer(nn.Module):
             loss_preds = preds
 
         with torch.profiler.record_function("match_targets"):
-            matched_preds, matched_targets, assignment_weight_sum = self.match_targets(
-                preds, loss_preds, targets, image_size
-            )
+            matching_result = self.matching_func(preds, targets, image_size, self.input_is_normalized)
 
-        with torch.profiler.record_function("elementwise_sums"):
-            losses = self.loss_func.elementwise_sums(
-                matched_preds, matched_targets, self.input_is_normalized, image_size
+        with torch.profiler.record_function("loss_sums"):
+            losses = self.loss_func.sums(
+                matching_result,
+                loss_preds,
+                self.input_is_normalized,
+                image_size,
             )
         loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
-
-        matched_count = len(matched_targets["boxes"])
-        # Matchers may return a Python integer count or a Python floating-point soft assignment weight; create the
-        # normalizer tensor with the loss dtype so division preserves fractional TAL weights.
-        normalizers = torch.tensor(
-            (matched_count, assignment_weight_sum, matched_count), dtype=loss_sums.dtype, device=loss_sums.device
-        )
+        assignment_weight_sum = matching_result.assignment_weight_sum
+        normalizers = assignment_weight_sum.expand_as(loss_sums).to(loss_sums.dtype)
         return DetectionLossRecord(loss_sums=loss_sums, normalizers=normalizers)
 
 

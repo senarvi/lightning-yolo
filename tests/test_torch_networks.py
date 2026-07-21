@@ -5,8 +5,8 @@ from lightning_yolo.torch_networks import create_network
 
 
 @pytest.mark.parametrize(
-    "architecture",
-    [
+    ("architecture", "predict_confidence"),
+    [(architecture, True) for architecture in [
         "yolov4",
         "yolov4-tiny",
         "yolov4-p6",
@@ -25,12 +25,17 @@ from lightning_yolo.torch_networks import create_network
         "yolox-s",
         "yolox-m",
         "yolox-l",
-    ],
+    ]] + [("yolov8n", False), ("yolox-tiny", False)],
 )
 @pytest.mark.parametrize("in_channels", [1, 3])
-def test_create_network(architecture, in_channels):
+def test_create_network(architecture, predict_confidence, in_channels):
     num_classes = 2
-    model = create_network(architecture=architecture, num_classes=num_classes, in_channels=in_channels)
+    model = create_network(
+        architecture=architecture,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        predict_confidence=predict_confidence,
+    )
     model.eval()
 
     images = torch.rand(1, in_channels, 128, 128)

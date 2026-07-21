@@ -1929,6 +1929,7 @@ class YOLOXHead(nn.Module):
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
             "linear", or "none".
         norm: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
+        predict_confidence: Whether the head predicts a confidence (objectness) channel.
 
     """
 
@@ -1940,6 +1941,7 @@ class YOLOXHead(nn.Module):
         num_classes: int,
         activation: str | None = "silu",
         norm: str | None = "batchnorm",
+        predict_confidence: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1964,20 +1966,23 @@ class YOLOXHead(nn.Module):
         self.stem = conv(in_channels, hidden_channels)
         self.feat = features(hidden_channels)
         self.box = linear(hidden_channels, anchors_per_cell * 4)
-        self.confidence = linear(hidden_channels, anchors_per_cell)
+        self.confidence = linear(hidden_channels, anchors_per_cell) if predict_confidence else None
         self.classprob = classprob(hidden_channels)
 
-        confidence_bias = detection_confidence_bias()
         initialize_zero_bias(self.box)
-        initialize_constant_bias(self.confidence, confidence_bias)
+        if self.confidence is not None:
+            initialize_constant_bias(self.confidence, detection_confidence_bias())
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.stem(x)
         features = self.feat(x)
         box = self.box(features)
-        confidence = self.confidence(features)
         classprob = self.classprob(x)
-        return torch.cat((box, confidence, classprob), dim=1)
+        outputs = [box]
+        if self.confidence is not None:
+            outputs.append(self.confidence(features))
+        outputs.append(classprob)
+        return torch.cat(outputs, dim=1)
 
 
 class YOLOXNetwork(nn.Module):
@@ -2082,6 +2087,7 @@ class YOLOXNetwork(nn.Module):
                 num_classes,
                 activation=activation,
                 norm=normalization,
+                predict_confidence=predict_confidence,
             )
 
         def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
