@@ -24,14 +24,15 @@ def test_detection_layer_forward():
     )
     x = torch.randn(1, 14, 2, 2)
     image_size = torch.tensor([64, 64])
-    output, preds = layer(x, image_size)
+    level = layer(x, image_size)
+    preds = level.as_grid()
 
-    assert output.shape == (1, 8, 7)
+    assert level.detections.shape == (1, 8, 7)
     assert len(preds) == 1
     assert preds[0]["boxes"].shape == (2, 2, 2, 4)
     assert preds[0]["confidences"].shape == (2, 2, 2)
     assert preds[0]["classprobs"].shape == (2, 2, 2, 2)
-    assert torch.isfinite(output).all()
+    assert torch.isfinite(level.detections).all()
 
 
 def test_detection_layer_forward_no_confidence():
@@ -64,17 +65,19 @@ def test_detection_layer_forward_no_confidence():
     # Confidence-free heads predict num_classes + 4 attributes per anchor (no objectness channel).
     x = torch.randn(1, 2 * (2 + 4), 2, 2)
     image_size = torch.tensor([64, 64])
-    output, preds = layer(x, image_size)
+    level = layer(x, image_size)
+    preds = level.as_grid()
 
     # The public output keeps the num_classes + 5 layout with a constant confidence of one.
-    assert output.shape == (1, 8, 7)
-    torch.testing.assert_close(output[..., 4], torch.ones_like(output[..., 4]))
+    assert level.detections.shape == (1, 8, 7)
+    torch.testing.assert_close(level.detections[..., 4], torch.ones_like(level.detections[..., 4]))
     assert preds[0]["classprobs"].shape == (2, 2, 2, 2)
     assert torch.equal(preds[0]["confidences"], torch.ones_like(preds[0]["confidences"]))
-    assert torch.isfinite(output).all()
+    assert torch.isfinite(level.detections).all()
 
     targets = [{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}]
-    loss_record = layer.calculate_losses(preds, targets, image_size)
+    matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
+    loss_record = layer.loss_func.matched_losses(matching_result, preds, layer.input_is_normalized, image_size)
     torch.testing.assert_close(loss_record.normalizers, torch.tensor([1.0, 1.0, 1.0]))
 
 

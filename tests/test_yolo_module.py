@@ -5,6 +5,8 @@ from torch import nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
+from lightning_yolo import _migrate_legacy_checkpoint_hparams
+from lightning_yolo.config import MatchingConfig
 from lightning_yolo.initialization import detection_classprob_bias
 from lightning_yolo.torch_networks import YOLOXHead
 from lightning_yolo.yolo_module import YOLO
@@ -15,7 +17,7 @@ def test_yolo(predict_confidence: bool) -> None:
     module = YOLO(
         architecture="yolov8n",
         num_classes=2,
-        matching_algorithm="tal",
+        matching=MatchingConfig(algorithm="tal"),
         predict_confidence=predict_confidence,
     )
     images = torch.rand(1, 3, 64, 64)
@@ -26,6 +28,31 @@ def test_yolo(predict_confidence: bool) -> None:
     # Finite losses with empty targets.
     assert torch.isfinite(losses).all()
     assert losses.max() < 100
+
+
+def test_migrate_legacy_checkpoint_hparams() -> None:
+    hparams = {
+        "architecture": "yolov8n",
+        "matching_algorithm": "tal",
+        "matching_threshold": 0.5,
+        "overlap_func": "ciou",
+        "overlap_loss_multiplier": 5.0,
+        "confidence_loss_multiplier": 1.0,
+        "class_loss_multiplier": 1.0,
+    }
+
+    migrated = _migrate_legacy_checkpoint_hparams(hparams)
+
+    assert migrated == {
+        "architecture": "yolov8n",
+        "matching": {"algorithm": "tal", "threshold": 0.5},
+        "loss": {
+            "overlap_func": "ciou",
+            "overlap_multiplier": 5.0,
+            "confidence_multiplier": 1.0,
+            "class_multiplier": 1.0,
+        },
+    }
 
 
 def test_yolo_to_onnx(tmp_path):

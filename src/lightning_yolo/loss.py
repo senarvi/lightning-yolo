@@ -1,6 +1,5 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import singledispatchmethod
 from typing import Literal
 
 import torch
@@ -17,7 +16,7 @@ from torchvision.ops import (
 )
 
 from .matching_result import DenseMatchingResult, MatchingResult, SparseMatchingResult
-from .types import PREDICTIONS, PredictionDict, TargetDict
+from .types import PREDICTIONS, DetectionLossRecord, PredictionDict, TargetDict
 
 _PredKey = Literal["boxes", "confidences", "classprobs"]
 
@@ -320,7 +319,7 @@ class YOLOLoss:
         self.class_multiplier = class_multiplier
         self.predict_confidence = predict_confidence
 
-    def pairwise(
+    def pairwise_costs(
         self,
         preds: PredictionDict,
         targets: TargetDict,
@@ -328,7 +327,7 @@ class YOLOLoss:
     ) -> tuple[YOLOLosses, Tensor]:
         """Calculates matrices containing the losses for all prediction/target pairs.
 
-        This method is called for obtaining costs for SimOTA matching.
+        Called by SimOTA matching to compute assignment costs for every candidate anchor.
 
         Args:
             preds: A dictionary of predictions, containing "boxes", "confidences", and "classprobs". Each tensor
@@ -372,13 +371,37 @@ class YOLOLoss:
 
         return losses, overlap
 
-    @singledispatchmethod
+    def matched_losses(
+        self,
+        matching: MatchingResult,
+        preds: PREDICTIONS,
+        input_is_normalized: bool,
+        image_size: Tensor,
+    ) -> DetectionLossRecord:
+        """Computes summed training losses from the predictions assigned by ``matching``.
+
+        Args:
+            matching: The target assignments produced by a matcher.
+            preds: Predicted boxes, confidences, and class scores for each image.
+            input_is_normalized: If ``False``, input is logits, if ``True``, input is normalized to `0..1`.
+            image_size: Width and height used for box-size weighting.
+
+        Returns:
+            The overlap, confidence, and classification loss sums with their normalizers.
+
+        """
+        with torch.profiler.record_function("loss_sums"):
+            losses = self.sums(matching, preds, input_is_normalized, image_size)
+        loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
+        normalizers = matching.assignment_weight_sum.expand_as(loss_sums).to(loss_sums.dtype)
+        return DetectionLossRecord(loss_sums=loss_sums, normalizers=normalizers)
+
     def sums(
         self,
         matching: MatchingResult,
-        preds: PREDICTIONS,  # noqa: ARG002
-        input_is_normalized: bool,  # noqa: ARG002
-        image_size: Tensor,  # noqa: ARG002
+        preds: PREDICTIONS,
+        input_is_normalized: bool,
+        image_size: Tensor,
     ) -> YOLOLosses:
         """Calculates loss sums for the predictions matched by ``matching``.
 
@@ -395,9 +418,12 @@ class YOLOLoss:
             Loss sums for overlap, confidence, and classification.
 
         """
+        if isinstance(matching, DenseMatchingResult):
+            return self._dense_sums(matching, preds, input_is_normalized, image_size)
+        if isinstance(matching, SparseMatchingResult):
+            return self._sparse_sums(matching, preds, input_is_normalized, image_size)
         raise TypeError(f"Unsupported matching result type: {type(matching)!r}")
 
-    @sums.register(DenseMatchingResult)
     def _dense_sums(
         self,
         matching: DenseMatchingResult,
@@ -412,13 +438,14 @@ class YOLOLoss:
         bce_func: Callable[..., Tensor] = (
             binary_cross_entropy if input_is_normalized else binary_cross_entropy_with_logits
         )
-        target_boxes = matching.target_boxes.flatten(0, 1)
-        pred_boxes = pred_batch["boxes"].flatten(0, 1)
-        target_boxes = torch.where(foreground.flatten().unsqueeze(-1), target_boxes, pred_boxes.detach())
-        overlap_loss_values = self._elementwise_overlap_loss(target_boxes, pred_boxes).view_as(foreground)
-        overlap = 1.0 - overlap_loss_values
-        box_weights = _size_compensation(target_boxes, image_size).view_as(foreground)
-        overlap_loss = torch.where(foreground, overlap_loss_values * box_weights * assignment_weights, 0.0).sum()
+        flat_foreground = foreground.flatten()
+        target_boxes = matching.target_boxes.flatten(0, 1)[flat_foreground]
+        pred_boxes = pred_batch["boxes"].flatten(0, 1)[flat_foreground]
+        overlap_loss_values = self._elementwise_overlap_loss(target_boxes, pred_boxes)
+        overlap = torch.zeros_like(assignment_weights)
+        overlap.masked_scatter_(foreground, (1.0 - overlap_loss_values).detach())
+        box_weights = _size_compensation(target_boxes, image_size)
+        overlap_loss = (overlap_loss_values * box_weights * assignment_weights[foreground]).sum()
 
         if self.predict_confidence:
             confidence_targets = assignment_weights
@@ -453,7 +480,6 @@ class YOLOLoss:
             class_loss * self.class_multiplier,
         )
 
-    @sums.register(SparseMatchingResult)
     def _sparse_sums(
         self,
         matching: SparseMatchingResult,

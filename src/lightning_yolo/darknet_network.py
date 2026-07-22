@@ -10,6 +10,7 @@ from lightning.pytorch.utilities import rank_zero_info
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from torch import Tensor, nn
 
+from .config import LossConfig, MatchingConfig
 from .initialization import detection_classprob_bias, detection_confidence_bias, initialize_yolo_logits
 from .layers import (
     Conv,
@@ -42,29 +43,10 @@ class DarknetNetwork(nn.Module):
             resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
-        matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
-            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
-            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
-        matching_threshold: Threshold for "size" and "iou" matching algorithms.
-        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target, where `N` is the value of this parameter.
-        size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
-            no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
-        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the corresponding anchor
-            has IoU with some target greater than this threshold, the predictor will not be taken into account when
-            calculating the confidence loss.
-        overlap_func: A function for calculating the pairwise overlaps between two sets of boxes. Either a string or a
-            function that returns a matrix of pairwise overlaps. Valid string values are "iou", "giou", "diou", and
-            "ciou".
-        predict_overlap: Balance between binary confidence targets and predicting the overlap. 0.0 means that the target
-            confidence is 1 if there's an object, and 1.0 means that the target confidence is the output of
-            ``overlap_func``.
-        label_smoothing: The epsilon parameter (weight) for class label smoothing. 0.0 means no smoothing (binary
-            targets), and 1.0 means that the target probabilities are always 0.5.
-        overlap_loss_multiplier: Overlap loss will be scaled by this value.
-        confidence_loss_multiplier: Confidence loss will be scaled by this value.
-        class_loss_multiplier: Classification loss will be scaled by this value.
+        matching: Configuration that controls how targets are assigned to anchors. Fields left as ``None`` will fall
+            back to the corresponding values from the Darknet ``.cfg`` file where applicable.
+        loss: Configuration that controls how detection losses are computed. Fields left as ``None`` will fall back to
+            the corresponding values from the Darknet ``.cfg`` file where applicable.
 
     """
 
@@ -118,7 +100,13 @@ class DarknetNetwork(nn.Module):
                 x, preds = layer(x, image_size)
                 detections.append(x)
                 if targets is not None:
-                    losses.append(layer.calculate_losses(preds, targets, image_size))
+                    # Darknet configurations always use per-level matchers (TAL is rejected during construction).
+                    assert layer.matching_func is not None
+                    with torch.profiler.record_function("match_targets"):
+                        matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
+                    losses.append(
+                        layer.loss_func.matched_losses(matching_result, preds, layer.input_is_normalized, image_size)
+                    )
             else:
                 x = layer(x)
 
@@ -434,17 +422,8 @@ def _create_yolo(
     num_inputs: list[int],  # noqa: ARG001
     num_classes: int | None = None,
     prior_shapes: PRIOR_SHAPES | None = None,
-    matching_algorithm: str | None = None,
-    matching_threshold: float | None = None,
-    spatial_range: float = 5.0,
-    size_range: float = 4.0,
-    ignore_bg_threshold: float | None = None,
-    overlap_func: str | Callable | None = None,
-    predict_overlap: float | None = None,
-    label_smoothing: float | None = None,
-    overlap_loss_multiplier: float | None = None,
-    confidence_loss_multiplier: float | None = None,
-    class_loss_multiplier: float | None = None,
+    matching: MatchingConfig | None = None,
+    loss: LossConfig | None = None,
     xy_scale: float | None = None,
     **_: Any,
 ) -> CREATE_LAYER_OUTPUT:
@@ -459,29 +438,10 @@ def _create_yolo(
             resolution. There should be `3N` tuples, where `N` defines the number of anchors per spatial location. They
             are assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning
             that you typically want to sort the shapes from the smallest to the largest.
-        matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
-            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
-            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
-        matching_threshold: Threshold for "size" and "iou" matching algorithms.
-        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target, where `N` is the value of this parameter.
-        size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
-            no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
-        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the corresponding anchor
-            has IoU with some target greater than this threshold, the predictor will not be taken into account when
-            calculating the confidence loss.
-        overlap_func: A function for calculating the pairwise overlaps between two sets of boxes. Either a string or a
-            function that returns a matrix of pairwise overlaps. Valid string values are "iou", "giou", "diou", and
-            "ciou".
-        predict_overlap: Balance between binary confidence targets and predicting the overlap. 0.0 means that the target
-            confidence is 1 if there's an object, and 1.0 means that the target confidence is the output of
-            ``overlap_func``.
-        label_smoothing: The epsilon parameter (weight) for class label smoothing. 0.0 means no smoothing (binary
-            targets), and 1.0 means that the target probabilities are always 0.5.
-        overlap_loss_multiplier: Overlap loss will be scaled by this value.
-        confidence_loss_multiplier: Confidence loss will be scaled by this value.
-        class_loss_multiplier: Classification loss will be scaled by this value.
+        matching: Configuration that controls how targets are assigned to anchors. Fields left as ``None`` will fall
+            back to the corresponding values from the Darknet ``.cfg`` file where applicable.
+        loss: Configuration that controls how detection losses are computed. Fields left as ``None`` will fall back to
+            the corresponding values from the Darknet ``.cfg`` file where applicable.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
             to produce coordinate values close to one.
 
@@ -490,28 +450,47 @@ def _create_yolo(
         its output (always 0 for a detection layer).
 
     """
+    matching = matching or MatchingConfig()
+    loss = loss or LossConfig()
+
     if num_classes is None:
         num_classes = config["classes"]
         assert isinstance(num_classes, int)
+    if matching.algorithm == "tal":
+        raise ValueError(
+            'Task-aligned matching ("tal") is not supported in Darknet configurations. It assigns targets across all '
+            "feature levels at once, but a Darknet model is a sequential graph that processes one detection layer at a "
+            "time. Use a native architecture for task-aligned matching."
+        )
     if prior_shapes is None:
         # The "anchors" list alternates width and height.
         dims = config["anchors"]
         prior_shapes = [(dims[i], dims[i + 1]) for i in range(0, len(dims), 2)]
+    ignore_bg_threshold = matching.ignore_bg_threshold
     if ignore_bg_threshold is None:
         ignore_bg_threshold = config.get("ignore_thresh", 1.0)
         assert isinstance(ignore_bg_threshold, float)
+
+    overlap_func = loss.overlap_func
     if overlap_func is None:
         overlap_func = config.get("iou_loss", "iou")
-        assert isinstance(overlap_func, str)
-    if overlap_loss_multiplier is None:
-        overlap_loss_multiplier = config.get("iou_normalizer", 1.0)
-        assert isinstance(overlap_loss_multiplier, float)
-    if confidence_loss_multiplier is None:
-        confidence_loss_multiplier = config.get("obj_normalizer", 1.0)
-        assert isinstance(confidence_loss_multiplier, float)
-    if class_loss_multiplier is None:
-        class_loss_multiplier = config.get("cls_normalizer", 1.0)
-        assert isinstance(class_loss_multiplier, float)
+        assert isinstance(overlap_func, str | Callable)
+
+    overlap_multiplier = loss.overlap_multiplier
+    if overlap_multiplier is None:
+        overlap_multiplier = config.get("iou_normalizer", 1.0)
+        assert isinstance(overlap_multiplier, float)
+
+    confidence_multiplier = loss.confidence_multiplier
+    if confidence_multiplier is None:
+        confidence_multiplier = config.get("obj_normalizer", 1.0)
+        assert isinstance(confidence_multiplier, float)
+
+    class_multiplier = loss.class_multiplier
+    if class_multiplier is None:
+        class_multiplier = config.get("cls_normalizer", 1.0)
+        assert isinstance(class_multiplier, float)
+
     if xy_scale is None:
         xy_scale = config.get("scale_x_y", 1.0)
         assert isinstance(xy_scale, float)
@@ -520,17 +499,21 @@ def _create_yolo(
         num_classes=num_classes,
         prior_shapes=prior_shapes,
         prior_shape_idxs=config["mask"],
-        matching_algorithm=matching_algorithm,
-        matching_threshold=matching_threshold,
-        spatial_range=spatial_range,
-        size_range=size_range,
-        ignore_bg_threshold=ignore_bg_threshold,
-        overlap_func=overlap_func,
-        predict_overlap=predict_overlap,
-        label_smoothing=label_smoothing,
-        overlap_loss_multiplier=overlap_loss_multiplier,
-        confidence_loss_multiplier=confidence_loss_multiplier,
-        class_loss_multiplier=class_loss_multiplier,
+        matching=MatchingConfig(
+            algorithm=matching.algorithm,
+            threshold=matching.threshold,
+            spatial_range=matching.spatial_range,
+            size_range=matching.size_range,
+            ignore_bg_threshold=ignore_bg_threshold,
+        ),
+        loss=LossConfig(
+            overlap_func=overlap_func,
+            predict_overlap=loss.predict_overlap,
+            label_smoothing=loss.label_smoothing,
+            overlap_multiplier=overlap_multiplier,
+            confidence_multiplier=confidence_multiplier,
+            class_multiplier=class_multiplier,
+        ),
         xy_scale=xy_scale,
         input_is_normalized=config.get("new_coords", 0) > 0,
     )

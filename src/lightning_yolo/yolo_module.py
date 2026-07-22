@@ -11,6 +11,7 @@ from torchmetrics.detection import MeanAveragePrecision
 from torchvision.ops import batched_nms
 from torchvision.transforms import functional as T
 
+from .config import LossConfig, MatchingConfig
 from .darknet_network import DarknetNetwork
 from .torch_networks import create_network
 from .types import BATCH, IMAGES, PRIOR_SHAPES, TARGETS
@@ -107,28 +108,10 @@ class YOLO(LightningModule):
             that you typically want to sort the shapes from the smallest to the largest.
         predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to drop
             confidence supervision and supervise all anchors via classification loss only.
-        matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
-            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
-            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
-        matching_threshold: Threshold for "size" and "iou" matching algorithms.
-        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target, where `N` is the value of this parameter.
-        size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
-            no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
-        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the corresponding anchor
-            has IoU with some target greater than this threshold, the predictor will not be taken into account when
-            calculating the confidence loss.
-        overlap_func: A function for calculating the pairwise overlaps between two sets of boxes. Valid values are
-            "iou", "giou", "diou", and "ciou".
-        predict_overlap: Balance between binary confidence targets and predicting the overlap. 0.0 means that target
-            confidence is one if there's an object, and 1.0 means that the target confidence is the output of
-            ``overlap_func``.
-        label_smoothing: The epsilon parameter (weight) for class label smoothing. 0.0 means no smoothing (binary
-            targets), and 1.0 means that the target probabilities are always 0.5.
-        overlap_loss_multiplier: Overlap loss will be scaled by this value.
-        confidence_loss_multiplier: Confidence loss will be scaled by this value.
-        class_loss_multiplier: Classification loss will be scaled by this value.
+        matching: Configuration that controls how targets are assigned to anchors (matching algorithm, thresholds, and
+            the task-aligned matching hyperparameters). See :class:`~lightning_yolo.config.MatchingConfig`.
+        loss: Configuration that controls how the detection losses are computed (overlap function, label smoothing, and
+            the loss multipliers). See :class:`~lightning_yolo.config.LossConfig`.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
             to produce coordinate values close to one.
         lr: Learning rate after warmup.
@@ -153,17 +136,8 @@ class YOLO(LightningModule):
         num_channels: int = 3,
         num_classes: int | None = None,
         prior_shapes: PRIOR_SHAPES | None = None,
-        matching_algorithm: str | None = None,
-        matching_threshold: float | None = None,
-        spatial_range: float = 5.0,
-        size_range: float = 4.0,
-        ignore_bg_threshold: float | None = None,
-        overlap_func: str | None = None,
-        predict_overlap: float | None = None,
-        label_smoothing: float | None = None,
-        overlap_loss_multiplier: float | None = None,
-        confidence_loss_multiplier: float | None = None,
-        class_loss_multiplier: float | None = None,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
         xy_scale: float | None = None,
         lr: float = 0.01,  # noqa: ARG002
         warmup_epochs: float = 3.0,  # noqa: ARG002
@@ -179,6 +153,9 @@ class YOLO(LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
+        matching = matching if matching is not None else MatchingConfig()
+        loss = loss if loss is not None else LossConfig()
+
         if darknet_config is not None:
             if architecture is not None:
                 raise ValueError("Cannot specify both a Darknet configuration and a built-in architecture.")
@@ -189,57 +166,25 @@ class YOLO(LightningModule):
                 in_channels=num_channels,
                 num_classes=num_classes,
                 prior_shapes=prior_shapes,
-                matching_algorithm=matching_algorithm,
-                matching_threshold=matching_threshold,
-                spatial_range=spatial_range,
-                size_range=size_range,
-                ignore_bg_threshold=ignore_bg_threshold,
-                overlap_func=overlap_func,
-                predict_overlap=predict_overlap,
-                label_smoothing=label_smoothing,
-                overlap_loss_multiplier=overlap_loss_multiplier,
-                confidence_loss_multiplier=confidence_loss_multiplier,
-                class_loss_multiplier=class_loss_multiplier,
+                matching=matching,
+                loss=loss,
                 xy_scale=xy_scale,
             )
         else:
-            # We need to ensure that required parameters are set, since we don't get the default values from a
-            # configuration file.
             if architecture is None:
                 raise ValueError("Either a Darknet configuration or a built-in architecture must be specified.")
             if num_classes is None:
                 raise ValueError("Number of classes must be specified when not using a Darknet configuration.")
-            if ignore_bg_threshold is None:
-                ignore_bg_threshold = 0.7
-            if overlap_func is None:
-                overlap_func = "ciou"
-            if overlap_loss_multiplier is None:
-                overlap_loss_multiplier = 5.0
-            if confidence_loss_multiplier is None:
-                confidence_loss_multiplier = 1.0
-            if class_loss_multiplier is None:
-                class_loss_multiplier = 1.0
-            if xy_scale is None:
-                xy_scale = 1.0
 
             self.network = create_network(
                 architecture=architecture,
                 num_classes=num_classes,
                 in_channels=num_channels,
                 prior_shapes=prior_shapes,
-                matching_algorithm=matching_algorithm,
-                matching_threshold=matching_threshold,
-                spatial_range=spatial_range,
-                size_range=size_range,
-                ignore_bg_threshold=ignore_bg_threshold,
-                overlap_func=overlap_func,
-                predict_overlap=predict_overlap,
-                label_smoothing=label_smoothing,
-                overlap_loss_multiplier=overlap_loss_multiplier,
-                confidence_loss_multiplier=confidence_loss_multiplier,
-                class_loss_multiplier=class_loss_multiplier,
-                xy_scale=xy_scale,
+                matching=matching,
+                loss=loss,
                 predict_confidence=predict_confidence,
+                xy_scale=xy_scale if xy_scale is not None else 1.0,
             )
 
         self.confidence_threshold = confidence_threshold
@@ -433,10 +378,10 @@ class YOLO(LightningModule):
         _, losses = self(images, targets)
         total_loss = losses.sum()
 
-        self.log("train/overlap_loss", losses[0], prog_bar=True, sync_dist=True)
-        self.log("train/confidence_loss", losses[1], prog_bar=True, sync_dist=True)
-        self.log("train/class_loss", losses[2], prog_bar=True, sync_dist=True)
-        self.log("train/total_loss", total_loss, sync_dist=True)
+        self.log("train/overlap_loss", losses[0], prog_bar=True, sync_dist=False)
+        self.log("train/confidence_loss", losses[1], prog_bar=True, sync_dist=False)
+        self.log("train/class_loss", losses[2], prog_bar=True, sync_dist=False)
+        self.log("train/total_loss", total_loss, sync_dist=False)
 
         return {"loss": total_loss}
 

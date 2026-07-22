@@ -464,7 +464,7 @@ class SimOTAMatching:
             "classprobs": preds["classprobs"][prior_mask],
         }
 
-        losses, ious = self.loss_func.pairwise(prior_preds, targets, input_is_normalized=input_is_normalized)
+        losses, ious = self.loss_func.pairwise_costs(prior_preds, targets, input_is_normalized=input_is_normalized)
         costs = losses.overlap + losses.confidence + losses.classification
         costs += 100000.0 * ~anchor_inside_target
         pred_mask, target_selector = _sim_ota_match(costs, ious)
@@ -564,6 +564,11 @@ class TALMatching:
     task-aligned score. For each target, top-k anchors by alignment score are selected from anchors whose center point
     is inside the target box.
 
+    Task-aligned matching selects the top candidates across all feature levels at once, so it is global: native
+    architectures prepare the concatenated predictions and anchor points in their detection head before calling this
+    matcher. It is therefore not usable in the per-level path of Darknet configurations, which process one detection
+    layer at a time.
+
     The assignment weight sum is the sum of normalized alignment scores for the matched foreground anchors.
 
     Args:
@@ -598,17 +603,22 @@ class TALMatching:
         self,
         preds: PREDICTIONS,
         targets: TARGETS,
-        image_size: Tensor,
+        anchor_points: Tensor,
         input_is_normalized: bool = False,
     ) -> MatchingResult:
         """Selects predictions for a batch using task-aligned matching.
 
+        Task-aligned matching is global, so ``anchor_points`` (the candidate centers of every feature level) must be
+        given by the caller. Native architectures prepare them in their detection head. Per-level matching, as used by
+        the Darknet path, is not supported.
+
         Args:
-            preds: Predictions for each image.
+            preds: Predictions for each image, concatenated across all feature levels.
             targets: Training targets for each image.
-            image_size: Input image width and height.
+            anchor_points: Candidate centers in image coordinates for every prediction.
             input_is_normalized: The predicted confidences and class probabilities have been normalized by logistic
-                activation. This is used by the Darknet configurations of Scaled-YOLOv4.
+                activation. If ``False``, class probabilities are logits and are normalized with sigmoid for TAL
+                assignment scores only; the original logits remain available for loss calculation.
 
         Returns:
             Fixed-shape assignments for the whole batch.
@@ -616,17 +626,11 @@ class TALMatching:
         """
         batch_size = len(preds)
         device = preds[0]["boxes"].device
-        grid_height, grid_width, boxes_per_cell, _ = preds[0]["boxes"].shape
-        num_preds = grid_height * grid_width * boxes_per_cell
+        num_preds = preds[0]["boxes"].numel() // 4
         num_classes = preds[0]["classprobs"].shape[-1]
 
-        # This multiplier scales feature map coordinates to image coordinates.
-        grid_size = torch.tensor([grid_width, grid_height], device=device)
-        grid_to_image = torch.true_divide(image_size, grid_size)
-
-        # Create the anchor centers in image coordinates. The centers are the same for all images in the batch.
-        centers = grid_centers(grid_size).view(-1, 2) * grid_to_image  # [grid_cells, 2]
-        centers = centers[:, None, :].repeat(1, boxes_per_cell, 1).view(-1, 2)  # [num_preds, 2]
+        if anchor_points.shape != (num_preds, 2):
+            raise ValueError(f"Expected {num_preds} anchor points, got shape {tuple(anchor_points.shape)}.")
 
         # Flatten the spatial and anchor dimensions, then stack predictions so that TAL can process the whole batch.
         pred_boxes = torch.stack([pred["boxes"].reshape(-1, 4) for pred in preds])
@@ -652,7 +656,7 @@ class TALMatching:
 
         # Create a [batch, predictions, targets] tensor that indicates which anchor centers are inside each target box.
         # The centers and padded boxes are broadcast across the batch and prediction dimensions, respectively.
-        pts = centers[None, :, None, :]  # [1, N, 1, 2]
+        pts = anchor_points[None, :, None, :]  # [1, N, 1, 2]
         lt = pts[..., :2] - padded_boxes[:, None, :, :2]  # [B, N, T_max, 2]
         rb = padded_boxes[:, None, :, 2:] - pts[..., :2]  # [B, N, T_max, 2]
         inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0  # [B, N, T_max]
@@ -681,10 +685,8 @@ class TALMatching:
             align_metric, ious, inside_selector, target_mask, self.topk, self.eps
         )  # [B, N], [B, N], [B, N]
 
-        # The background IoU mask for confidence suppression has shape [B, grid_h, grid_w, boxes_per_cell].
-        best_iou = ious.amax(dim=2).view(batch_size, grid_height, grid_width, boxes_per_cell)
-
-        background = (best_iou <= self.ignore_bg_threshold).view(batch_size, num_preds) & ~pred_mask
+        best_iou = ious.amax(dim=2)
+        background = (best_iou <= self.ignore_bg_threshold) & ~pred_mask
         target_boxes = torch.gather(padded_boxes, 1, target_sel.unsqueeze(-1).expand(-1, -1, 4))
 
         if first_labels.ndim == 1:

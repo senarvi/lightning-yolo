@@ -21,6 +21,41 @@ class DetectionLossRecord:
         return DetectionLossRecord(loss_sums=self.loss_sums * scale, normalizers=self.normalizers * scale)
 
 
+@dataclass(frozen=True)
+class LevelPredictions:
+    """Decoded predictions and geometry for one detection feature level.
+
+    Attributes:
+        detections: Public normalized detections shaped ``[B, N, C + 5]``.
+        boxes: Decoded boxes shaped ``[B, N, 4]``.
+        confidences: Confidence logits, or normalized probabilities when the input is normalized, shaped ``[B, N]``.
+        classprobs: Classification logits, or normalized probabilities when the input is normalized, shaped
+            ``[B, N, C]``.
+        anchor_points: Candidate center points in image coordinates shaped ``[N, 2]``.
+        spatial_shape: Feature grid height, width, and candidates per cell.
+
+    """
+
+    detections: Tensor
+    boxes: Tensor
+    confidences: Tensor
+    classprobs: Tensor
+    anchor_points: Tensor
+    spatial_shape: tuple[int, int, int]
+
+    def as_grid(self) -> list[PredictionDict]:
+        """Return per-image prediction dictionaries with tensors shaped by grid cell and candidate."""
+        height, width, candidates_per_cell = self.spatial_shape
+        return [
+            {
+                "boxes": boxes.view(height, width, candidates_per_cell, 4),
+                "confidences": confidences.view(height, width, candidates_per_cell),
+                "classprobs": classprobs.view(height, width, candidates_per_cell, -1),
+            }
+            for boxes, confidences, classprobs in zip(self.boxes, self.confidences, self.classprobs, strict=True)
+        ]
+
+
 class PredictionDict(TypedDict):
     boxes: Tensor
     confidences: Tensor

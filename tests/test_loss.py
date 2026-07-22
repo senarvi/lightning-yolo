@@ -124,7 +124,7 @@ def test_target_labels_to_probs_class_probabilities():
     ],
 )
 def test_yolo_loss_pairwise(loss, preds, targets, input_is_normalized, expected_shape):
-    losses, overlap = loss.pairwise(preds, targets, input_is_normalized=input_is_normalized)
+    losses, overlap = loss.pairwise_costs(preds, targets, input_is_normalized=input_is_normalized)
 
     assert overlap.shape == expected_shape
     torch.testing.assert_close(overlap, box_iou(preds["boxes"], targets["boxes"]))

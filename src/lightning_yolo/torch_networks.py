@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from .config import LossConfig, MatchingConfig
 from .initialization import (
     detection_classprob_bias,
     detection_confidence_bias,
@@ -12,7 +13,7 @@ from .initialization import (
     initialize_yolo_logits,
     initialize_zero_bias,
 )
-from .layers import Conv, MaxPool, ReOrg, create_detection_layer
+from .layers import Conv, DetectionHeadWithAux, MaxPool, ReOrg, create_detection_head
 from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS, DetectionLossRecord
 from .utils import get_image_size
 
@@ -676,101 +677,6 @@ class YOLOV8Backbone(nn.Module):
         return [c1, c2, c3, c4, c5]
 
 
-class DetectionStage(nn.Module):
-    """This is a convenience class for running a detection layer.
-
-    It might be cleaner to implement this as a function, but TorchScript allows only specific types in function
-    arguments, not modules.
-
-    """
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__()
-        self.detection_layer = create_detection_layer(**kwargs)
-
-    def forward(
-        self,
-        layer_input: Tensor,
-        targets: TARGETS | None,
-        image_size: Tensor,
-        detections: list[Tensor],
-        losses: list[DetectionLossRecord],
-    ) -> None:
-        """Runs the detection layer on the inputs and appends the output to the ``detections`` list.
-
-        If ``targets`` is given, also calculates the losses and appends to the ``losses`` list.
-
-        Args:
-            layer_input: Input to the detection layer.
-            targets: List of training targets for each image.
-            image_size: Width and height in a vector that defines the scale of the target coordinates.
-            detections: A list where a tensor containing the detections will be appended to.
-            losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
-
-        """
-        output, preds = self.detection_layer(layer_input, image_size)
-        detections.append(output)
-
-        if targets is not None:
-            losses.append(self.detection_layer.calculate_losses(preds, targets, image_size))
-
-
-class DetectionStageWithAux(nn.Module):
-    """This class represents a combination of a lead and an auxiliary detection layer.
-
-    Args:
-        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target. This parameter specifies `N` for the lead head.
-        aux_spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target. This parameter specifies `N` for the auxiliary head.
-        aux_weight: Weight for the loss from the auxiliary head.
-
-    """
-
-    def __init__(
-        self, spatial_range: float = 5.0, aux_spatial_range: float = 3.0, aux_weight: float = 0.25, **kwargs: Any
-    ) -> None:
-        super().__init__()
-        self.detection_layer = create_detection_layer(spatial_range=spatial_range, **kwargs)
-        self.aux_detection_layer = create_detection_layer(spatial_range=aux_spatial_range, **kwargs)
-        self.aux_weight = aux_weight
-
-    def forward(
-        self,
-        layer_input: Tensor,
-        aux_input: Tensor,
-        targets: TARGETS | None,
-        image_size: Tensor,
-        detections: list[Tensor],
-        losses: list[DetectionLossRecord],
-    ) -> None:
-        """Runs the detection layer and the auxiliary detection layer on their respective inputs and appends the outputs
-        to the ``detections`` list.
-
-        If ``targets`` is given, also calculates the losses and appends to the ``losses`` list.
-
-        Args:
-            layer_input: Input to the lead detection layer.
-            aux_input: Input to the auxiliary detection layer.
-            targets: List of training targets for each image.
-            image_size: Width and height in a vector that defines the scale of the target coordinates.
-            detections: A list where a tensor containing the detections will be appended to.
-            losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
-
-        """
-        output, preds = self.detection_layer(layer_input, image_size)
-        detections.append(output)
-
-        if targets is not None:
-            # Match lead head predictions to targets and calculate losses from lead head outputs.
-            losses.append(self.detection_layer.calculate_losses(preds, targets, image_size))
-
-            # Match lead head predictions to targets and calculate losses from auxiliary head outputs.
-            _, aux_preds = self.aux_detection_layer(aux_input, image_size)
-            layer_losses = self.aux_detection_layer.calculate_losses(preds, targets, image_size, loss_preds=aux_preds)
-            losses.append(layer_losses.scaled(self.aux_weight))
-
-
 class YOLOV4TinyNetwork(nn.Module):
     """The "tiny" network architecture from YOLOv4.
 
@@ -828,7 +734,9 @@ class YOLOV4TinyNetwork(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -868,17 +776,6 @@ class YOLOV4TinyNetwork(nn.Module):
             initialize_yolo_logits(result, num_classes, confidence_bias, classprob_bias)
             return result
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
-            assert prior_shapes is not None
-            return DetectionStage(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                **kwargs,
-            )
-
         self.backbone = backbone or YOLOV4TinyBackbone(
             in_channels=in_channels,
             width=width,
@@ -904,14 +801,18 @@ class YOLOV4TinyNetwork(nn.Module):
         self.fpn3 = conv(width * 6, width * 4, kernel_size=3)
         self.out3 = nn.Sequential(OrderedDict([(f"outputs_{num_outputs}", outputs(width * 4))]))
 
-        self.detect3 = detect([0, 1, 2])
-        self.detect4 = detect([3, 4, 5])
-        self.detect5 = detect([6, 7, 8])
+        self.detect = create_detection_head(
+            prior_shapes,
+            [[0, 1, 2], [3, 4, 5], [6, 7, 8]],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            predict_confidence=predict_confidence,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, c5 = self.backbone(x)[-3:]
@@ -922,10 +823,7 @@ class YOLOV4TinyNetwork(nn.Module):
         x = torch.cat((self.upsample4(p4), c3), dim=1)
         p3 = self.fpn3(x)
 
-        self.detect5(self.out5(p5), targets, image_size, detections, losses)
-        self.detect4(self.out4(p4), targets, image_size, detections, losses)
-        self.detect3(self.out3(p3), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect([self.out3(p3), self.out4(p4), self.out5(p5)], image_size, targets)
 
 
 class YOLOV4Network(nn.Module):
@@ -984,7 +882,9 @@ class YOLOV4Network(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -1041,17 +941,6 @@ class YOLOV4Network(nn.Module):
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
-            assert prior_shapes is not None
-            return DetectionStage(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                **kwargs,
-            )
-
         if backbone is not None:
             self.backbone = backbone
         else:
@@ -1086,14 +975,22 @@ class YOLOV4Network(nn.Module):
         self.out4 = out(w4)
         self.out5 = out(w5)
 
-        self.detect3 = detect(range(0, anchors_per_cell))
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
+        self.detect = create_detection_head(
+            prior_shapes,
+            [
+                range(0, anchors_per_cell),
+                range(anchors_per_cell, anchors_per_cell * 2),
+                range(anchors_per_cell * 2, anchors_per_cell * 3),
+            ],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            predict_confidence=predict_confidence,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -1108,10 +1005,7 @@ class YOLOV4Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect([self.out3(n3), self.out4(n4), self.out5(n5)], image_size, targets)
 
 
 class YOLOV4P6Network(nn.Module):
@@ -1170,7 +1064,9 @@ class YOLOV4P6Network(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -1234,17 +1130,6 @@ class YOLOV4P6Network(nn.Module):
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
-            assert prior_shapes is not None
-            return DetectionStage(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                **kwargs,
-            )
-
         if backbone is not None:
             self.backbone = backbone
         else:
@@ -1289,15 +1174,23 @@ class YOLOV4P6Network(nn.Module):
         self.out5 = out(w5)
         self.out6 = out(w6)
 
-        self.detect3 = detect(range(0, anchors_per_cell))
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
-        self.detect6 = detect(range(anchors_per_cell * 3, anchors_per_cell * 4))
+        self.detect = create_detection_head(
+            prior_shapes,
+            [
+                range(0, anchors_per_cell),
+                range(anchors_per_cell, anchors_per_cell * 2),
+                range(anchors_per_cell * 2, anchors_per_cell * 3),
+                range(anchors_per_cell * 3, anchors_per_cell * 4),
+            ],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            predict_confidence=predict_confidence,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, c5, x = self.backbone(x)[-4:]
@@ -1316,11 +1209,7 @@ class YOLOV4P6Network(nn.Module):
         x = torch.cat((self.downsample5(n5), c6), dim=1)
         n6 = self.pan6(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses)
-        self.detect6(self.out6(n6), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect([self.out3(n3), self.out4(n4), self.out5(n5), self.out6(n6)], image_size, targets)
 
 
 class YOLOV5Network(nn.Module):
@@ -1385,7 +1274,9 @@ class YOLOV5Network(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -1436,17 +1327,6 @@ class YOLOV5Network(nn.Module):
                 activation=activation,
             )
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
-            assert prior_shapes is not None
-            return DetectionStage(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                **kwargs,
-            )
-
         self.backbone = backbone or YOLOV5Backbone(
             in_channels=in_channels,
             depth=depth,
@@ -1480,14 +1360,22 @@ class YOLOV5Network(nn.Module):
         self.downsample3 = downsample(width * 4, width * 4)
         self.downsample4 = downsample(width * 8, width * 8)
 
-        self.detect3 = detect(range(0, anchors_per_cell))
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
+        self.detect = create_detection_head(
+            prior_shapes,
+            [
+                range(0, anchors_per_cell),
+                range(anchors_per_cell, anchors_per_cell * 2),
+                range(anchors_per_cell * 2, anchors_per_cell * 3),
+            ],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            predict_confidence=predict_confidence,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -1504,10 +1392,7 @@ class YOLOV5Network(nn.Module):
         x = torch.cat((self.downsample4(n4), p5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect([self.out3(n3), self.out4(n4), self.out5(n5)], image_size, targets)
 
 
 class YOLOV7W6Network(nn.Module):
@@ -1569,7 +1454,9 @@ class YOLOV7W6Network(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -1636,15 +1523,17 @@ class YOLOV7W6Network(nn.Module):
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStageWithAux:
+        def detection_head(prior_shape_idxs: Sequence[int]) -> DetectionHeadWithAux:
             assert prior_shapes is not None
-            return DetectionStageWithAux(
+            return DetectionHeadWithAux(
                 prior_shapes=prior_shapes,
                 prior_shape_idxs=list(prior_shape_idxs),
                 num_classes=num_classes,
                 input_is_normalized=False,
                 predict_confidence=predict_confidence,
-                **kwargs,
+                matching=matching,
+                loss=loss,
+                xy_scale=xy_scale,
             )
 
         if backbone is not None:
@@ -1696,10 +1585,12 @@ class YOLOV7W6Network(nn.Module):
         self.out6 = out(w6 // 2, w6)
         self.aux_out6 = out(w6 // 2, w6 + (w6 // 4))
 
-        self.detect3 = detect(range(0, anchors_per_cell))
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
-        self.detect6 = detect(range(anchors_per_cell * 3, anchors_per_cell * 4))
+        # Unlike the other architectures, YOLOv7 keeps a per-level DetectionHeadWithAux with its own lead/auxiliary
+        # deep supervision, so it cannot use the unified create_detection_head path.
+        self.detect3 = detection_head(range(0, anchors_per_cell))
+        self.detect4 = detection_head(range(anchors_per_cell, anchors_per_cell * 2))
+        self.detect5 = detection_head(range(anchors_per_cell * 2, anchors_per_cell * 3))
+        self.detect6 = detection_head(range(anchors_per_cell * 3, anchors_per_cell * 4))
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
@@ -1797,7 +1688,9 @@ class YOLOV8Network(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -1848,17 +1741,6 @@ class YOLOV8Network(nn.Module):
                 activation=activation,
             )
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
-            assert prior_shapes is not None
-            return DetectionStage(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                **kwargs,
-            )
-
         self.backbone = backbone or YOLOV8Backbone(
             in_channels=in_channels,
             widths=widths,
@@ -1888,14 +1770,22 @@ class YOLOV8Network(nn.Module):
         self.downsample3 = downsample(w3, w3)
         self.downsample4 = downsample(w4, w4)
 
-        self.detect3 = detect(range(0, anchors_per_cell))
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
+        self.detect = create_detection_head(
+            prior_shapes,
+            [
+                range(0, anchors_per_cell),
+                range(anchors_per_cell, anchors_per_cell * 2),
+                range(anchors_per_cell * 2, anchors_per_cell * 3),
+            ],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            predict_confidence=predict_confidence,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -1911,10 +1801,7 @@ class YOLOV8Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect([self.out3(n3), self.out4(n4), self.out5(n5)], image_size, targets)
 
 
 class YOLOXHead(nn.Module):
@@ -2047,7 +1934,9 @@ class YOLOXNetwork(nn.Module):
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
         predict_confidence: bool = True,
-        **kwargs: Any,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -2090,17 +1979,6 @@ class YOLOXNetwork(nn.Module):
                 predict_confidence=predict_confidence,
             )
 
-        def detect(prior_shape_idxs: Sequence[int]) -> DetectionStage:
-            assert prior_shapes is not None
-            return DetectionStage(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                **kwargs,
-            )
-
         self.backbone = backbone or YOLOV5Backbone(
             in_channels=in_channels,
             depth=depth,
@@ -2134,14 +2012,22 @@ class YOLOXNetwork(nn.Module):
         self.downsample3 = downsample(width * 4, width * 4)
         self.downsample4 = downsample(width * 8, width * 8)
 
-        self.detect3 = detect(range(0, anchors_per_cell))
-        self.detect4 = detect(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detect(range(anchors_per_cell * 2, anchors_per_cell * 3))
+        self.detect = create_detection_head(
+            prior_shapes,
+            [
+                range(0, anchors_per_cell),
+                range(anchors_per_cell, anchors_per_cell * 2),
+                range(anchors_per_cell * 2, anchors_per_cell * 3),
+            ],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            predict_confidence=predict_confidence,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -2158,13 +2044,19 @@ class YOLOXNetwork(nn.Module):
         x = torch.cat((self.downsample4(n4), p5), dim=1)
         n5 = self.pan5(x)
 
-        self.detect3(self.out3(n3), targets, image_size, detections, losses)
-        self.detect4(self.out4(n4), targets, image_size, detections, losses)
-        self.detect5(self.out5(n5), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect([self.out3(n3), self.out4(n4), self.out5(n5)], image_size, targets)
 
 
-def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Module:
+def create_network(
+    architecture: str,
+    num_classes: int,
+    in_channels: int = 3,
+    prior_shapes: PRIOR_SHAPES | None = None,
+    matching: MatchingConfig | None = None,
+    loss: LossConfig | None = None,
+    predict_confidence: bool = True,
+    xy_scale: float = 1.0,
+) -> nn.Module:
     """Create a YOLO network based on the given architecture name.
 
     Args:
@@ -2172,7 +2064,12 @@ def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Mod
             "yolov4-p6", "yolov5n", "yolov5s", "yolov5m", "yolov5l", "yolov5x", "yolov7-w6", "yolov8n",
             "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolox-tiny", "yolox-s", "yolox-m", and "yolox-l".
         num_classes: Number of different classes that this model predicts.
-        kwargs: Additional keyword arguments to pass to the network constructor.
+        in_channels: Number of channels in the input image.
+        prior_shapes: A list of prior box dimensions, or ``None`` to use the architecture defaults.
+        matching: Configuration that controls how targets are assigned to anchors.
+        loss: Configuration that controls how the detection losses are computed.
+        predict_confidence: Whether the head predicts a confidence (objectness) channel.
+        xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor.
 
     """
 
@@ -2236,4 +2133,13 @@ def create_network(architecture: str, num_classes: int, **kwargs: Any) -> nn.Mod
             "yolox-tiny, yolox-s, yolox-m, yolox-l."
         )
 
-    return network_class(num_classes=num_classes, **network_size, **kwargs)
+    return network_class(
+        num_classes=num_classes,
+        in_channels=in_channels,
+        prior_shapes=prior_shapes,
+        matching=matching,
+        loss=loss,
+        predict_confidence=predict_confidence,
+        xy_scale=xy_scale,
+        **network_size,
+    )

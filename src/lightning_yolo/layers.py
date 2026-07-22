@@ -1,10 +1,12 @@
-from collections.abc import Callable, Sequence
-from typing import Any
+from collections.abc import Sequence
+from dataclasses import replace
+from typing import cast
 
 import torch
 from torch import Tensor, nn
 from torchvision.ops import box_convert
 
+from .config import LossConfig, MatchingConfig
 from .loss import YOLOLoss
 from .target_matching import (
     HighestIoUMatching,
@@ -20,8 +22,9 @@ from .types import (
     PRIOR_SHAPES,
     TARGETS,
     DetectionLossRecord,
+    LevelPredictions,
 )
-from .utils import global_xy
+from .utils import global_xy, grid_centers
 
 
 def _get_padding(kernel_size: int, stride: int) -> tuple[int, nn.Module]:
@@ -62,7 +65,8 @@ class DetectionLayer(nn.Module):
         num_classes: Number of different classes that this layer predicts.
         prior_shapes: A list of prior box dimensions for this layer, used for scaling the predicted dimensions. The list
             should contain (width, height) tuples in the network input resolution.
-        matching_func: The matching algorithm to be used for assigning targets to anchors.
+        matching_func: The matching algorithm used for assigning targets to anchors, or ``None`` when a head-level
+            matcher (such as task-aligned matching) assigns targets across all levels instead.
         loss_func: ``YOLOLoss`` object for calculating the losses.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
             to produce coordinate values close to one.
@@ -77,7 +81,7 @@ class DetectionLayer(nn.Module):
         self,
         num_classes: int,
         prior_shapes: PRIOR_SHAPES,
-        matching_func: MatchingFn,
+        matching_func: MatchingFn | None,
         loss_func: YOLOLoss,
         xy_scale: float = 1.0,
         input_is_normalized: bool = False,
@@ -93,12 +97,13 @@ class DetectionLayer(nn.Module):
         self.input_is_normalized = input_is_normalized
         self.predict_confidence = predict_confidence
 
-    def forward(self, x: Tensor, image_size: Tensor) -> tuple[Tensor, PREDICTIONS]:
-        """Runs a forward pass through this YOLO detection layer.
+    def forward(self, x: Tensor, image_size: Tensor) -> LevelPredictions:
+        """Decode one feature level into a structured prediction representation.
 
         Maps cell-local coordinates to global coordinates in the image space, scales the bounding boxes with the
-        anchors, converts the center coordinates to corner coordinates, and maps probabilities to the `]0, 1[` range
-        using sigmoid.
+        anchors, converts the center coordinates to corner coordinates, and maps public detections to the `]0, 1[`
+        probability range using sigmoid. The returned training predictions preserve unnormalized confidence and class
+        logits when ``input_is_normalized`` is ``False``, so the loss can use ``binary_cross_entropy_with_logits``.
 
         Args:
             x: The output from the previous layer. The size of this tensor has to be
@@ -106,9 +111,7 @@ class DetectionLayer(nn.Module):
             image_size: Image width and height in a vector (defines the scale of the predicted and target coordinates).
 
         Returns:
-            The layer output, with normalized probabilities, in a tensor sized
-            ``[batch_size, anchors_per_cell * height * width, num_classes + 5]`` and a list of dictionaries, containing
-            the same predictions, but with unnormalized probabilities (for loss calculation).
+            Decoded, flattened predictions and candidate geometry for this feature level.
 
         """
         batch_size, num_features, height, width = x.shape
@@ -126,8 +129,8 @@ class DetectionLayer(nn.Module):
         x = x.view(batch_size, height, width, anchors_per_cell, num_attrs)
 
         # Take the sigmoid of the bounding box coordinates, confidence score, and class probabilities, unless the input
-        # is normalized by the previous layer activation. Confidence and class losses use the unnormalized values if
-        # possible.
+        # is normalized by the previous layer activation. Confidence and class losses use the unnormalized values when
+        # available, so YOLOLoss can apply binary_cross_entropy_with_logits.
         norm_x = x if self.input_is_normalized else torch.sigmoid(x)
         xy = norm_x[..., :2]
         wh = x[..., 2:4]
@@ -156,53 +159,217 @@ class DetectionLayer(nn.Module):
         output = torch.cat((box, norm_confidence.unsqueeze(-1), norm_classprob), -1)
         output = output.reshape(batch_size, height * width * anchors_per_cell, self.num_classes + 5)
 
-        # It's better to use binary_cross_entropy_with_logits() for loss computation, so we'll provide the unnormalized
-        # confidence and classprob, when available.
-        preds: PREDICTIONS = [
-            {"boxes": b, "confidences": c, "classprobs": p} for b, c, p in zip(box, confidence, classprob, strict=True)
-        ]
+        grid_size = torch.tensor([width, height], device=x.device)
+        grid_to_image = torch.true_divide(image_size, grid_size)
+        anchor_points = grid_centers(grid_size).view(-1, 2) * grid_to_image
+        anchor_points = anchor_points[:, None, :].expand(-1, anchors_per_cell, -1).reshape(-1, 2)
 
-        return output, preds
+        return LevelPredictions(
+            detections=output,
+            boxes=box.reshape(batch_size, -1, 4),
+            confidences=confidence.reshape(batch_size, -1),
+            classprobs=classprob.reshape(batch_size, -1, self.num_classes),
+            anchor_points=anchor_points,
+            spatial_shape=(height, width, anchors_per_cell),
+        )
 
-    def calculate_losses(
+
+class DetectionHead(nn.Module):
+    """Detection head for native YOLO architectures with multiple feature levels.
+
+    Owns all detection layers and applies the appropriate assignment strategy. Task-aligned matching operates on the
+    whole head: a single matcher is passed as ``matching_func`` and assigns targets across the concatenated candidates
+    of every level. All other matchers are per-level and live in the individual detection layers, whose
+    ``matching_func`` is used to match each level independently with its own prior shapes and grid geometry.
+
+    This class bundles what would otherwise be separate per-level ``DetectionLayer`` modules plus an external criterion,
+    removing the need for a separate ``DetectionCriterion`` object in the network.
+
+    Args:
+        layers: The per-level detection layers.
+        matching_func: A head-level matcher that assigns targets across all levels at once. When ``None``, each layer
+            uses its own ``matching_func`` instead.
+
+    """
+
+    def __init__(self, layers: Sequence[DetectionLayer], matching_func: TALMatching | None = None) -> None:
+        super().__init__()
+        if not layers:
+            raise ValueError("At least one detection layer is required.")
+        self.layers = cast(Sequence[DetectionLayer], nn.ModuleList(layers))
+        self.matching_func = matching_func
+
+    def forward(
         self,
-        preds: PREDICTIONS,
-        targets: TARGETS,
+        features: Sequence[Tensor],
         image_size: Tensor,
-        loss_preds: PREDICTIONS | None = None,
-    ) -> DetectionLossRecord:
-        """Matches the predictions to targets and computes the losses.
+        targets: TARGETS | None,
+    ) -> tuple[list[Tensor], list[DetectionLossRecord]]:
+        """Decodes all feature levels and computes detection losses if targets are provided.
 
         Args:
-            preds: List of predictions for each image, as returned by ``forward()``. These will be matched to the
-                training targets and used to compute the losses (unless another set of predictions for loss computation
-                is given in ``loss_preds``).
-            targets: List of training targets for each image.
-            image_size: Width and height in a vector that defines the scale of the target coordinates.
-            loss_preds: List of predictions for each image. If given, these will be used for loss computation, instead
-                of the same predictions that were used for matching. This is needed for deep supervision in YOLOv7.
+            features: Feature tensors for each detection level, one per layer.
+            image_size: Image width and height.
+            targets: Training targets, or ``None`` during inference.
 
         Returns:
-            Loss sums and normalization counts for this layer.
+            Decoded detections and loss records (empty list during inference).
 
         """
-        if loss_preds is None:
-            loss_preds = preds
+        levels = [layer(feat, image_size) for layer, feat in zip(self.layers, features, strict=True)]
+        detections = [level.detections for level in levels]
 
-        with torch.profiler.record_function("match_targets"):
-            matching_result = self.matching_func(preds, targets, image_size, self.input_is_normalized)
+        if targets is None:
+            return detections, []
 
-        with torch.profiler.record_function("loss_sums"):
-            losses = self.loss_func.sums(
-                matching_result,
-                loss_preds,
-                self.input_is_normalized,
-                image_size,
+        first = self.layers[0]
+        if self.matching_func is not None:
+            predictions: PREDICTIONS = [
+                {
+                    "boxes": torch.cat([level.boxes[image_idx] for level in levels], dim=0),
+                    "confidences": torch.cat([level.confidences[image_idx] for level in levels], dim=0),
+                    "classprobs": torch.cat([level.classprobs[image_idx] for level in levels], dim=0),
+                }
+                for image_idx in range(levels[0].boxes.shape[0])
+            ]
+            anchor_points = torch.cat([level.anchor_points for level in levels], dim=0)
+            with torch.profiler.record_function("match_targets"):
+                matching_result = self.matching_func(
+                    preds=predictions,
+                    targets=targets,
+                    anchor_points=anchor_points,
+                    input_is_normalized=first.input_is_normalized,
+                )
+            return detections, [
+                first.loss_func.matched_losses(matching_result, predictions, first.input_is_normalized, image_size)
+            ]
+
+        losses = []
+        for layer, level in zip(self.layers, levels, strict=True):
+            assert layer.matching_func is not None, (
+                "A per-level matcher is required when the head has no head-level matcher."
             )
-        loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
-        assignment_weight_sum = matching_result.assignment_weight_sum
-        normalizers = assignment_weight_sum.expand_as(loss_sums).to(loss_sums.dtype)
-        return DetectionLossRecord(loss_sums=loss_sums, normalizers=normalizers)
+            preds = level.as_grid()
+            with torch.profiler.record_function("match_targets"):
+                matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
+            losses.append(layer.loss_func.matched_losses(matching_result, preds, layer.input_is_normalized, image_size))
+        return detections, losses
+
+
+class DetectionHeadWithAux(nn.Module):
+    """Detection head combining a lead and an auxiliary detection layer for deep supervision.
+
+    The lead head is matched to targets to determine assignment; the auxiliary head uses the same assignments but
+    computes its own prediction losses, scaled down by ``aux_weight``. This pattern is used by YOLOv7.
+
+    Args:
+        prior_shapes: A list of all the prior box dimensions in the network input resolution.
+        prior_shape_idxs: Indices into ``prior_shapes`` selecting the prior shapes used by both heads.
+        num_classes: Number of different classes that the heads predict.
+        matching: Configuration that controls how targets are assigned to anchors for the lead head. The auxiliary head
+            reuses it with ``spatial_range`` replaced by ``aux_spatial_range``.
+        loss: Configuration that controls how the detection losses are computed.
+        aux_spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
+            area centered at the target. This parameter specifies `N` for the auxiliary head.
+        aux_weight: Weight for the loss from the auxiliary head.
+        predict_confidence: Whether the heads predict a confidence (objectness) channel.
+        xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor.
+        input_is_normalized: Whether the previous layer normalizes its output by a logistic activation.
+
+    """
+
+    def __init__(
+        self,
+        prior_shapes: PRIOR_SHAPES,
+        prior_shape_idxs: Sequence[int],
+        num_classes: int,
+        matching: MatchingConfig | None = None,
+        loss: LossConfig | None = None,
+        aux_spatial_range: float = 3.0,
+        aux_weight: float = 0.25,
+        predict_confidence: bool = True,
+        xy_scale: float = 1.0,
+        input_is_normalized: bool = False,
+    ) -> None:
+        super().__init__()
+        matching = matching or MatchingConfig()
+        self.detection_layer = create_detection_layer(
+            prior_shapes=prior_shapes,
+            prior_shape_idxs=prior_shape_idxs,
+            num_classes=num_classes,
+            matching=matching,
+            loss=loss,
+            predict_confidence=predict_confidence,
+            xy_scale=xy_scale,
+            input_is_normalized=input_is_normalized,
+        )
+        self.aux_detection_layer = create_detection_layer(
+            prior_shapes=prior_shapes,
+            prior_shape_idxs=prior_shape_idxs,
+            num_classes=num_classes,
+            matching=replace(matching, spatial_range=aux_spatial_range),
+            loss=loss,
+            predict_confidence=predict_confidence,
+            xy_scale=xy_scale,
+            input_is_normalized=input_is_normalized,
+        )
+        self.aux_weight = aux_weight
+
+    def forward(
+        self,
+        layer_input: Tensor,
+        aux_input: Tensor,
+        targets: TARGETS | None,
+        image_size: Tensor,
+        detections: list[Tensor],
+        losses: list[DetectionLossRecord],
+    ) -> None:
+        """Runs the lead and auxiliary detection layers and appends their outputs.
+
+        If ``targets`` is given, computes losses from both heads and appends them to ``losses``. The lead head
+        determines which predictions are matched to targets; the auxiliary head uses the same assignment.
+
+        Args:
+            layer_input: Input to the lead detection layer.
+            aux_input: Input to the auxiliary detection layer.
+            targets: List of training targets for each image.
+            image_size: Width and height in a vector that defines the scale of the target coordinates.
+            detections: A list where a tensor containing the detections will be appended to.
+            losses: A list where a tensor containing the losses will be appended to, if ``targets`` is given.
+
+        """
+        level = self.detection_layer(layer_input, image_size)
+        detections.append(level.detections)
+
+        if targets is not None:
+            lead_matching_func = self.detection_layer.matching_func
+            aux_matching_func = self.aux_detection_layer.matching_func
+            assert lead_matching_func is not None, "Auxiliary detection heads require per-level matchers."
+            assert aux_matching_func is not None, "Auxiliary detection heads require per-level matchers."
+            preds = level.as_grid()
+
+            # Match lead head predictions to targets and calculate losses from lead head outputs.
+            with torch.profiler.record_function("match_targets"):
+                matching_result = lead_matching_func(
+                    preds, targets, image_size, self.detection_layer.input_is_normalized
+                )
+            losses.append(
+                self.detection_layer.loss_func.matched_losses(
+                    matching_result, preds, self.detection_layer.input_is_normalized, image_size
+                )
+            )
+
+            # Match lead head predictions to targets and calculate losses from auxiliary head outputs.
+            aux_level = self.aux_detection_layer(aux_input, image_size)
+            aux_preds = aux_level.as_grid()
+            with torch.profiler.record_function("match_targets"):
+                aux_matching_result = aux_matching_func(
+                    preds, targets, image_size, self.aux_detection_layer.input_is_normalized
+                )
+            aux_loss = self.aux_detection_layer.loss_func.matched_losses(
+                aux_matching_result, aux_preds, self.aux_detection_layer.input_is_normalized, image_size
+            )
+            losses.append(aux_loss.scaled(self.aux_weight))
 
 
 class Conv(nn.Module):
@@ -375,24 +542,17 @@ def _create_normalization_module(name: str | None, num_channels: int) -> nn.Modu
 def create_detection_layer(
     prior_shapes: PRIOR_SHAPES,
     prior_shape_idxs: Sequence[int],
-    matching_algorithm: str | None = None,
-    matching_threshold: float | None = None,
-    spatial_range: float = 5.0,
-    size_range: float = 4.0,
-    tal_topk: int = 10,
-    tal_alpha: float = 0.5,
-    tal_beta: float = 6.0,
-    ignore_bg_threshold: float = 0.7,
-    overlap_func: str | Callable = "ciou",
-    predict_overlap: float | None = None,
-    label_smoothing: float | None = None,
-    overlap_loss_multiplier: float = 5.0,
-    confidence_loss_multiplier: float = 1.0,
-    class_loss_multiplier: float = 1.0,
+    num_classes: int,
+    matching: MatchingConfig | None = None,
+    loss: LossConfig | None = None,
     predict_confidence: bool = True,
-    **kwargs: Any,
+    xy_scale: float = 1.0,
+    input_is_normalized: bool = False,
 ) -> DetectionLayer:
     """Creates a detection layer module and the required loss function and target matching objects.
+
+    Task-aligned matching ("tal") is applied by the :class:`DetectionHead` across all levels, so the returned layer has
+    ``matching_func`` set to ``None`` in that case; :func:`create_detection_head` builds the head-level matcher.
 
     Args:
         prior_shapes: A list of all the prior box dimensions, used for scaling the predicted dimensions and possibly for
@@ -400,35 +560,11 @@ def create_detection_layer(
             resolution.
         prior_shape_idxs: List of indices to ``prior_shapes`` that is used to select the (usually 3) prior shapes that
             this layer uses.
-        matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
-            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
-            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
-        matching_threshold: Threshold for "size" and "iou" matching algorithms.
-        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target, where `N` is the value of this parameter.
-        size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
-            no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
-        tal_topk: TAL matching algorithm will select up to this many top anchors per target.
-        tal_alpha: Exponent for class confidence in the TAL alignment metric.
-        tal_beta: Exponent for IoU in the TAL alignment metric.
-        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the corresponding anchor
-            has IoU with some target greater than this threshold, the predictor will not be taken into account when
-            calculating the confidence loss.
-        overlap_func: A function for calculating the pairwise overlaps between two sets of boxes. Either a string or a
-            function that returns a matrix of pairwise overlaps. Valid string values are "iou", "giou", "diou", and
-            "ciou" (default).
-        predict_overlap: Balance between binary confidence targets and predicting the overlap. 0.0 means that the target
-            confidence is 1 if there's an object, and 1.0 means that the target confidence is the output of
-            ``overlap_func``.
-        label_smoothing: The epsilon parameter (weight) for class label smoothing. 0.0 means no smoothing (binary
-            targets), and 1.0 means that the target probabilities are always 0.5.
-        overlap_loss_multiplier: Overlap loss will be scaled by this value.
-        confidence_loss_multiplier: Confidence loss will be scaled by this value.
-        class_loss_multiplier: Classification loss will be scaled by this value.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         num_classes: Number of different classes that this layer predicts.
+        matching: Configuration that controls how targets are assigned to anchors.
+        loss: Configuration that controls how the detection losses are computed.
+        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to drop
+            objectness supervision and supervise all anchors via classification loss only.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
             to produce coordinate values close to one.
         input_is_normalized: The input is normalized by logistic activation in the previous layer. In this case the
@@ -437,52 +573,127 @@ def create_detection_layer(
             Darknet configurations of Scaled-YOLOv4.
 
     """
-    matching_func: ShapeMatching | SimOTAMatching | TALMatching
-    if matching_algorithm == "simota":
+    matching = (matching or MatchingConfig()).with_defaults()
+    loss = (loss or LossConfig()).with_defaults()
+    assert matching.ignore_bg_threshold is not None
+    assert loss.overlap_func is not None
+    assert loss.overlap_multiplier is not None
+    assert loss.confidence_multiplier is not None
+    assert loss.class_multiplier is not None
+
+    matching_func: ShapeMatching | SimOTAMatching | None
+    if matching.algorithm == "tal":
+        # Task-aligned matching assigns targets across all levels, so it is created by the head, not the layer.
+        matching_func = None
+    elif matching.algorithm == "simota":
         if not predict_confidence:
             raise ValueError(
                 "predict_confidence=False is incompatible with SimOTA matching, which relies on the confidence cost."
             )
-        loss_func = YOLOLoss(
-            overlap_func, None, None, overlap_loss_multiplier, confidence_loss_multiplier, class_loss_multiplier
+        cost_func = YOLOLoss(
+            loss.overlap_func,
+            None,
+            None,
+            loss.overlap_multiplier,
+            loss.confidence_multiplier,
+            loss.class_multiplier,
         )
-        matching_func = SimOTAMatching(prior_shapes, prior_shape_idxs, loss_func, spatial_range, size_range)
-    elif matching_algorithm == "tal":
-        matching_func = TALMatching(
-            prior_shapes,
-            prior_shape_idxs,
-            topk=tal_topk,
-            alpha=tal_alpha,
-            beta=tal_beta,
-            ignore_bg_threshold=ignore_bg_threshold,
+        matching_func = SimOTAMatching(
+            prior_shapes, prior_shape_idxs, cost_func, matching.spatial_range, matching.size_range
         )
-    elif matching_algorithm == "size":
-        if matching_threshold is None:
-            raise ValueError("matching_threshold is required with size ratio matching.")
-        matching_func = SizeRatioMatching(prior_shapes, prior_shape_idxs, matching_threshold, ignore_bg_threshold)
-    elif matching_algorithm == "iou":
-        if matching_threshold is None:
-            raise ValueError("matching_threshold is required with IoU threshold matching.")
-        matching_func = IoUThresholdMatching(prior_shapes, prior_shape_idxs, matching_threshold, ignore_bg_threshold)
-    elif matching_algorithm == "maxiou" or matching_algorithm is None:
-        matching_func = HighestIoUMatching(prior_shapes, prior_shape_idxs, ignore_bg_threshold)
+    elif matching.algorithm == "size":
+        if matching.threshold is None:
+            raise ValueError("A matching threshold is required with size ratio matching.")
+        matching_func = SizeRatioMatching(
+            prior_shapes, prior_shape_idxs, matching.threshold, matching.ignore_bg_threshold
+        )
+    elif matching.algorithm == "iou":
+        if matching.threshold is None:
+            raise ValueError("A matching threshold is required with IoU threshold matching.")
+        matching_func = IoUThresholdMatching(
+            prior_shapes, prior_shape_idxs, matching.threshold, matching.ignore_bg_threshold
+        )
+    elif matching.algorithm == "maxiou" or matching.algorithm is None:
+        matching_func = HighestIoUMatching(prior_shapes, prior_shape_idxs, matching.ignore_bg_threshold)
     else:
-        raise ValueError(f"Matching algorithm `{matching_algorithm}´ is unknown.")
+        raise ValueError(f"Matching algorithm `{matching.algorithm}´ is unknown.")
 
     loss_func = YOLOLoss(
-        overlap_func,
-        predict_overlap,
-        label_smoothing,
-        overlap_loss_multiplier,
-        confidence_loss_multiplier,
-        class_loss_multiplier,
+        loss.overlap_func,
+        loss.predict_overlap,
+        loss.label_smoothing,
+        loss.overlap_multiplier,
+        loss.confidence_multiplier,
+        loss.class_multiplier,
         predict_confidence=predict_confidence,
     )
     layer_shapes = [prior_shapes[i] for i in prior_shape_idxs]
     return DetectionLayer(
+        num_classes=num_classes,
         prior_shapes=layer_shapes,
         matching_func=matching_func,
         loss_func=loss_func,
+        xy_scale=xy_scale,
+        input_is_normalized=input_is_normalized,
         predict_confidence=predict_confidence,
-        **kwargs,
     )
+
+
+def create_detection_head(
+    prior_shapes: PRIOR_SHAPES,
+    prior_shape_idxs_per_level: Sequence[Sequence[int]],
+    num_classes: int,
+    matching: MatchingConfig | None = None,
+    loss: LossConfig | None = None,
+    predict_confidence: bool = True,
+    xy_scale: float = 1.0,
+    input_is_normalized: bool = False,
+) -> DetectionHead:
+    """Creates a multi-level detection head with the appropriate matching strategy.
+
+    Each feature level gets a :class:`DetectionLayer`. For task-aligned matching, a single :class:`TALMatching` is
+    created and given to the head, which assigns targets across all levels at once; the per-level layers then carry no
+    matcher. For all other algorithms, each layer carries its own per-level matcher.
+
+    Args:
+        prior_shapes: A list of all the prior box dimensions in the network input resolution.
+        prior_shape_idxs_per_level: For each feature level, the indices into ``prior_shapes`` that the level uses.
+        num_classes: Number of different classes that the head predicts.
+        matching: Configuration that controls how targets are assigned to anchors.
+        loss: Configuration that controls how the detection losses are computed.
+        predict_confidence: Whether the head predicts a confidence (objectness) channel.
+        xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor.
+        input_is_normalized: Whether the previous layer normalizes its output by a logistic activation.
+
+    Returns:
+        A detection head that owns the per-level layers and the matching strategy.
+
+    """
+    matching = matching or MatchingConfig()
+    layers = [
+        create_detection_layer(
+            prior_shapes=prior_shapes,
+            prior_shape_idxs=list(prior_shape_idxs),
+            num_classes=num_classes,
+            matching=matching,
+            loss=loss,
+            predict_confidence=predict_confidence,
+            xy_scale=xy_scale,
+            input_is_normalized=input_is_normalized,
+        )
+        for prior_shape_idxs in prior_shape_idxs_per_level
+    ]
+
+    matching_func = None
+    if matching.algorithm == "tal":
+        resolved = matching.with_defaults()
+        assert resolved.ignore_bg_threshold is not None
+        matching_func = TALMatching(
+            prior_shapes,
+            [],
+            topk=matching.tal_topk,
+            alpha=matching.tal_alpha,
+            beta=matching.tal_beta,
+            ignore_bg_threshold=resolved.ignore_bg_threshold,
+        )
+    return DetectionHead(layers, matching_func)

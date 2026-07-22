@@ -207,12 +207,12 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
         "labels": target_labels,
         "polygons": torch.empty((0, 8)),
     }
-    image_size = torch.tensor([2.0, 1.0])
+    anchor_points = torch.tensor([[0.5, 0.5], [1.5, 0.5]])
     result = matcher(
         [preds],
         [targets],
-        image_size,
         input_is_normalized=input_is_normalized,
+        anchor_points=anchor_points,
     )
 
     # The first prediction matches the first target and the second prediction matches the second target, because they
@@ -239,7 +239,7 @@ def test_tal_matching_empty_targets() -> None:
         "labels": torch.empty(0, dtype=torch.int64),
     }
 
-    result = matcher([preds], [targets], torch.tensor([1.0, 1.0]))
+    result = matcher([preds], [targets], anchor_points=torch.tensor([[0.5, 0.5]]))
 
     assert not result.foreground.any()
     assert result.background.all()
