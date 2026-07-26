@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from lightning_yolo.batching import pack_targets
 from lightning_yolo.loss import YOLOLoss
 from lightning_yolo.target_matching import (
     HighestIoUMatching,
@@ -167,7 +168,7 @@ def test_sim_ota_matching() -> None:
     }
     result = matcher(
         [preds, preds],
-        [targets, empty_targets],
+        pack_targets([targets, empty_targets]),
         image_size=torch.tensor([2.0, 2.0]),
         input_is_normalized=False,
     )
@@ -210,7 +211,7 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
     anchor_points = torch.tensor([[0.5, 0.5], [1.5, 0.5]])
     result = matcher(
         [preds],
-        [targets],
+        pack_targets([targets]),
         input_is_normalized=input_is_normalized,
         anchor_points=anchor_points,
     )
@@ -239,7 +240,7 @@ def test_tal_matching_empty_targets() -> None:
         "labels": torch.empty(0, dtype=torch.int64),
     }
 
-    result = matcher([preds], [targets], anchor_points=torch.tensor([[0.5, 0.5]]))
+    result = matcher([preds], pack_targets([targets]), anchor_points=torch.tensor([[0.5, 0.5]]))
 
     assert not result.foreground.any()
     assert result.background.all()

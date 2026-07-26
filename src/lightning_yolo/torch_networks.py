@@ -14,7 +14,7 @@ from .initialization import (
     initialize_zero_bias,
 )
 from .layers import Conv, DetectionHeadWithAux, MaxPool, ReOrg, create_detection_head
-from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS, DetectionLossRecord
+from .types import NETWORK_OUTPUT, PRIOR_SHAPES, DetectionLossRecord, PackedTargetDict
 from .utils import get_image_size
 
 
@@ -812,7 +812,7 @@ class YOLOV4TinyNetwork(nn.Module):
             xy_scale=xy_scale,
         )
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
 
         c3, c4, c5 = self.backbone(x)[-3:]
@@ -990,7 +990,7 @@ class YOLOV4Network(nn.Module):
             xy_scale=xy_scale,
         )
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -1190,7 +1190,7 @@ class YOLOV4P6Network(nn.Module):
             xy_scale=xy_scale,
         )
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
 
         c3, c4, c5, x = self.backbone(x)[-4:]
@@ -1375,7 +1375,7 @@ class YOLOV5Network(nn.Module):
             xy_scale=xy_scale,
         )
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -1592,7 +1592,7 @@ class YOLOV7W6Network(nn.Module):
         self.detect5 = detection_head(range(anchors_per_cell * 2, anchors_per_cell * 3))
         self.detect6 = detection_head(range(anchors_per_cell * 3, anchors_per_cell * 4))
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         detections: list[Tensor] = []  # Outputs from detection layers
         losses: list[DetectionLossRecord] = []  # Loss records from detection layers
 
@@ -1785,7 +1785,7 @@ class YOLOV8Network(nn.Module):
             xy_scale=xy_scale,
         )
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]
@@ -2027,7 +2027,7 @@ class YOLOXNetwork(nn.Module):
             xy_scale=xy_scale,
         )
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
 
         c3, c4, x = self.backbone(x)[-3:]

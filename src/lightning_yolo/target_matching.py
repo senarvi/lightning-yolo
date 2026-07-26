@@ -5,14 +5,15 @@ import torch
 from torch import Tensor
 from torchvision.ops import box_convert, box_iou
 
+from .batching import split_targets
 from .loss import YOLOLoss
 from .matching_result import DenseMatchingResult, ImageMatch, MatchingResult, SparseMatchingResult
-from .types import PREDICTIONS, PRIOR_SHAPES, TARGETS, PredictionDict, TargetDict
+from .types import PREDICTIONS, PRIOR_SHAPES, PackedTargetDict, PredictionDict, TargetDict
 from .utils import aligned_iou, box_size_ratio, grid_centers, iou_below, is_inside_box
 
 # A matching function takes batched predictions and targets, image size, and a boolean indicating whether the
 # probabilities are normalized, and returns the assignment of predictions to targets for the whole batch.
-MatchingFn = Callable[[PREDICTIONS, TARGETS, Tensor, bool], MatchingResult]
+MatchingFn = Callable[[PREDICTIONS, PackedTargetDict, Tensor, bool], MatchingResult]
 
 
 class ShapeMatching(ABC):
@@ -41,7 +42,7 @@ class ShapeMatching(ABC):
     def __call__(
         self,
         preds: PREDICTIONS,
-        targets: TARGETS,
+        targets: PackedTargetDict,
         image_size: Tensor,
         input_is_normalized: bool = False,  # noqa: ARG002
     ) -> MatchingResult:
@@ -61,9 +62,10 @@ class ShapeMatching(ABC):
             Per-image foreground assignments for the whole batch.
 
         """
+        image_targets = split_targets(targets)
         images = [
             self._match_image(image_preds, image_targets, image_size)
-            for image_preds, image_targets in zip(preds, targets, strict=True)
+            for image_preds, image_targets in zip(preds, image_targets, strict=True)
         ]
         return SparseMatchingResult(images)
 
@@ -285,15 +287,15 @@ def _tal_match(
     more than one target, it is assigned to the target with the highest IoU.
 
     Args:
-        align_metric: ``[B, N, T_max]`` alignment scores.
-        ious: ``[B, N, T_max]`` IoU values.
-        inside_selector: ``[B, N, T_max]`` bool — True when an anchor centre is inside the target box.
-        target_mask: ``[B, T_max]`` bool — True for real targets, False for padding.
+        align_metric: ``[batch_size, N, max_targets]`` alignment scores.
+        ious: ``[batch_size, N, max_targets]`` IoU values.
+        inside_selector: ``[batch_size, N, max_targets]`` bool — True when an anchor centre is inside the target box.
+        target_mask: ``[batch_size, max_targets]`` bool — True for real targets, False for padding.
         topk: Maximum number of anchors to select per target.
 
     Returns:
-        pred_mask ``[B, N]``, target_selector ``[B, N]`` (meaningful only where pred_mask is True), and
-        assignment_weights ``[B, N]`` used for loss normalisation.
+        pred_mask ``[batch_size, N]``, target_selector ``[batch_size, N]`` (meaningful only where pred_mask is True),
+        and assignment_weights ``[batch_size, N]`` used for loss normalisation.
 
     """
     batch_size, num_preds, max_targets = align_metric.shape
@@ -304,35 +306,35 @@ def _tal_match(
     masked_metric[~target_mask[:, None, :].expand(batch_size, num_preds, max_targets)] = -1.0
 
     # For each target, select top-k anchors by the alignment metric among anchors that are inside the target box.
-    masked_t = masked_metric.permute(0, 2, 1)  # [B, T_max, N]
+    masked_t = masked_metric.permute(0, 2, 1)  # [batch_size, max_targets, N]
     k = min(topk, num_preds)
-    _, topk_indices = torch.topk(masked_t, k=k, dim=2)  # [B, T_max, k]
+    _, topk_indices = torch.topk(masked_t, k=k, dim=2)  # [batch_size, max_targets, k]
 
     valid = torch.gather(inside_selector.permute(0, 2, 1), 2, topk_indices)
 
-    # Scatter topk selections back into the [B, N, T_max] matching matrix.
-    # topk_indices: [B, T_max, k] → transpose to [B, k, T_max] for scatter on dim 1.
-    idx = topk_indices.permute(0, 2, 1)  # [B, k, T_max]
-    val = valid.permute(0, 2, 1)  # [B, k, T_max]
+    # Scatter topk selections back into the [batch_size, N, max_targets] matching matrix.
+    # topk_indices: [batch_size, max_targets, k] → transpose to [batch_size, k, max_targets] for scatter on dim 1.
+    idx = topk_indices.permute(0, 2, 1)  # [batch_size, k, max_targets]
+    val = valid.permute(0, 2, 1)  # [batch_size, k, max_targets]
     matching_matrix = torch.zeros_like(align_metric, dtype=torch.bool)
     matching_matrix.scatter_(1, idx, val)
 
     # If there is more than one match for some prediction, match it with the target that has the highest IoU.
-    multiple = matching_matrix.sum(dim=2) > 1  # [B, N]
+    multiple = matching_matrix.sum(dim=2) > 1  # [batch_size, N]
     best_targets = ious.argmax(dim=2, keepdim=True)
     best_matches = torch.zeros_like(matching_matrix).scatter_(2, best_targets, True)
     matching_matrix = torch.where(multiple.unsqueeze(-1), best_matches, matching_matrix)
 
     # For those predictions that were matched, get the index of the target.
-    pred_mask = matching_matrix.any(dim=2)  # [B, N]
-    target_selector = matching_matrix.int().argmax(dim=2)  # [B, N]
+    pred_mask = matching_matrix.any(dim=2)  # [batch_size, N]
+    target_selector = matching_matrix.int().argmax(dim=2)  # [batch_size, N]
 
     # Normalize each matched alignment score by the best matched alignment score for the same target, then scale it by
     # that target's best matched IoU.
     matched_metric = align_metric * matching_matrix.float()
-    best_align = matched_metric.amax(dim=1, keepdim=True).clamp(min=eps)  # [B, 1, T_max]
-    best_iou = (ious * matching_matrix.float()).amax(dim=1, keepdim=True)  # [B, 1, T_max]
-    assignment_weights = (matched_metric * best_iou / best_align).amax(dim=2)  # [B, N]
+    best_align = matched_metric.amax(dim=1, keepdim=True).clamp(min=eps)  # [batch_size, 1, max_targets]
+    best_iou = (ious * matching_matrix.float()).amax(dim=1, keepdim=True)  # [batch_size, 1, max_targets]
+    assignment_weights = (matched_metric * best_iou / best_align).amax(dim=2)  # [batch_size, N]
 
     return pred_mask, target_selector, assignment_weights
 
@@ -426,7 +428,7 @@ class SimOTAMatching:
     def __call__(
         self,
         preds: PREDICTIONS,
-        targets: TARGETS,
+        targets: PackedTargetDict,
         image_size: Tensor,
         input_is_normalized: bool = False,
     ) -> MatchingResult:
@@ -443,9 +445,10 @@ class SimOTAMatching:
             Per-image foreground assignments for the whole batch.
 
         """
+        image_targets = split_targets(targets)
         images = [
             self._match_image(image_preds, image_targets, image_size, input_is_normalized)
-            for image_preds, image_targets in zip(preds, targets, strict=True)
+            for image_preds, image_targets in zip(preds, image_targets, strict=True)
         ]
         return SparseMatchingResult(images)
 
@@ -602,7 +605,7 @@ class TALMatching:
     def __call__(
         self,
         preds: PREDICTIONS,
-        targets: TARGETS,
+        targets: PackedTargetDict,
         anchor_points: Tensor,
         input_is_normalized: bool = False,
     ) -> MatchingResult:
@@ -638,33 +641,42 @@ class TALMatching:
         if not input_is_normalized:
             pred_probs = pred_probs.sigmoid()
 
-        # Pad targets to the maximum target count in the batch.
-        target_counts = [target["boxes"].shape[0] for target in targets]
-        max_targets = max(max(target_counts, default=0), 1)
+        # Scatter the packed targets into a [batch_size, max_targets] padded layout without a Python per-image loop.
+        # Each packed row knows its image via batch_indices; per-image counts give its position within that image.
+        counts = targets["counts"]
+        packed_boxes = targets["boxes"]
+        packed_labels = targets["labels"]
+        batch_indices = targets["batch_indices"].to(device)
+        multilabel = packed_labels.ndim == 2
+
+        max_targets = max(max(counts), 1)
         padded_boxes = pred_boxes.new_zeros(batch_size, max_targets, 4)
         target_mask = torch.zeros(batch_size, max_targets, dtype=torch.bool, device=device)
-        first_labels = targets[0]["labels"]
-        if first_labels.ndim == 1:
-            padded_labels = torch.zeros(batch_size, max_targets, dtype=first_labels.dtype, device=device)
+        if multilabel:
+            padded_labels = torch.zeros(batch_size, max_targets, num_classes, dtype=packed_labels.dtype, device=device)
         else:
-            padded_labels = torch.zeros(batch_size, max_targets, num_classes, dtype=first_labels.dtype, device=device)
-        for image_idx, target in enumerate(targets):
-            num_targets = target["boxes"].shape[0]
-            padded_boxes[image_idx, :num_targets] = target["boxes"]
-            padded_labels[image_idx, :num_targets] = target["labels"]
-            target_mask[image_idx, :num_targets] = True
+            padded_labels = torch.zeros(batch_size, max_targets, dtype=packed_labels.dtype, device=device)
+
+        num_targets = packed_boxes.shape[0]
+        if num_targets:
+            counts_tensor = torch.as_tensor(counts, device=device)
+            image_starts = counts_tensor.cumsum(0) - counts_tensor
+            within_image = torch.arange(num_targets, device=device) - image_starts.repeat_interleave(counts_tensor)
+            padded_boxes[batch_indices, within_image] = packed_boxes.to(padded_boxes.dtype)
+            padded_labels[batch_indices, within_image] = packed_labels
+            target_mask[batch_indices, within_image] = True
 
         # Create a [batch, predictions, targets] tensor that indicates which anchor centers are inside each target box.
         # The centers and padded boxes are broadcast across the batch and prediction dimensions, respectively.
         pts = anchor_points[None, :, None, :]  # [1, N, 1, 2]
-        lt = pts[..., :2] - padded_boxes[:, None, :, :2]  # [B, N, T_max, 2]
-        rb = padded_boxes[:, None, :, 2:] - pts[..., :2]  # [B, N, T_max, 2]
-        inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0  # [B, N, T_max]
+        lt = pts[..., :2] - padded_boxes[:, None, :, :2]  # [batch_size, N, max_targets, 2]
+        rb = padded_boxes[:, None, :, 2:] - pts[..., :2]  # [batch_size, N, max_targets, 2]
+        inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0  # [batch_size, N, max_targets]
         inside_selector = inside_selector & target_mask[:, None, :]
 
         # Calculate the TAL alignment metric from the target-class probabilities and IoUs. Padded targets are masked so
         # that they cannot contribute to matching.
-        ious = box_iou(pred_boxes, padded_boxes)  # [B, N, T_max]
+        ious = box_iou(pred_boxes, padded_boxes)  # [batch_size, N, max_targets]
         ious = ious * target_mask[:, None, :].float()
 
         # Gather each target's predicted class score vectorized across the batch.
@@ -683,19 +695,19 @@ class TALMatching:
         # Run TAL matching for the whole batch.
         pred_mask, target_sel, weights = _tal_match(
             align_metric, ious, inside_selector, target_mask, self.topk, self.eps
-        )  # [B, N], [B, N], [B, N]
+        )  # [batch_size, N], [batch_size, N], [batch_size, N]
 
         best_iou = ious.amax(dim=2)
         background = (best_iou <= self.ignore_bg_threshold) & ~pred_mask
         target_boxes = torch.gather(padded_boxes, 1, target_sel.unsqueeze(-1).expand(-1, -1, 4))
 
-        if first_labels.ndim == 1:
+        if not multilabel:
             target_labels = torch.gather(padded_labels, 1, target_sel)
         else:
             target_labels = torch.gather(padded_labels, 1, target_sel.unsqueeze(-1).expand(-1, -1, num_classes))
 
         # Matching scores are fixed training targets. Detaching prevents gradients from flowing through TAL's
-        # discrete assignment graph and releases its large [B, N, T_max] intermediates before backward.
+        # discrete assignment graph and releases its large [batch_size, N, max_targets] intermediates before backward.
         weights = weights.detach()
         return DenseMatchingResult(
             foreground=pred_mask,

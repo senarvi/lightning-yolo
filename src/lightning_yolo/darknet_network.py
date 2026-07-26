@@ -20,7 +20,7 @@ from .layers import (
     ShortcutLayer,
     create_detection_layer,
 )
-from .types import NETWORK_OUTPUT, PRIOR_SHAPES, TARGETS, DetectionLossRecord
+from .types import NETWORK_OUTPUT, PRIOR_SHAPES, DetectionLossRecord, PackedTargetDict
 from .utils import get_image_size
 
 DARKNET_CONFIG = dict[str, Any]
@@ -86,7 +86,7 @@ class DarknetNetwork(nn.Module):
             with open(weights_path, "rb") as weight_file:
                 self.load_weights(weight_file)
 
-    def forward(self, x: Tensor, targets: TARGETS | None = None) -> NETWORK_OUTPUT:
+    def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         outputs: list[Tensor] = []  # Outputs from all layers
         detections: list[Tensor] = []  # Outputs from detection layers
         losses: list[DetectionLossRecord] = []  # Loss records from detection layers
@@ -102,8 +102,7 @@ class DarknetNetwork(nn.Module):
                 if targets is not None:
                     # Darknet configurations always use per-level matchers (TAL is rejected during construction).
                     assert layer.matching_func is not None
-                    with torch.profiler.record_function("match_targets"):
-                        matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
+                    matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
                     losses.append(
                         layer.loss_func.matched_losses(matching_result, preds, layer.input_is_normalized, image_size)
                     )

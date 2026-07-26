@@ -2,20 +2,20 @@ import json
 from pathlib import Path
 from unittest.mock import Mock
 
+import cv2
+import numpy as np
 import pytest
 import torch
 from lightning.pytorch import Trainer
-from PIL import Image
-from torchvision import tv_tensors
 
+from lightning_yolo.batching import collate_packed_batch
 from lightning_yolo.coco_datamodule import (
     CloseMosaic,
     COCODetectionDataModule,
     COCODetectionDataset,
-    collate_fn,
     convert_annotations,
+    read_coco_index,
 )
-from lightning_yolo.transforms import LetterBox, MixUp, Mosaic
 
 
 def create_coco_data(data_dir: Path) -> tuple[Path, Path]:
@@ -23,7 +23,7 @@ def create_coco_data(data_dir: Path) -> tuple[Path, Path]:
     image_dir.mkdir(parents=True, exist_ok=True)
 
     image_path = image_dir / "000000000001.jpg"
-    Image.new("RGB", (10, 6)).save(image_path)
+    cv2.imwrite(str(image_path), np.zeros((6, 10, 3), dtype=np.uint8))
 
     annotation_path = data_dir / "annotations.json"
     annotation_path.write_text(
@@ -88,44 +88,58 @@ def test_convert_annotations() -> None:
         },
     ]
     category_id_to_label = {8: 0, 65: 1, 67: 2, 70: 3}
-    target = convert_annotations(
+    boxes, labels = convert_annotations(
         annotations=annotations,
         width=20,
         height=20,
         category_id_to_label=category_id_to_label,
         include_crowd=False,
     )
-    expected_boxes = torch.tensor(
+    expected_boxes = np.array(
         [
             [10.0, 10.0, 20.0, 15.0],
             [0.0, 0.0, 3.0, 3.0],
             [2.0, 1.0, 9.0, 7.0],
             [1.0, 2.0, 8.0, 9.0],
             [4.0, 6.0, 7.0, 11.0],
-        ]
+        ],
+        dtype=np.float32,
     )
-    expected_labels = torch.tensor([1, 2, 2, 1, 1])
+    expected_labels = np.array([1, 2, 2, 1, 1], dtype=np.int64)
 
-    torch.testing.assert_close(target["boxes"], expected_boxes)
-    assert torch.equal(target["labels"], expected_labels)
+    np.testing.assert_allclose(boxes, expected_boxes)
+    np.testing.assert_array_equal(labels, expected_labels)
 
 
-def test_collate_fn() -> None:
-    image1 = torch.zeros((3, 10, 12))
-    image2 = torch.zeros((3, 20, 18))
+def test_read_coco_index(tmp_path: Path) -> None:
+    image_dir, annotation_path = create_coco_data(tmp_path)
+
+    index = read_coco_index(image_dir, annotation_path, include_crowd=False)
+
+    assert len(index) == 1
+    assert index.image_paths[0] == image_dir / "000000000001.jpg"
+    assert index.image_sizes[0] == (10, 6)
+    np.testing.assert_allclose(index.boxes[0], np.array([[1.0, 1.0, 3.0, 3.0]], dtype=np.float32))
+    np.testing.assert_array_equal(index.labels[0], np.array([1], dtype=np.int64))
+
+
+def test_collate_packed_batch() -> None:
+    image1 = torch.zeros((3, 10, 12), dtype=torch.uint8)
+    image2 = torch.zeros((3, 10, 12), dtype=torch.uint8)
     target1 = {"boxes": torch.zeros((1, 4)), "labels": torch.tensor([1])}
     target2 = {
         "boxes": torch.zeros((0, 4)),
         "labels": torch.empty((0,), dtype=torch.int64),
     }
-    images, targets = collate_fn([(image1, target1), (image2, target2)])
+    images, targets = collate_packed_batch([(image1, target1), (image2, target2)])
 
-    assert isinstance(images, list)
-    assert isinstance(targets, list)
-    assert images[0].shape == (3, 10, 12)
-    assert images[1].shape == (3, 20, 18)
-    assert targets[0]["boxes"].shape == (1, 4)
-    assert targets[1]["boxes"].shape == (0, 4)
+    assert isinstance(images, torch.Tensor)
+    assert images.shape == (2, 3, 10, 12)
+    assert images.dtype == torch.uint8
+    assert targets["boxes"].shape == (1, 4)
+    assert torch.equal(targets["labels"], torch.tensor([1]))
+    assert torch.equal(targets["batch_indices"], torch.tensor([0]))
+    assert targets["counts"] == [1, 0]
 
 
 def test_coco_detection_dataset(tmp_path: Path) -> None:
@@ -133,29 +147,100 @@ def test_coco_detection_dataset(tmp_path: Path) -> None:
     dataset = COCODetectionDataset(
         image_dir=image_dir,
         ann_file=annotation_path,
-        image_size=(12, 20),
+        image_size=(20, 12),
         training=False,
     )
     image, target = dataset[0]
 
     assert image.shape == (3, 12, 20)
+    assert image.dtype == torch.uint8
     torch.testing.assert_close(target["boxes"], torch.tensor([[2.0, 2.0, 6.0, 6.0]]))
     assert torch.equal(target["labels"], torch.tensor([1]))
 
+    resized_image, resized_boxes = dataset._fit_within_output(
+        np.zeros((5, 7, 3), dtype=np.uint8),
+        np.array([[0.0, 0.0, 7.0, 5.0]], dtype=np.float32),
+    )
+    assert resized_image.shape == (12, 17, 3)
+    np.testing.assert_array_equal(resized_boxes, np.array([[0.0, 0.0, 17.0, 12.0]], dtype=np.float32))
 
-def test_coco_detection_datamodule(tmp_path: Path) -> None:
+
+def test_coco_detection_dataset_training(tmp_path: Path) -> None:
     image_dir, annotation_path = create_coco_data(tmp_path)
-    COCODetectionDataModule(tmp_path, image_size=(12, 20))
     dataset = COCODetectionDataset(
         image_dir=image_dir,
         ann_file=annotation_path,
-        image_size=(12, 20),
-        training=False,
+        image_size=(16, 16),
+        training=True,
+        cache_size=4,
     )
+
     image, target = dataset[0]
 
-    assert image.shape == (3, 12, 20)
-    torch.testing.assert_close(target["boxes"], torch.tensor([[2.0, 2.0, 6.0, 6.0]]))
+    assert image.shape == (3, 16, 16)
+    assert image.dtype == torch.uint8
+    assert target["boxes"].shape[1:] == (4,)
+    assert target["labels"].ndim == 1
+
+
+def test_coco_detection_dataset_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image_dir, annotation_path = create_coco_data(tmp_path)
+    dataset = COCODetectionDataset(
+        image_dir=image_dir,
+        ann_file=annotation_path,
+        image_size=(20, 12),
+        training=False,
+        cache_size=1,
+    )
+    first = dataset.load_sample(0)
+    first.labels[0] = 99
+    imread = Mock(side_effect=AssertionError("cached sample was decoded again"))
+    monkeypatch.setattr(cv2, "imread", imread)
+
+    cached = dataset.load_sample(0)
+
+    assert cached.image.shape == (12, 20, 3)
+    np.testing.assert_array_equal(cached.labels, np.array([1]))
+    imread.assert_not_called()
+
+
+def test_coco_detection_datamodule_setup(tmp_path: Path) -> None:
+    image_dir, annotation_path = create_coco_data(tmp_path)
+    (tmp_path / "val2017").mkdir(exist_ok=True)
+    annotations_dir = tmp_path / "annotations"
+    annotations_dir.mkdir(exist_ok=True)
+    for name in ("instances_train2017.json", "instances_val2017.json"):
+        (annotations_dir / name).write_text(annotation_path.read_text(encoding="utf-8"), encoding="utf-8")
+    # The images live under train2017; reuse them for both splits in this fixture.
+    (tmp_path / "val2017" / "000000000001.jpg").write_bytes((image_dir / "000000000001.jpg").read_bytes())
+
+    datamodule = COCODetectionDataModule(tmp_path, batch_size=1, num_workers=0, image_size=(16, 16))
+    datamodule.setup("fit")
+
+    assert datamodule.train_dataset is not None
+    assert datamodule.val_dataset is not None
+    image, target = datamodule.train_dataset[0]
+    assert image.shape[0] == 3
+    assert target["boxes"].shape[1:] == (4,)
+
+
+@pytest.mark.parametrize(("num_workers", "expected_prefetch_factor"), [(0, None), (1, 4)])
+def test_coco_detection_dataloader_prefetch_factor(
+    tmp_path: Path, num_workers: int, expected_prefetch_factor: int | None
+) -> None:
+    image_dir, annotation_path = create_coco_data(tmp_path)
+    dataset = COCODetectionDataset(
+        image_dir=image_dir,
+        ann_file=annotation_path,
+        image_size=(20, 12),
+        training=False,
+    )
+    datamodule = COCODetectionDataModule(tmp_path, num_workers=num_workers, persistent_workers=False)
+    datamodule.train_dataset = dataset
+
+    dataloader = datamodule.train_dataloader()
+
+    assert dataloader.prefetch_factor == expected_prefetch_factor
 
 
 def test_close_mosaic(tmp_path: Path) -> None:
@@ -163,7 +248,7 @@ def test_close_mosaic(tmp_path: Path) -> None:
     dataset = COCODetectionDataset(
         image_dir=image_dir,
         ann_file=annotation_path,
-        image_size=(12, 20),
+        image_size=(16, 16),
         training=True,
     )
     datamodule = COCODetectionDataModule(tmp_path)
@@ -178,84 +263,14 @@ def test_close_mosaic(tmp_path: Path) -> None:
     trainer.datamodule = datamodule
     callback = CloseMosaic(epochs=10)
 
-    assert dataset.mosaic_enabled.is_shared()
+    assert dataset._mosaic_enabled.is_shared()
     trainer.fit_loop.epoch_progress.current.completed = 89
     callback.on_train_epoch_start(trainer, Mock())
-    assert bool(dataset.mosaic_enabled)
+    assert dataset.mosaic_enabled
     trainer.fit_loop.epoch_progress.current.completed = 90
     callback.on_train_epoch_start(trainer, Mock())
-    assert not bool(dataset.mosaic_enabled)
+    assert not dataset.mosaic_enabled
 
     image, target = dataset[0]
-    assert image.shape == (3, 12, 20)
+    assert image.shape == (3, 16, 16)
     assert target["boxes"].shape[1:] == (4,)
-
-
-def test_mosaic(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(torch, "randint", lambda *_args, **_kwargs: torch.tensor(8))
-    boxes = ([5.0, 1.0, 7.0, 3.0], [1.0, 1.0, 3.0, 3.0]) * 2
-    samples = [
-        (
-            tv_tensors.Image(torch.zeros((3, 4, 8), dtype=torch.uint8)),
-            {
-                "boxes": tv_tensors.BoundingBoxes([box], format="XYXY", canvas_size=(4, 8)),
-                "labels": torch.tensor([label]),
-            },
-        )
-        for label, box in enumerate(boxes)
-    ]
-
-    image, target = Mosaic((8, 8))(samples)
-
-    assert image.shape == (3, 8, 8)
-    torch.testing.assert_close(
-        target["boxes"],
-        torch.tensor(
-            [
-                [1.0, 1.0, 3.0, 3.0],
-                [5.0, 1.0, 7.0, 3.0],
-                [1.0, 5.0, 3.0, 7.0],
-                [5.0, 5.0, 7.0, 7.0],
-            ]
-        ),
-    )
-    assert torch.equal(target["labels"], torch.arange(4))
-
-
-def test_letterbox() -> None:
-    image = tv_tensors.Image(torch.zeros((3, 10, 10), dtype=torch.uint8))
-    target = {
-        "boxes": tv_tensors.BoundingBoxes([[1.0, 1.0, 3.0, 3.0]], format="XYXY", canvas_size=(10, 10)),
-        "labels": torch.tensor([1]),
-    }
-
-    image, target = LetterBox((13, 20))(image, target)
-
-    assert image.shape == (3, 13, 20)
-    assert torch.all(image[:, :, :3] == 114)
-    assert torch.all(image[:, :, -4:] == 114)
-    torch.testing.assert_close(target["boxes"], torch.tensor([[4.3, 1.3, 6.9, 3.9]]))
-    assert target["boxes"].canvas_size == (13, 20)
-
-
-def test_mixup(monkeypatch: pytest.MonkeyPatch) -> None:
-    beta = Mock()
-    beta.return_value.sample.return_value = torch.tensor(0.25)
-    monkeypatch.setattr(torch.distributions, "Beta", beta)
-    samples = []
-    for label, value in enumerate((0, 200)):
-        image = tv_tensors.Image(torch.full((3, 4, 4), value, dtype=torch.uint8))
-        target = {
-            "boxes": tv_tensors.BoundingBoxes([[1.0, 1.0, 3.0, 3.0]], format="XYXY", canvas_size=(4, 4)),
-            "labels": torch.tensor([label]),
-        }
-        samples.append((image, target))
-
-    image, target = MixUp(alpha=2.0)(samples)
-
-    assert image.shape == (3, 4, 4)
-    assert image.dtype == torch.uint8
-    assert image[0, 0, 0] == 150
-    assert target["boxes"].shape == (2, 4)
-    assert torch.equal(target["labels"], torch.tensor([0, 1]))
-    beta.assert_called_once_with(2.0, 2.0)

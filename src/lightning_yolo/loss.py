@@ -390,8 +390,7 @@ class YOLOLoss:
             The overlap, confidence, and classification loss sums with their normalizers.
 
         """
-        with torch.profiler.record_function("loss_sums"):
-            losses = self.sums(matching, preds, input_is_normalized, image_size)
+        losses = self.sums(matching, preds, input_is_normalized, image_size)
         loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
         normalizers = matching.assignment_weight_sum.expand_as(loss_sums).to(loss_sums.dtype)
         return DetectionLossRecord(loss_sums=loss_sums, normalizers=normalizers)

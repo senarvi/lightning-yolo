@@ -20,9 +20,9 @@ from .target_matching import (
 from .types import (
     PREDICTIONS,
     PRIOR_SHAPES,
-    TARGETS,
     DetectionLossRecord,
     LevelPredictions,
+    PackedTargetDict,
 )
 from .utils import global_xy, grid_centers
 
@@ -203,7 +203,7 @@ class DetectionHead(nn.Module):
         self,
         features: Sequence[Tensor],
         image_size: Tensor,
-        targets: TARGETS | None,
+        targets: PackedTargetDict | None,
     ) -> tuple[list[Tensor], list[DetectionLossRecord]]:
         """Decodes all feature levels and computes detection losses if targets are provided.
 
@@ -233,13 +233,12 @@ class DetectionHead(nn.Module):
                 for image_idx in range(levels[0].boxes.shape[0])
             ]
             anchor_points = torch.cat([level.anchor_points for level in levels], dim=0)
-            with torch.profiler.record_function("match_targets"):
-                matching_result = self.matching_func(
-                    preds=predictions,
-                    targets=targets,
-                    anchor_points=anchor_points,
-                    input_is_normalized=first.input_is_normalized,
-                )
+            matching_result = self.matching_func(
+                preds=predictions,
+                targets=targets,
+                anchor_points=anchor_points,
+                input_is_normalized=first.input_is_normalized,
+            )
             return detections, [
                 first.loss_func.matched_losses(matching_result, predictions, first.input_is_normalized, image_size)
             ]
@@ -250,8 +249,7 @@ class DetectionHead(nn.Module):
                 "A per-level matcher is required when the head has no head-level matcher."
             )
             preds = level.as_grid()
-            with torch.profiler.record_function("match_targets"):
-                matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
+            matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
             losses.append(layer.loss_func.matched_losses(matching_result, preds, layer.input_is_normalized, image_size))
         return detections, losses
 
@@ -319,7 +317,7 @@ class DetectionHeadWithAux(nn.Module):
         self,
         layer_input: Tensor,
         aux_input: Tensor,
-        targets: TARGETS | None,
+        targets: PackedTargetDict | None,
         image_size: Tensor,
         detections: list[Tensor],
         losses: list[DetectionLossRecord],
@@ -349,10 +347,7 @@ class DetectionHeadWithAux(nn.Module):
             preds = level.as_grid()
 
             # Match lead head predictions to targets and calculate losses from lead head outputs.
-            with torch.profiler.record_function("match_targets"):
-                matching_result = lead_matching_func(
-                    preds, targets, image_size, self.detection_layer.input_is_normalized
-                )
+            matching_result = lead_matching_func(preds, targets, image_size, self.detection_layer.input_is_normalized)
             losses.append(
                 self.detection_layer.loss_func.matched_losses(
                     matching_result, preds, self.detection_layer.input_is_normalized, image_size
@@ -362,10 +357,9 @@ class DetectionHeadWithAux(nn.Module):
             # Match lead head predictions to targets and calculate losses from auxiliary head outputs.
             aux_level = self.aux_detection_layer(aux_input, image_size)
             aux_preds = aux_level.as_grid()
-            with torch.profiler.record_function("match_targets"):
-                aux_matching_result = aux_matching_func(
-                    preds, targets, image_size, self.aux_detection_layer.input_is_normalized
-                )
+            aux_matching_result = aux_matching_func(
+                preds, targets, image_size, self.aux_detection_layer.input_is_normalized
+            )
             aux_loss = self.aux_detection_layer.loss_func.matched_losses(
                 aux_matching_result, aux_preds, self.aux_detection_layer.input_is_normalized, image_size
             )

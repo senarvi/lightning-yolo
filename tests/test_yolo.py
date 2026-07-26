@@ -5,23 +5,23 @@ from torch import nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
-from lightning_yolo import _migrate_legacy_checkpoint_hparams
+from lightning_yolo.batching import pack_targets
 from lightning_yolo.config import MatchingConfig
 from lightning_yolo.initialization import detection_classprob_bias
 from lightning_yolo.torch_networks import YOLOXHead
-from lightning_yolo.yolo_module import YOLO
+from lightning_yolo.yolo import YOLO
 
 
 @pytest.mark.parametrize("predict_confidence", [False, True])
-def test_yolo(predict_confidence: bool) -> None:
+def test_yolo_forward(predict_confidence: bool) -> None:
     module = YOLO(
         architecture="yolov8n",
-        num_classes=2,
+        num_classes=3,
         matching=MatchingConfig(algorithm="tal"),
         predict_confidence=predict_confidence,
     )
     images = torch.rand(1, 3, 64, 64)
-    targets = [{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}]
+    targets = pack_targets([{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}])
 
     _, losses = module(images, targets)
 
@@ -29,30 +29,23 @@ def test_yolo(predict_confidence: bool) -> None:
     assert torch.isfinite(losses).all()
     assert losses.max() < 100
 
+    module.eval()
+    uint8_images = torch.randint(0, 256, (2, 3, 64, 64), dtype=torch.uint8)
+    float_images = uint8_images.to(torch.float32).div(255.0)
+    targets = pack_targets(
+        [
+            {"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([0])},
+            {"boxes": torch.tensor([[8.0, 8.0, 24.0, 24.0]]), "labels": torch.tensor([1])},
+        ]
+    )
 
-def test_migrate_legacy_checkpoint_hparams() -> None:
-    hparams = {
-        "architecture": "yolov8n",
-        "matching_algorithm": "tal",
-        "matching_threshold": 0.5,
-        "overlap_func": "ciou",
-        "overlap_loss_multiplier": 5.0,
-        "confidence_loss_multiplier": 1.0,
-        "class_loss_multiplier": 1.0,
-    }
+    torch.manual_seed(0)
+    uint8_detections, uint8_losses = module(uint8_images, targets)
+    torch.manual_seed(0)
+    float_detections, float_losses = module(float_images, targets)
 
-    migrated = _migrate_legacy_checkpoint_hparams(hparams)
-
-    assert migrated == {
-        "architecture": "yolov8n",
-        "matching": {"algorithm": "tal", "threshold": 0.5},
-        "loss": {
-            "overlap_func": "ciou",
-            "overlap_multiplier": 5.0,
-            "confidence_multiplier": 1.0,
-            "class_multiplier": 1.0,
-        },
-    }
+    torch.testing.assert_close(uint8_detections, float_detections)
+    torch.testing.assert_close(uint8_losses, float_losses)
 
 
 def test_yolo_to_onnx(tmp_path):
@@ -86,7 +79,7 @@ def test_yolo_to_onnx(tmp_path):
     assert image_shape[3].dim_param == "width"
 
 
-def test_yolov4_bias_init() -> None:
+def test_yolo_init_yolov4_bias() -> None:
     module = YOLO(architecture="yolov4", num_classes=2)
     classprob_bias = detection_classprob_bias(2)
     output_convs = [
@@ -104,7 +97,7 @@ def test_yolov4_bias_init() -> None:
         assert torch.allclose(bias[:, 5:], torch.full_like(bias[:, 5:], classprob_bias))
 
 
-def test_yolox_bias_init() -> None:
+def test_yolo_init_yolox_bias() -> None:
     module = YOLO(architecture="yolox-tiny", num_classes=2)
     classprob_bias = detection_classprob_bias(2)
     heads = [head for head in module.network.modules() if isinstance(head, YOLOXHead)]

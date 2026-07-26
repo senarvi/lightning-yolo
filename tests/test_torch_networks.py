@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from lightning_yolo.batching import pack_targets
 from lightning_yolo.config import MatchingConfig
 from lightning_yolo.torch_networks import create_network
 
@@ -63,7 +64,9 @@ def test_create_network(
         assert output.shape[2] == (5 + num_classes)
         assert torch.isfinite(output).all()
 
-    targets = [{"boxes": torch.tensor([[24.0, 32.0, 88.0, 96.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
+    targets = pack_targets(
+        [{"boxes": torch.tensor([[24.0, 32.0, 88.0, 96.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
+    )
     detections, losses = model(images, targets)
 
     assert len(detections) > 0

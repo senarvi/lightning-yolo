@@ -34,16 +34,20 @@ The prior shapes are also used for matching the ground-truth targets to anchors 
 
 ## Input Data
 
-The model input is expected to be a list of images. Each image is a tensor with shape `[channels, height, width]`. The images from a single batch will be stacked into a single tensor, so the sizes have to match. Different batches can have different image sizes. The feature pyramid network introduces another constraint on the image size: the width and the height have to be divisible by the ratio in which the network downsamples the input.
+The model input is a tensor with shape `[batch, channels, height, width]`. The provided data modules emit uint8 tensors, which the model converts to floating point and normalizes on the target device. Floating-point image tensors are also accepted. Different batches can have different image sizes. The feature pyramid network introduces another constraint on the image size: the width and the height have to be divisible by the ratio in which the network downsamples the input.
 
-During training, the model expects both the image tensors and a list of targets. It's possible to train a model using one integer class label per box, but the YOLO model supports also multiple labels per box. For multi-label training, simply use a boolean matrix that indicates which classes are assigned to which boxes, in place of the class labels. Each target is a dictionary containing the following tensors:
+During training, targets are packed into one dictionary for the whole batch. It is possible to train a model using one integer class label per box, or a boolean class mask for multi-label training. The packed dictionary contains:
 
-- *boxes*: `(x1, y1, x2, y2)` coordinates of the ground-truth boxes in a matrix with shape `[N, 4]`.
-- *labels*: Either integer class labels in a vector of size `N` or a class mask for each ground-truth box in a boolean matrix with shape `[N, classes]`
+- *boxes*: `(x1, y1, x2, y2)` coordinates of all ground-truth boxes in a tensor with shape `[T, 4]`.
+- *labels*: Integer class labels with shape `[T]` or boolean class masks with shape `[T, classes]`.
+- *batch_indices*: Image index for each target, with shape `[T]`.
+- *counts*: Number of targets in each image, as a list of length `batch`.
+
+Here `T` is the total number of targets in the batch. Data loaders should use `collate_packed_batch` to stack images and construct this representation.
 
 ## Training
 
-The `YOLO` class defined in [lightning_module.py](src/lightning_yolo/lightning_module.py) is a `LightningModule` that can be used with PyTorch Lightning Trainer. First the module creates a network, either from a Darknet configuration file, or using one of the built-in PyTorch networks.
+The `YOLO` class defined in [yolo.py](src/lightning_yolo/yolo.py) is a `LightningModule` that can be used with PyTorch Lightning Trainer. First the module creates a network, either from a Darknet configuration file, or using one of the built-in PyTorch networks.
 
 A data module for the COCO object detection dataset is provided for demonstration purposes. The data module needs to resize the data to a suitable size, in addition to any augmenting transforms. For example, YOLOv4 network requires that the width and the height are multiples of 32.
 

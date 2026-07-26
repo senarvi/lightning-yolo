@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -57,19 +58,58 @@ class LevelPredictions:
 
 
 class PredictionDict(TypedDict):
+    """Decoded predictions for a single image.
+
+    Attributes:
+        boxes: Predicted boxes shaped ``[N, 4]`` in ``xyxy`` coordinates.
+        confidences: Confidence logits, or normalized probabilities when the input is normalized, shaped ``[N]``.
+        classprobs: Class logits, or normalized probabilities when the input is normalized, shaped ``[N, C]``.
+
+    """
+
     boxes: Tensor
     confidences: Tensor
     classprobs: Tensor
 
 
 class TargetDict(TypedDict):
+    """Ground-truth detection targets for a single image.
+
+    Attributes:
+        boxes: Target boxes shaped ``[N, 4]`` in ``xyxy`` pixel coordinates.
+        labels: Class labels shaped ``[N]``.
+
+    """
+
     boxes: Tensor
     labels: Tensor
 
 
-IMAGES = tuple[Tensor, ...] | list[Tensor]
-PREDICTIONS = tuple[PredictionDict, ...] | list[PredictionDict]
+class PackedTargetDict(TypedDict):
+    """Targets for a whole batch concatenated into flat tensors.
+
+    Packing avoids Python-level looping over images and removes the need for padding to the largest target count.
+    The data module produces this format via :func:`collate_packed_batch` and the model consumes it directly.
+
+    Attributes:
+        boxes: Concatenated boxes shaped ``[T, 4]`` in ``xyxy`` pixel coordinates, where ``T`` is the total number of
+            targets across the batch.
+        labels: Concatenated class labels shaped ``[T]``.
+        batch_indices: Image index for each target row, shaped ``[T]``. Used for scatter-style operations over the
+            packed tensors.
+        counts: Number of targets per image, one entry per image in the batch. ``len(counts)`` is the batch size.
+            Unlike ``batch_indices``, this encodes images with zero targets and is used to split the packed tensors
+            back into per-image lists via ``Tensor.split(counts)``.
+
+    """
+
+    boxes: Tensor
+    labels: Tensor
+    batch_indices: Tensor
+    counts: list[int]
+
+
+PREDICTIONS = Sequence[PredictionDict]
 PRIOR_SHAPES = list[tuple[int, int]]
-TARGETS = tuple[TargetDict, ...] | list[TargetDict]
-BATCH = tuple[IMAGES, TARGETS]
+BATCH = tuple[Tensor, PackedTargetDict]
 NETWORK_OUTPUT = tuple[list[Tensor], list[DetectionLossRecord]]

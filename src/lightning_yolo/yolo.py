@@ -11,10 +11,11 @@ from torchmetrics.detection import MeanAveragePrecision
 from torchvision.ops import batched_nms
 from torchvision.transforms import functional as T
 
+from .batching import split_targets
 from .config import LossConfig, MatchingConfig
 from .darknet_network import DarknetNetwork
 from .torch_networks import create_network
-from .types import BATCH, IMAGES, PRIOR_SHAPES, TARGETS
+from .types import BATCH, PRIOR_SHAPES, PackedTargetDict
 
 
 class YOLO(LightningModule):
@@ -44,21 +45,15 @@ class YOLO(LightningModule):
     input. Note that if you change the size of the input images, you should also scale the prior shapes (a.k.a.
     anchors).
 
-    During training, the model expects both the image tensors and a list of targets. It's possible to train a model
-    using one integer class label per box, but the YOLO model supports also multiple labels per box. For multi-label
-    training, simply use a boolean matrix that indicates which classes are assigned to which boxes, in place of the
-    class labels. *Each target is a dictionary containing the following tensors*:
+    During training, the model expects both the image tensors and a :class:`~.types.PackedTargetDict` with the
+    ground-truth boxes and labels for the whole batch packed into flat tensors.
 
-    - boxes (``FloatTensor[N, 4]``): the ground-truth boxes in `(x1, y1, x2, y2)` format
-    - labels (``Int64Tensor[N]`` or ``BoolTensor[N, classes]``): the class label or a boolean class mask for each
-      ground-truth box
-
-    :func:`~.yolo_module.YOLO.forward` method returns all predictions from all detection layers in one tensor with shape
+    :func:`~.yolo.YOLO.forward` method returns all predictions from all detection layers in one tensor with shape
     ``[N, anchors, classes + 5]``, where ``anchors`` is the total number of anchors in all detection layers. The
-    coordinates are scaled to the input image size. During training it also returns a dictionary containing the
-    classification, box overlap, and confidence losses.
+    coordinates are scaled to the input image size. During training it also returns a 1-D tensor of three loss values:
+    overlap, confidence, and classification.
 
-    During inference, the model requires only the image tensor. :func:`~.yolo_module.YOLO.infer` method filters and
+    During inference, the model requires only the image tensor. :func:`~.yolo.YOLO.infer` method filters and
     processes the predictions. If a prediction has a high score for more than one class, it will be duplicated. *The
     processed output is returned in a dictionary containing the following tensors*:
 
@@ -70,8 +65,9 @@ class YOLO(LightningModule):
 
         # Darknet network configuration
         wget https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny-3l.cfg
-        python yolo_module.py fit \
-            --model.network_config yolov4-tiny-3l.cfg \
+        uv run lightning-yolo fit \
+            --model.darknet_config yolov4-tiny-3l.cfg \
+            --model.num_classes 80 \
             --data.batch_size 8 \
             --data.num_workers 4 \
             --trainer.accelerator gpu \
@@ -81,7 +77,9 @@ class YOLO(LightningModule):
             --trainer.max_epochs=100
 
         # YOLOv4
-        python yolo_module.py fit \
+        uv run lightning-yolo fit \
+            --model.architecture yolov4 \
+            --model.num_classes 80 \
             --data.batch_size 8 \
             --data.num_workers 4 \
             --trainer.accelerator gpu \
@@ -196,7 +194,9 @@ class YOLO(LightningModule):
         self._test_map = MeanAveragePrecision(max_detection_thresholds=map_thresholds)
 
     @override
-    def forward(self, images: Tensor | IMAGES, targets: TARGETS | None = None) -> Tensor | tuple[Tensor, Tensor]:
+    def forward(
+        self, images: Tensor | list[Tensor], targets: PackedTargetDict | None = None
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Runs a forward pass through the network (all layers listed in ``self.network``), and if training targets are
         provided, computes the losses from the detection layers.
 
@@ -204,20 +204,22 @@ class YOLO(LightningModule):
         that depends on the size of the feature map and the number of anchors per feature map cell.
 
         Args:
-            images: A tensor of size ``[batch_size, channels, height, width]`` containing a batch of images or a list of
-                image tensors.
-            targets: If given, computes losses from detection layers against these targets. A list of target
-                dictionaries, one for each image.
+            images: A tensor of size ``[batch_size, channels, height, width]`` containing a batch of images or a list
+                of image tensors.
+            targets: If given, computes losses from detection layers against these packed targets.
 
         Returns:
-            detections (:class:`~torch.Tensor`), losses (:class:`~torch.Tensor`): Detections, and if targets were
-            provided, a dictionary of losses. Detections are shaped ``[batch_size, anchors, classes + 5]``, where
-            ``anchors`` is the feature map size (width * height) times the number of anchors per cell. The predicted box
-            coordinates are in `(x1, y1, x2, y2)` format and scaled to the input image size.
+            When ``targets`` is ``None``, returns the detections tensor shaped
+            ``[batch_size, anchors, classes + 5]``. When targets are provided, returns a tuple
+            ``(detections, losses)`` where ``losses`` is a 1-D tensor of three values: overlap, confidence, and
+            classification loss. ``anchors`` is the feature map size (width * height) times the number of anchors per
+            cell. Box coordinates are in `(x1, y1, x2, y2)` format and scaled to the input image size.
 
         """
         self.validate_batch(images, targets)
         images_tensor = images if isinstance(images, Tensor) else torch.stack(images)
+        if images_tensor.dtype == torch.uint8:
+            images_tensor = images_tensor.to(torch.float32).div(255.0)
         detections, loss_records = self.network(images_tensor, targets)
 
         detections = torch.cat(detections, 1)
@@ -554,7 +556,7 @@ class YOLO(LightningModule):
 
         return [process(p[..., :4], p[..., 4], p[..., 5:]) for p in preds]
 
-    def process_targets(self, targets: TARGETS) -> list[dict[str, Tensor]]:
+    def process_targets(self, targets: PackedTargetDict) -> list[dict[str, Tensor]]:
         """Duplicates multi-label targets to create one target for each label.
 
         Args:
@@ -572,22 +574,23 @@ class YOLO(LightningModule):
                 boxes = boxes[idxs]
             return {"boxes": boxes, "labels": labels, **other}
 
-        return [process(**t) for t in targets]
+        return [process(**target) for target in split_targets(targets)]
 
-    def validate_batch(self, images: Tensor | IMAGES, targets: TARGETS | None) -> None:
+    def validate_batch(self, images: Tensor | list[Tensor], targets: PackedTargetDict | None) -> None:
         """Validates the format of a batch of data.
 
         Args:
             images: A tensor containing a batch of images or a list of image tensors.
-            targets: A list of target dictionaries or ``None``. If a list is provided, there should be as many target
-                dictionaries as there are images.
 
         """
-        if not isinstance(images, Tensor):
-            if not isinstance(images, (tuple, list)):
-                raise TypeError(f"Expected images to be a Tensor, tuple, or a list, got {type(images).__name__}.")
+        if isinstance(images, Tensor):
+            batch_size = int(images.shape[0])
+        else:
+            if not isinstance(images, list):
+                raise TypeError(f"Expected images to be a Tensor or a list, got {type(images).__name__}.")
             if not images:
                 raise ValueError("No images in batch.")
+            batch_size = len(images)
             shape = images[0].shape
             for image in images:
                 if not isinstance(image, Tensor):
@@ -600,25 +603,32 @@ class YOLO(LightningModule):
                 raise ValueError("Targets should be given in training mode.")
             return
 
-        if not isinstance(targets, (tuple, list)):
-            raise TypeError(f"Expected targets to be a tuple or a list, got {type(images).__name__}.")
-        if len(images) != len(targets):
-            raise ValueError(f"Got {len(images)} images, but targets for {len(targets)} images.")
-
-        for target in targets:
-            if "boxes" not in target:
-                raise ValueError("Target dictionary doesn't contain boxes.")
-            boxes = target["boxes"]
-            if not isinstance(boxes, Tensor):
-                raise TypeError(f"Expected target boxes to be of type Tensor, got {type(boxes).__name__}.")
-            if (boxes.ndim != 2) or (boxes.shape[-1] != 4):
-                raise ValueError(f"Expected target boxes to be tensors of shape [N, 4], got {list(boxes.shape)}.")
-            if "labels" not in target:
-                raise ValueError("Target dictionary doesn't contain labels.")
-            labels = target["labels"]
-            if not isinstance(labels, Tensor):
-                raise ValueError(f"Expected target labels to be of type Tensor, got {type(labels).__name__}.")
-            if (labels.ndim < 1) or (labels.ndim > 2) or (len(labels) != len(boxes)):
-                raise ValueError(
-                    f"Expected target labels to be tensors of shape [N] or [N, num_classes], got {list(labels.shape)}."
-                )
+        for key in ("boxes", "labels", "batch_indices", "counts"):
+            if key not in targets:
+                raise ValueError(f"Packed target dictionary doesn't contain {key}.")
+        boxes = targets["boxes"]
+        labels = targets["labels"]
+        batch_indices = targets["batch_indices"]
+        counts = targets["counts"]
+        if not isinstance(boxes, Tensor):
+            raise TypeError(f"Expected target boxes to be of type Tensor, got {type(boxes).__name__}.")
+        if not isinstance(labels, Tensor):
+            raise TypeError(f"Expected target labels to be of type Tensor, got {type(labels).__name__}.")
+        if not isinstance(batch_indices, Tensor):
+            raise TypeError(f"Expected target batch_indices to be of type Tensor, got {type(batch_indices).__name__}.")
+        if not isinstance(counts, list):
+            raise TypeError(f"Expected target counts to be a list, got {type(counts).__name__}.")
+        if (boxes.ndim != 2) or (boxes.shape[-1] != 4):
+            raise ValueError(f"Expected target boxes to be tensors of shape [N, 4], got {list(boxes.shape)}.")
+        if (labels.ndim < 1) or (labels.ndim > 2) or (len(labels) != len(boxes)):
+            raise ValueError(
+                f"Expected target labels to be tensors of shape [N] or [N, num_classes], got {list(labels.shape)}."
+            )
+        if batch_indices.ndim != 1 or len(batch_indices) != len(boxes):
+            raise ValueError(
+                f"Expected target batch_indices to be tensors of shape [N], got {list(batch_indices.shape)}."
+            )
+        if len(counts) != batch_size:
+            raise ValueError(f"Got {batch_size} images, but target counts for {len(counts)} images.")
+        if sum(counts) != len(boxes):
+            raise ValueError(f"Target counts sum to {sum(counts)}, but there are {len(boxes)} boxes.")

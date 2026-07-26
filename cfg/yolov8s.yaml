@@ -3,11 +3,11 @@ trainer:
   devices: 1
   precision: 16-mixed
   max_epochs: 500
-  default_root_dir: runs/yolov8s-simota-500
+  default_root_dir: runs/yolov8s
   logger:
     class_path: lightning.pytorch.loggers.CSVLogger
     init_args:
-      save_dir: runs/yolov8s-simota-500
+      save_dir: runs/yolov8s
       name: csv
       version: version_0
   log_every_n_steps: 50
@@ -15,20 +15,23 @@ trainer:
     - class_path: lightning_yolo.coco_datamodule.CloseMosaic
       init_args:
         epochs: 10
+    - class_path: lightning_yolo.callbacks.EpochLogger
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: runs/yolov8s-simota-500/checkpoints
+        dirpath: runs/yolov8s/checkpoints
         filename: epoch={epoch:03d}-val_map={val/map:.4f}
         monitor: val/map
         mode: max
         save_last: true
         save_top_k: 3
         auto_insert_metric_name: false
+        verbose: true
 model:
   architecture: yolov8s
   num_classes: 80
   matching:
-    algorithm: simota
+    algorithm: tal
+  predict_confidence: false
   lr: 0.01
   momentum: 0.9
   weight_decay: 0.0005

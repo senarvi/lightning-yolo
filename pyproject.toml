@@ -11,6 +11,7 @@ dependencies = [
     "lightning[extra]>=2.6.1",
     "onnxruntime>=1.24.4",
     "onnxscript>=0.6.2",
+    "opencv-python-headless>=5.0.0.93",
     "pycocotools>=2.0.11",
     "torchvision>=0.25.0",
 ]
@@ -63,6 +64,9 @@ extend-select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/lightning_yolo/coco_datamodule.py" = [
+    "ARG002",  # save_hyperparameters() consumes __init__ args via frame inspection
+]
 "src/**" = [
     "S101",  # Use of `assert` detected
 ]
