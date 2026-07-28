@@ -205,6 +205,8 @@ class COCODetectionDataset(Dataset):
         translate: Maximum affine translation as a fraction of the output size.
         scale: Maximum affine scale variation around one.
         mixup: Probability of applying MixUp to a training sample.
+        hsv: HSV gains as `(hue, saturation, value)` for the training augmentation.
+        flip: Probability of horizontal flipping in the training augmentation.
         cache_size: Maximum number of resized samples retained per worker; zero disables caching.
 
     """
@@ -219,6 +221,8 @@ class COCODetectionDataset(Dataset):
         translate: float = 0.1,
         scale: float = 0.5,
         mixup: float = 0.0,
+        hsv: tuple[float, float, float] = (0.015, 0.7, 0.4),
+        flip: float = 0.5,
         cache_size: int = 512,
     ) -> None:
         if not 0.0 <= translate <= 1.0:
@@ -241,7 +245,15 @@ class COCODetectionDataset(Dataset):
         self._cache: list[Sample | None] = [None] * len(index)
         self._recent: deque[int] = deque()
         self._augmentation: TrainAugmentation | EvalAugmentation = (
-            TrainAugmentation(image_size, translate=translate, scale=scale, mixup=mixup, fill=114)
+            TrainAugmentation(
+                image_size,
+                translate=translate,
+                scale=scale,
+                mixup=mixup,
+                hsv=hsv,
+                flip=flip,
+                fill=114,
+            )
             if training
             else EvalAugmentation(image_size, fill=114)
         )
@@ -373,6 +385,8 @@ class COCODetectionDataModule(LightningDataModule):
         translate: Maximum affine translation as a fraction of the output size.
         scale: Maximum affine scale variation around one.
         mixup: Probability of applying MixUp to a training sample.
+        hsv: HSV gains as `(hue, saturation, value)` for the training augmentation.
+        flip: Probability of horizontal flipping in the training augmentation.
         cache_size: Resized samples cached per training worker; ``None`` derives a value from the batch size.
 
     """
@@ -397,6 +411,8 @@ class COCODetectionDataModule(LightningDataModule):
         scale: float = 0.5,
         mixup: float = 0.0,
         cache_size: int | None = None,
+        hsv: tuple[float, float, float] = (0.015, 0.7, 0.4),
+        flip: float = 0.5,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -485,6 +501,8 @@ class COCODetectionDataModule(LightningDataModule):
                 scale=self.hparams["scale"],
                 mixup=self.hparams["mixup"],
                 cache_size=cache_size,
+                hsv=self.hparams["hsv"],
+                flip=self.hparams["flip"],
             )
         return COCODetectionDataset(
             image_dir=image_dir,

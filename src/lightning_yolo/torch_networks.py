@@ -6,6 +6,11 @@ import torch
 from torch import Tensor, nn
 
 from .config import LossConfig, MatchingConfig
+from .heads import (
+    create_distributional_distance_detection_head,
+    create_prior_shape_detection_head,
+    create_prior_shape_detection_head_with_aux,
+)
 from .initialization import (
     detection_classprob_bias,
     detection_confidence_bias,
@@ -13,8 +18,8 @@ from .initialization import (
     initialize_yolo_logits,
     initialize_zero_bias,
 )
-from .layers import Conv, DetectionHeadWithAux, MaxPool, ReOrg, create_detection_head
-from .types import NETWORK_OUTPUT, PRIOR_SHAPES, DetectionLossRecord, PackedTargetDict
+from .layers import Conv, MaxPool, ReOrg
+from .types import NETWORK_OUTPUT, PRIOR_SHAPES, PackedTargetDict
 from .utils import get_image_size
 
 
@@ -27,6 +32,7 @@ class BottleneckBlock(nn.Module):
         hidden_channels: Number of output channels the (hidden) bottleneck layer produces. By default the number of
             output channels of the block.
         shortcut: Whether the block should include a shortcut connection.
+        kernel_sizes: Kernel sizes of the hidden and output convolutions.
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
             "linear", or "none".
         norm: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
@@ -39,6 +45,7 @@ class BottleneckBlock(nn.Module):
         out_channels: int,
         hidden_channels: int | None = None,
         shortcut: bool = True,
+        kernel_sizes: tuple[int, int] = (1, 3),
         activation: str | None = "silu",
         norm: str | None = "batchnorm",
     ) -> None:
@@ -48,8 +55,10 @@ class BottleneckBlock(nn.Module):
             hidden_channels = out_channels
 
         self.convs = nn.Sequential(
-            Conv(in_channels, hidden_channels, kernel_size=1, stride=1, activation=activation, norm=norm),
-            Conv(hidden_channels, out_channels, kernel_size=3, stride=1, activation=activation, norm=norm),
+            Conv(in_channels, hidden_channels, kernel_size=kernel_sizes[0], stride=1, activation=activation, norm=norm),
+            Conv(
+                hidden_channels, out_channels, kernel_size=kernel_sizes[1], stride=1, activation=activation, norm=norm
+            ),
         )
         self.shortcut = shortcut and in_channels == out_channels
 
@@ -251,7 +260,14 @@ class C2fStage(nn.Module):
 
         self.split = Conv(in_channels, hidden_channels * 2, kernel_size=1, stride=1, activation=activation, norm=norm)
         bottlenecks: list[nn.Module] = [
-            BottleneckBlock(hidden_channels, hidden_channels, shortcut=shortcut, norm=norm, activation=activation)
+            BottleneckBlock(
+                hidden_channels,
+                hidden_channels,
+                shortcut=shortcut,
+                kernel_sizes=(3, 3),
+                norm=norm,
+                activation=activation,
+            )
             for _ in range(depth)
         ]
         self.bottlenecks = nn.ModuleList(bottlenecks)
@@ -694,8 +710,6 @@ class YOLOV4TinyNetwork(nn.Module):
             resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
             assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
             you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -733,7 +747,6 @@ class YOLOV4TinyNetwork(nn.Module):
         activation: str | None = "leaky",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
         matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
         xy_scale: float = 1.0,
@@ -758,9 +771,9 @@ class YOLOV4TinyNetwork(nn.Module):
             anchors_per_cell, modulo = divmod(len(prior_shapes), 3)
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
-        box_attrs = 5 if predict_confidence else 4
+        box_attrs = 5
         num_outputs = (box_attrs + num_classes) * anchors_per_cell
-        confidence_bias = detection_confidence_bias() if predict_confidence else None
+        confidence_bias = detection_confidence_bias()
         classprob_bias = detection_classprob_bias(num_classes)
 
         def conv(in_channels: int, out_channels: int, kernel_size: int = 1) -> nn.Module:
@@ -801,12 +814,11 @@ class YOLOV4TinyNetwork(nn.Module):
         self.fpn3 = conv(width * 6, width * 4, kernel_size=3)
         self.out3 = nn.Sequential(OrderedDict([(f"outputs_{num_outputs}", outputs(width * 4))]))
 
-        self.detect = create_detection_head(
+        self.detect = create_prior_shape_detection_head(
             prior_shapes,
             [[0, 1, 2], [3, 4, 5], [6, 7, 8]],
             num_classes=num_classes,
             input_is_normalized=False,
-            predict_confidence=predict_confidence,
             matching=matching,
             loss=loss,
             xy_scale=xy_scale,
@@ -842,8 +854,6 @@ class YOLOV4Network(nn.Module):
             resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
             assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
             you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -881,7 +891,6 @@ class YOLOV4Network(nn.Module):
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
         matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
         xy_scale: float = 1.0,
@@ -906,9 +915,9 @@ class YOLOV4Network(nn.Module):
             anchors_per_cell, modulo = divmod(len(prior_shapes), 3)
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
-        box_attrs = 5 if predict_confidence else 4
+        box_attrs = 5
         num_outputs = (box_attrs + num_classes) * anchors_per_cell
-        confidence_bias = detection_confidence_bias() if predict_confidence else None
+        confidence_bias = detection_confidence_bias()
         classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
@@ -975,7 +984,7 @@ class YOLOV4Network(nn.Module):
         self.out4 = out(w4)
         self.out5 = out(w5)
 
-        self.detect = create_detection_head(
+        self.detect = create_prior_shape_detection_head(
             prior_shapes,
             [
                 range(0, anchors_per_cell),
@@ -984,7 +993,6 @@ class YOLOV4Network(nn.Module):
             ],
             num_classes=num_classes,
             input_is_normalized=False,
-            predict_confidence=predict_confidence,
             matching=matching,
             loss=loss,
             xy_scale=xy_scale,
@@ -1024,8 +1032,6 @@ class YOLOV4P6Network(nn.Module):
             resolution. There should be `4N` pairs, where `N` is the number of anchors per spatial location. They are
             assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
             you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1063,7 +1069,6 @@ class YOLOV4P6Network(nn.Module):
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
         matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
         xy_scale: float = 1.0,
@@ -1095,9 +1100,9 @@ class YOLOV4P6Network(nn.Module):
             anchors_per_cell, modulo = divmod(len(prior_shapes), 4)
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 4.")
-        box_attrs = 5 if predict_confidence else 4
+        box_attrs = 5
         num_outputs = (box_attrs + num_classes) * anchors_per_cell
-        confidence_bias = detection_confidence_bias() if predict_confidence else None
+        confidence_bias = detection_confidence_bias()
         classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
@@ -1174,7 +1179,7 @@ class YOLOV4P6Network(nn.Module):
         self.out5 = out(w5)
         self.out6 = out(w6)
 
-        self.detect = create_detection_head(
+        self.detect = create_prior_shape_detection_head(
             prior_shapes,
             [
                 range(0, anchors_per_cell),
@@ -1184,7 +1189,6 @@ class YOLOV4P6Network(nn.Module):
             ],
             num_classes=num_classes,
             input_is_normalized=False,
-            predict_confidence=predict_confidence,
             matching=matching,
             loss=loss,
             xy_scale=xy_scale,
@@ -1233,8 +1237,6 @@ class YOLOV5Network(nn.Module):
             resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
             assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
             you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1273,7 +1275,6 @@ class YOLOV5Network(nn.Module):
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
         matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
         xy_scale: float = 1.0,
@@ -1298,9 +1299,9 @@ class YOLOV5Network(nn.Module):
             anchors_per_cell, modulo = divmod(len(prior_shapes), 3)
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
-        box_attrs = 5 if predict_confidence else 4
+        box_attrs = 5
         num_outputs = (box_attrs + num_classes) * anchors_per_cell
-        confidence_bias = detection_confidence_bias() if predict_confidence else None
+        confidence_bias = detection_confidence_bias()
         classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
@@ -1360,7 +1361,7 @@ class YOLOV5Network(nn.Module):
         self.downsample3 = downsample(width * 4, width * 4)
         self.downsample4 = downsample(width * 8, width * 8)
 
-        self.detect = create_detection_head(
+        self.detect = create_prior_shape_detection_head(
             prior_shapes,
             [
                 range(0, anchors_per_cell),
@@ -1369,7 +1370,6 @@ class YOLOV5Network(nn.Module):
             ],
             num_classes=num_classes,
             input_is_normalized=False,
-            predict_confidence=predict_confidence,
             matching=matching,
             loss=loss,
             xy_scale=xy_scale,
@@ -1411,8 +1411,6 @@ class YOLOV7W6Network(nn.Module):
             resolution. There should be `4N` pairs, where `N` is the number of anchors per spatial location. They are
             assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
             you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1453,7 +1451,6 @@ class YOLOV7W6Network(nn.Module):
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
         matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
         xy_scale: float = 1.0,
@@ -1485,9 +1482,9 @@ class YOLOV7W6Network(nn.Module):
             anchors_per_cell, modulo = divmod(len(prior_shapes), 4)
             if modulo != 0:
                 raise ValueError("The number of provided prior shapes needs to be divisible by 4.")
-        box_attrs = 5 if predict_confidence else 4
+        box_attrs = 5
         num_outputs = (box_attrs + num_classes) * anchors_per_cell
-        confidence_bias = detection_confidence_bias() if predict_confidence else None
+        confidence_bias = detection_confidence_bias()
         classprob_bias = detection_classprob_bias(num_classes)
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
@@ -1522,19 +1519,6 @@ class YOLOV7W6Network(nn.Module):
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
-
-        def detection_head(prior_shape_idxs: Sequence[int]) -> DetectionHeadWithAux:
-            assert prior_shapes is not None
-            return DetectionHeadWithAux(
-                prior_shapes=prior_shapes,
-                prior_shape_idxs=list(prior_shape_idxs),
-                num_classes=num_classes,
-                input_is_normalized=False,
-                predict_confidence=predict_confidence,
-                matching=matching,
-                loss=loss,
-                xy_scale=xy_scale,
-            )
 
         if backbone is not None:
             self.backbone = backbone
@@ -1585,17 +1569,22 @@ class YOLOV7W6Network(nn.Module):
         self.out6 = out(w6 // 2, w6)
         self.aux_out6 = out(w6 // 2, w6 + (w6 // 4))
 
-        # Unlike the other architectures, YOLOv7 keeps a per-level DetectionHeadWithAux with its own lead/auxiliary
-        # deep supervision, so it cannot use the unified create_detection_head path.
-        self.detect3 = detection_head(range(0, anchors_per_cell))
-        self.detect4 = detection_head(range(anchors_per_cell, anchors_per_cell * 2))
-        self.detect5 = detection_head(range(anchors_per_cell * 2, anchors_per_cell * 3))
-        self.detect6 = detection_head(range(anchors_per_cell * 3, anchors_per_cell * 4))
+        self.detect = create_prior_shape_detection_head_with_aux(
+            prior_shapes,
+            [
+                range(0, anchors_per_cell),
+                range(anchors_per_cell, anchors_per_cell * 2),
+                range(anchors_per_cell * 2, anchors_per_cell * 3),
+                range(anchors_per_cell * 3, anchors_per_cell * 4),
+            ],
+            num_classes=num_classes,
+            input_is_normalized=False,
+            matching=matching,
+            loss=loss,
+            xy_scale=xy_scale,
+        )
 
     def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
-        detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
-
         image_size = get_image_size(x)
 
         c3, c4, c5, x = self.backbone(x)[-4:]
@@ -1614,11 +1603,12 @@ class YOLOV7W6Network(nn.Module):
         x = torch.cat((self.downsample5(n5), c6), dim=1)
         n6 = self.pan6(x)
 
-        self.detect3(self.out3(n3), self.aux_out3(n3), targets, image_size, detections, losses)
-        self.detect4(self.out4(n4), self.aux_out4(p4), targets, image_size, detections, losses)
-        self.detect5(self.out5(n5), self.aux_out5(p5), targets, image_size, detections, losses)
-        self.detect6(self.out6(n6), self.aux_out6(c6), targets, image_size, detections, losses)
-        return detections, losses
+        return self.detect(
+            [self.out3(n3), self.out4(n4), self.out5(n5), self.out6(n6)],
+            [self.aux_out3(n3), self.aux_out4(p4), self.aux_out5(p5), self.aux_out6(c6)],
+            image_size,
+            targets,
+        )
 
 
 class YOLOV8Network(nn.Module):
@@ -1643,37 +1633,9 @@ class YOLOV8Network(nn.Module):
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"),
             "logistic", "linear", or "none".
         normalization: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
-        prior_shapes: A list of prior box dimensions, used for scaling the predicted dimensions and possibly for
-            matching the targets to the anchors. The list should contain (width, height) tuples in the network input
-            resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
-            assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
-            you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
-        matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
-            from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
-            shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
-            that give a high enough IoU), or "maxiou" (match the prior shape that gives the highest IoU, default).
-        matching_threshold: Threshold for "size" and "iou" matching algorithms.
-        spatial_range: The "simota" matching algorithm will restrict to anchors that are within an `N × N` grid cell
-            area centered at the target, where `N` is the value of this parameter.
-        size_range: The "simota" matching algorithm will restrict to anchors whose dimensions are no more than `N` and
-            no less than `1/N` times the target dimensions, where `N` is the value of this parameter.
-        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the prior shape has IoU
-            with some target greater than this threshold, the predictor will not be taken into account when calculating
-            the confidence loss.
-        overlap_func: A function for calculating the pairwise overlaps between two sets of boxes. Valid string values
-            are "iou", "giou", "diou", and "ciou".
-        predict_overlap: Balance between binary confidence targets and predicting the overlap. 0.0 means that the target
-            confidence is 1 if there's an object, and 1.0 means that the target confidence is the output of
-            ``overlap_func``.
-        label_smoothing: The epsilon parameter (weight) for class label smoothing. 0.0 means no smoothing (binary
-            targets), and 1.0 means that the target probabilities are always 0.5.
-        overlap_loss_multiplier: Overlap loss will be scaled by this value.
-        confidence_loss_multiplier: Confidence loss will be scaled by this value.
-        class_loss_multiplier: Classification loss will be scaled by this value.
-        xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor. Using a value > 1.0 helps
-            to produce coordinate values close to one.
+        loss: Optional YOLOv8 loss settings. ``overlap_func``, ``label_smoothing``, ``overlap_multiplier``,
+            ``class_multiplier``, ``dfl_multiplier``, and ``num_dfl_bins`` are used when set; confidence-specific
+            settings are rejected.
 
     """
 
@@ -1686,50 +1648,22 @@ class YOLOV8Network(nn.Module):
         depth: int = 3,
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
-        prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
-        matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
-        xy_scale: float = 1.0,
     ) -> None:
         super().__init__()
 
         if len(widths) != 5:
             raise ValueError("YOLOV8Network requires exactly 5 width values.")
 
-        # By default use the prior shapes that have been learned from the COCO data.
-        if prior_shapes is None:
-            prior_shapes = [
-                (12, 16),
-                (19, 36),
-                (40, 28),
-                (36, 75),
-                (76, 55),
-                (72, 146),
-                (142, 110),
-                (192, 243),
-                (459, 401),
-            ]
-            anchors_per_cell = 3
-        else:
-            anchors_per_cell, modulo = divmod(len(prior_shapes), 3)
-            if modulo != 0:
-                raise ValueError("The number of provided prior shapes needs to be divisible by 3.")
-        box_attrs = 5 if predict_confidence else 4
-        num_outputs = (box_attrs + num_classes) * anchors_per_cell
-        confidence_bias = detection_confidence_bias() if predict_confidence else None
-        classprob_bias = detection_classprob_bias(num_classes)
+        loss = loss or LossConfig()
+        if loss.confidence_multiplier is not None or loss.predict_overlap is not None:
+            raise ValueError("YOLOv8 loss does not use confidence or overlap prediction settings.")
 
         def spp(in_channels: int, out_channels: int) -> nn.Module:
             return FastSPP(in_channels, out_channels, activation=activation, norm=normalization)
 
         def downsample(in_channels: int, out_channels: int) -> nn.Module:
             return Conv(in_channels, out_channels, kernel_size=3, stride=2, activation=activation, norm=normalization)
-
-        def out(in_channels: int) -> nn.Module:
-            outputs = nn.Conv2d(in_channels, num_outputs, kernel_size=1)
-            initialize_yolo_logits(outputs, num_classes, confidence_bias, classprob_bias)
-            return nn.Sequential(OrderedDict([(f"outputs_{num_outputs}", outputs)]))
 
         def c2f(in_channels: int, out_channels: int) -> nn.Module:
             return C2fStage(
@@ -1756,34 +1690,18 @@ class YOLOV8Network(nn.Module):
         self.spp = spp(w5, w5)
 
         self.pan3 = c2f(w4 + w3, w3)
-        self.out3 = out(w3)
 
         self.fpn4 = c2f(w5 + w4, w4)
         self.pan4 = c2f(w3 + w4, w4)
-        self.out4 = out(w4)
 
         self.pan5 = c2f(w4 + w5, w5)
-        self.out5 = out(w5)
 
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
         self.downsample3 = downsample(w3, w3)
         self.downsample4 = downsample(w4, w4)
 
-        self.detect = create_detection_head(
-            prior_shapes,
-            [
-                range(0, anchors_per_cell),
-                range(anchors_per_cell, anchors_per_cell * 2),
-                range(anchors_per_cell * 2, anchors_per_cell * 3),
-            ],
-            num_classes=num_classes,
-            input_is_normalized=False,
-            predict_confidence=predict_confidence,
-            matching=matching,
-            loss=loss,
-            xy_scale=xy_scale,
-        )
+        self.detect = create_distributional_distance_detection_head((w3, w4, w5), num_classes=num_classes, loss=loss)
 
     def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         image_size = get_image_size(x)
@@ -1801,7 +1719,7 @@ class YOLOV8Network(nn.Module):
         x = torch.cat((self.downsample4(n4), c5), dim=1)
         n5 = self.pan5(x)
 
-        return self.detect([self.out3(n3), self.out4(n4), self.out5(n5)], image_size, targets)
+        return self.detect([n3, n4, n5], image_size, targets)
 
 
 class YOLOXHead(nn.Module):
@@ -1816,7 +1734,6 @@ class YOLOXHead(nn.Module):
         activation: Which layer activation to use. Can be "relu", "leaky", "mish", "silu" (or "swish"), "logistic",
             "linear", or "none".
         norm: Which layer normalization to use. Can be "batchnorm", "groupnorm", or "none".
-        predict_confidence: Whether the head predicts a confidence (objectness) channel.
 
     """
 
@@ -1828,7 +1745,6 @@ class YOLOXHead(nn.Module):
         num_classes: int,
         activation: str | None = "silu",
         norm: str | None = "batchnorm",
-        predict_confidence: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1853,22 +1769,18 @@ class YOLOXHead(nn.Module):
         self.stem = conv(in_channels, hidden_channels)
         self.feat = features(hidden_channels)
         self.box = linear(hidden_channels, anchors_per_cell * 4)
-        self.confidence = linear(hidden_channels, anchors_per_cell) if predict_confidence else None
+        self.confidence = linear(hidden_channels, anchors_per_cell)
         self.classprob = classprob(hidden_channels)
 
         initialize_zero_bias(self.box)
-        if self.confidence is not None:
-            initialize_constant_bias(self.confidence, detection_confidence_bias())
+        initialize_constant_bias(self.confidence, detection_confidence_bias())
 
     def forward(self, x: Tensor) -> Tensor:
         x = self.stem(x)
         features = self.feat(x)
         box = self.box(features)
         classprob = self.classprob(x)
-        outputs = [box]
-        if self.confidence is not None:
-            outputs.append(self.confidence(features))
-        outputs.append(classprob)
+        outputs = [box, self.confidence(features), classprob]
         return torch.cat(outputs, dim=1)
 
 
@@ -1893,8 +1805,6 @@ class YOLOXNetwork(nn.Module):
             resolution. There should be `3N` tuples, where `N` is the number of anchors per spatial location. They are
             assigned to the layers from the lowest (high-resolution) to the highest (low-resolution) layer, meaning that
             you typically want to sort the shapes from the smallest to the largest.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel. Set to ``False`` to
-            drop objectness supervision and supervise all anchors via classification loss only.
         matching_algorithm: Which algorithm to use for matching targets to anchors. "simota" (the SimOTA matching rule
             from YOLOX), "tal" (task-aligned top-k matching as used in Ultralytics YOLOv8), "size" (match those prior
             shapes, whose width and height relative to the target is below given ratio), "iou" (match all prior shapes
@@ -1933,7 +1843,6 @@ class YOLOXNetwork(nn.Module):
         activation: str | None = "silu",
         normalization: str | None = "batchnorm",
         prior_shapes: PRIOR_SHAPES | None = None,
-        predict_confidence: bool = True,
         matching: MatchingConfig | None = None,
         loss: LossConfig | None = None,
         xy_scale: float = 1.0,
@@ -1976,7 +1885,6 @@ class YOLOXNetwork(nn.Module):
                 num_classes,
                 activation=activation,
                 norm=normalization,
-                predict_confidence=predict_confidence,
             )
 
         self.backbone = backbone or YOLOV5Backbone(
@@ -2012,7 +1920,7 @@ class YOLOXNetwork(nn.Module):
         self.downsample3 = downsample(width * 4, width * 4)
         self.downsample4 = downsample(width * 8, width * 8)
 
-        self.detect = create_detection_head(
+        self.detect = create_prior_shape_detection_head(
             prior_shapes,
             [
                 range(0, anchors_per_cell),
@@ -2021,7 +1929,6 @@ class YOLOXNetwork(nn.Module):
             ],
             num_classes=num_classes,
             input_is_normalized=False,
-            predict_confidence=predict_confidence,
             matching=matching,
             loss=loss,
             xy_scale=xy_scale,
@@ -2054,7 +1961,6 @@ def create_network(
     prior_shapes: PRIOR_SHAPES | None = None,
     matching: MatchingConfig | None = None,
     loss: LossConfig | None = None,
-    predict_confidence: bool = True,
     xy_scale: float = 1.0,
 ) -> nn.Module:
     """Create a YOLO network based on the given architecture name.
@@ -2066,9 +1972,9 @@ def create_network(
         num_classes: Number of different classes that this model predicts.
         in_channels: Number of channels in the input image.
         prior_shapes: A list of prior box dimensions, or ``None`` to use the architecture defaults.
-        matching: Configuration that controls how targets are assigned to anchors.
+        matching: Configuration that controls how targets are assigned to anchors. Distributional-distance
+            architectures use fixed task-aligned matching and do not accept a matching configuration.
         loss: Configuration that controls how the detection losses are computed.
-        predict_confidence: Whether the head predicts a confidence (objectness) channel.
         xy_scale: Eliminate "grid sensitivity" by scaling the box coordinates by this factor.
 
     """
@@ -2133,13 +2039,21 @@ def create_network(
             "yolox-tiny, yolox-s, yolox-m, yolox-l."
         )
 
-    return network_class(
-        num_classes=num_classes,
-        in_channels=in_channels,
-        prior_shapes=prior_shapes,
-        matching=matching,
-        loss=loss,
-        predict_confidence=predict_confidence,
-        xy_scale=xy_scale,
+    network_args: dict[str, Any] = {
+        "num_classes": num_classes,
+        "in_channels": in_channels,
+        "prior_shapes": prior_shapes,
+        "matching": matching,
+        "loss": loss,
+        "xy_scale": xy_scale,
         **network_size,
-    )
+    }
+    if network_class is YOLOV8Network:
+        if prior_shapes is not None:
+            raise ValueError("YOLOv8 uses anchors without prior shapes and does not accept prior_shapes.")
+        if matching is not None:
+            raise ValueError("YOLOv8 uses built-in task-aligned matching and does not accept matching configuration.")
+        if xy_scale != 1.0:
+            raise ValueError("YOLOv8 point-distance decoding does not support xy_scale values other than 1.0.")
+        network_args = {"num_classes": num_classes, "in_channels": in_channels, "loss": loss, **network_size}
+    return network_class(**network_args)

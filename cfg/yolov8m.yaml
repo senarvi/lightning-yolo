@@ -9,36 +9,34 @@ trainer:
     class_path: lightning.pytorch.loggers.CSVLogger
     init_args:
       save_dir: runs/yolov8m
-      name: csv
-      version: version_0
   log_every_n_steps: 50
   callbacks:
     - class_path: lightning_yolo.coco_datamodule.CloseMosaic
       init_args:
         epochs: 10
-    - class_path: lightning_yolo.callbacks.EpochLogger
+    - class_path: lightning_yolo.callbacks.EMAWeightAveraging
+      init_args:
+        decay: 0.9999
+        warmup_updates: 2000.0
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
         dirpath: runs/yolov8m/checkpoints
-        filename: epoch={epoch:03d}-val_map={val/map:.4f}
         monitor: val/map
         mode: max
         save_last: true
         save_top_k: 3
-        auto_insert_metric_name: false
         verbose: true
 model:
   architecture: yolov8m
   num_classes: 80
-  matching:
-    algorithm: tal
-  predict_confidence: false
   lr: 0.01
   momentum: 0.9
   weight_decay: 0.0005
   warmup_epochs: 3.0
   final_lr_multiplier: 0.01
-  ema_decay: 0.9999
+  confidence_threshold: 0.001
+  nms_threshold: 0.7
+  detections_per_image: 300
 data:
   data_dir: data
   image_size: [640, 640]

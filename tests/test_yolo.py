@@ -1,82 +1,126 @@
+from pathlib import Path
+
 import onnx
+import onnxruntime as ort
 import pytest
 import torch
 from torch import nn
 from torch.optim import SGD
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
+import lightning_yolo.yolo as yolo_module
 from lightning_yolo.batching import pack_targets
-from lightning_yolo.config import MatchingConfig
 from lightning_yolo.initialization import detection_classprob_bias
 from lightning_yolo.torch_networks import YOLOXHead
+from lightning_yolo.types import DetectionLoss
 from lightning_yolo.yolo import YOLO
 
 
-@pytest.mark.parametrize("predict_confidence", [False, True])
-def test_yolo_forward(predict_confidence: bool) -> None:
+def test_yolo_forward() -> None:
     module = YOLO(
         architecture="yolov8n",
         num_classes=3,
-        matching=MatchingConfig(algorithm="tal"),
-        predict_confidence=predict_confidence,
+    )
+    module.eval()
+    uint8_images = torch.randint(0, 256, (2, 3, 64, 64), dtype=torch.uint8)
+    float_images = uint8_images.to(torch.float32).div(255.0)
+
+    torch.manual_seed(0)
+    uint8_detections = module(uint8_images)
+    torch.manual_seed(0)
+    float_detections = module(float_images)
+
+    assert uint8_detections.shape == (2, 84, 8)
+    torch.testing.assert_close(uint8_detections, float_detections)
+
+
+def test_yolo_forward_with_losses() -> None:
+    module = YOLO(
+        architecture="yolov8n",
+        num_classes=3,
     )
     images = torch.rand(1, 3, 64, 64)
     targets = pack_targets([{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}])
 
-    _, losses = module(images, targets)
+    detections, losses = module._forward_with_losses(images, targets)
 
-    # Finite losses with empty targets.
-    assert torch.isfinite(losses).all()
-    assert losses.max() < 100
+    assert detections.shape == (1, 84, 8)
+    assert losses.names == ("overlap", "classification", "dfl")
+    assert torch.isfinite(losses.values).all()
+    assert losses.values.max() < 100
 
-    module.eval()
-    uint8_images = torch.randint(0, 256, (2, 3, 64, 64), dtype=torch.uint8)
-    float_images = uint8_images.to(torch.float32).div(255.0)
+
+def test_yolo_forward_with_losses_multilabel() -> None:
+    module = YOLO(architecture="yolov8n", num_classes=3)
+    images = torch.rand(1, 3, 64, 64)
+    # A boolean class mask assigns multiple classes to one box, exercising the multi-label training path.
     targets = pack_targets(
+        [{"boxes": torch.tensor([[8.0, 8.0, 40.0, 40.0]]), "labels": torch.tensor([[True, False, True]])}]
+    )
+
+    detections, losses = module._forward_with_losses(images, targets)
+
+    assert detections.shape == (1, 84, 8)
+    assert losses.names == ("overlap", "classification", "dfl")
+    assert torch.isfinite(losses.values).all()
+
+
+def test_yolo_log_losses() -> None:
+    module = YOLO(architecture="yolov8n", num_classes=3)
+    logged: dict[str, tuple[torch.Tensor, dict[str, object]]] = {}
+
+    def log(name: str, value: torch.Tensor, **kwargs) -> None:
+        logged[name] = (value, kwargs)
+
+    module.log = log  # type: ignore[assignment]
+    losses = DetectionLoss(values=torch.tensor([2.0, 3.0, 5.0]), names=("overlap", "classification", "dfl"))
+
+    module._log_losses("val", losses, sync_dist=True, batch_size=4)
+
+    torch.testing.assert_close(logged["val/overlap_loss"][0], torch.tensor(2.0))
+    torch.testing.assert_close(logged["val/classification_loss"][0], torch.tensor(3.0))
+    torch.testing.assert_close(logged["val/dfl_loss"][0], torch.tensor(5.0))
+    torch.testing.assert_close(logged["val/total_loss"][0], torch.tensor(10.0))
+    assert all(kwargs["sync_dist"] is True for _, kwargs in logged.values())
+    assert all(kwargs["batch_size"] == 4 for _, kwargs in logged.values())
+
+
+def test_yolo_process_detections(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = YOLO(architecture="yolov8n", num_classes=2, detections_per_image=2)
+    captured: dict[str, torch.Tensor | float] = {}
+
+    def fake_batched_nms(
+        boxes: torch.Tensor, scores: torch.Tensor, labels: torch.Tensor, nms_threshold: float
+    ) -> torch.Tensor:
+        captured["boxes"] = boxes
+        captured["scores"] = scores
+        captured["labels"] = labels
+        captured["nms_threshold"] = nms_threshold
+        return torch.arange(scores.numel(), device=scores.device)
+
+    monkeypatch.setattr(yolo_module, "batched_nms", fake_batched_nms)
+    detections = torch.tensor(
         [
-            {"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([0])},
-            {"boxes": torch.tensor([[8.0, 8.0, 24.0, 24.0]]), "labels": torch.tensor([1])},
+            [
+                [10.0, 20.0, 30.0, 40.0, 1.0, 0.2, 0.7],
+                [50.0, 60.0, 70.0, 80.0, 0.75, 0.8, 0.1],
+                [90.0, 100.0, 110.0, 120.0, 1.0, 0.6, 0.6],
+            ]
         ]
     )
 
-    torch.manual_seed(0)
-    uint8_detections, uint8_losses = module(uint8_images, targets)
-    torch.manual_seed(0)
-    float_detections, float_losses = module(float_images, targets)
+    processed = module.process_detections(detections, confidence_threshold=0.25)
 
-    torch.testing.assert_close(uint8_detections, float_detections)
-    torch.testing.assert_close(uint8_losses, float_losses)
-
-
-def test_yolo_to_onnx(tmp_path):
-    output_path = tmp_path / "yolov4-tiny.onnx"
-    model = YOLO(architecture="yolov4-tiny", num_classes=2)
-    model.eval()
-    model.to_onnx(
-        output_path,
-        torch.rand(1, 3, 64, 64),
-        input_names=["images"],
-        output_names=["detections"],
-        opset_version=18,
-        dynamo=True,
-        external_data=False,
-        fallback=False,
-        verify=False,
-        dynamic_shapes={
-            "images": {
-                2: torch.export.Dim("height", min=32),
-                3: torch.export.Dim("width", min=32),
-            }
-        },
+    expected_nms_boxes = torch.tensor(
+        [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0], [90.0, 100.0, 110.0, 120.0], [90.0, 100.0, 110.0, 120.0]]
     )
-
-    assert output_path.is_file()
-    onnx_model = onnx.load(output_path)
-    onnx.checker.check_model(onnx_model)
-    assert onnx_model.graph.input[0].name == "images"
-    image_shape = onnx_model.graph.input[0].type.tensor_type.shape.dim
-    assert image_shape[2].dim_param == "height"
-    assert image_shape[3].dim_param == "width"
+    torch.testing.assert_close(captured["boxes"], expected_nms_boxes)
+    torch.testing.assert_close(captured["scores"], torch.tensor([0.7, 0.6, 0.6, 0.6]))
+    torch.testing.assert_close(captured["labels"], torch.tensor([1, 0, 0, 1]))
+    assert captured["nms_threshold"] == module.nms_threshold
+    torch.testing.assert_close(processed[0]["boxes"], expected_nms_boxes[:2])
+    torch.testing.assert_close(processed[0]["scores"], torch.tensor([0.7, 0.6]))
+    torch.testing.assert_close(processed[0]["labels"], torch.tensor([1, 0]))
 
 
 def test_yolo_init_yolov4_bias() -> None:
@@ -144,3 +188,59 @@ def test_yolo_get_lr_scheduler() -> None:
     for _ in range(total_steps - 1):
         scheduler.step()
     assert optimizer.param_groups[0]["lr"] == pytest.approx(base_lr * module.hparams["final_lr_multiplier"])
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected_num_detections"),
+    [
+        ("yolov4-tiny", 252),
+        ("yolov8n", 84),
+    ],
+)
+def test_yolo_to_onnx(
+    tmp_path: Path,
+    architecture: str,
+    expected_num_detections: int,
+) -> None:
+    output_path = tmp_path / f"{architecture}.onnx"
+    model = YOLO(architecture=architecture, num_classes=2)
+    model.eval()
+    images = torch.rand(1, 3, 64, 64)
+
+    with torch.no_grad():
+        eager_detections = model(images)
+    assert eager_detections.shape == (1, expected_num_detections, 7)
+
+    model.to_onnx(
+        output_path,
+        images,
+        input_names=["images"],
+        output_names=["detections"],
+        opset_version=18,
+        dynamo=True,
+        external_data=False,
+        fallback=False,
+        verify=False,
+        dynamic_shapes={
+            "images": {
+                2: torch.export.Dim("height", min=32),
+                3: torch.export.Dim("width", min=32),
+            }
+        },
+    )
+
+    assert output_path.is_file()
+    onnx_model = onnx.load(output_path)
+    onnx.checker.check_model(onnx_model)
+    assert onnx_model.graph.input[0].name == "images"
+    image_shape = onnx_model.graph.input[0].type.tensor_type.shape.dim
+    assert image_shape[2].dim_param == "height"
+    assert image_shape[3].dim_param == "width"
+    assert [output.name for output in onnx_model.graph.output] == ["detections"]
+    output_shape = onnx_model.graph.output[0].type.tensor_type.shape.dim
+    assert output_shape[2].dim_value == 7
+
+    session = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
+    (exported_detections,) = session.run(["detections"], {"images": images.numpy()})
+
+    torch.testing.assert_close(torch.from_numpy(exported_detections), eager_detections, rtol=1e-4, atol=1e-4)

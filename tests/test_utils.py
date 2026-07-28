@@ -6,7 +6,10 @@ from lightning.pytorch.utilities.warnings import PossibleUserWarning
 
 from lightning_yolo.utils import (
     aligned_iou,
+    anchor_points_and_strides,
     box_size_ratio,
+    boxes_to_distance_offsets,
+    distance_offsets_to_boxes,
     global_xy,
     grid_centers,
     grid_offsets,
@@ -53,6 +56,39 @@ def test_global_xy():
     assert torch.all(xy[:, 2, :, :, 1] == 125)
     assert torch.all(xy[:, :, 3, :, 0] == 350)
     assert torch.all(xy[:, 3, :, :, 1] == 175)
+
+
+def test_anchor_points_and_strides() -> None:
+    feature_maps = [torch.zeros((1, 8, 2, 2), dtype=torch.float64), torch.zeros((1, 16, 1, 1), dtype=torch.float64)]
+
+    points, strides = anchor_points_and_strides(feature_maps, torch.tensor([16.0, 16.0]))
+
+    expected_points = torch.tensor([[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5], [0.5, 0.5]], dtype=torch.float64)
+    torch.testing.assert_close(points, expected_points)
+    torch.testing.assert_close(strides, torch.tensor([[8.0], [8.0], [8.0], [8.0], [16.0]], dtype=torch.float64))
+
+
+def test_distance_offsets_to_boxes() -> None:
+    anchor_points = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+    distances = torch.tensor([[[1.0, 2.0, 3.0, 4.0], [0.0, 1.0, 2.0, 3.0]]])
+
+    boxes = distance_offsets_to_boxes(distances, anchor_points)
+
+    expected = torch.tensor([[[1.0, 1.0, 5.0, 7.0], [5.0, 6.0, 7.0, 10.0]]])
+    torch.testing.assert_close(boxes, expected)
+
+
+def test_boxes_to_distance_offsets() -> None:
+    anchor_points = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+    boxes = torch.tensor([[1.0, 1.0, 5.0, 7.0], [6.0, 8.0, 20.0, 30.0]])
+    original_boxes = boxes.clone()
+
+    distances = boxes_to_distance_offsets(boxes, anchor_points, num_dfl_bins=4)
+
+    torch.testing.assert_close(boxes, original_boxes)
+    torch.testing.assert_close(
+        distances, torch.tensor([[1.0, 2.0, 3.0 - 0.01, 3.0 - 0.01], [0.0, 0.0, 3.0 - 0.01, 3.0 - 0.01]])
+    )
 
 
 @pytest.mark.parametrize(

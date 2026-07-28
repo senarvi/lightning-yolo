@@ -69,32 +69,29 @@ def initialize_zero_bias(conv: nn.Conv2d, weight_std: float = 0.01) -> None:
 def initialize_yolo_logits(
     conv: nn.Conv2d,
     num_classes: int,
-    confidence_bias: float | None,
+    confidence_bias: float,
     classprob_bias: float,
     weight_std: float = 0.01,
 ) -> None:
     """Initializes a coupled YOLO output convolution.
 
-    Coupled heads predict box, confidence, and class values from a single convolution where output channels are grouped
-    as ``(x, y, width, height, confidence, class_probs...)`` per anchor. Confidence-free heads omit the confidence
-    channel, grouping channels as ``(x, y, width, height, class_probs...)``. Pass ``confidence_bias=None`` to select the
-    confidence-free layout.
+    Initializes a coupled YOLO output convolution whose output channels are grouped as
+    ``(x, y, width, height, confidence, class_probs...)`` per anchor.
 
     Args:
         conv: Coupled output convolution.
         num_classes: Number of predicted classes.
-        confidence_bias: Initial logit bias for confidence predictions. Pass ``None`` for confidence-free heads that
-            predict ``num_classes + 4`` attributes per anchor instead of ``num_classes + 5``.
+        confidence_bias: Initial logit bias for confidence predictions. Bias is written into the fifth attribute of each
+            anchor.
         classprob_bias: Initial logit bias for class probability predictions.
         weight_std: Standard deviation for normal weight initialization.
 
     Raises:
         ValueError: If the number of convolution output channels is not divisible by the number of attributes per
-            anchor (``num_classes + 5`` with confidence, ``num_classes + 4`` without).
+            anchor (``num_classes + 5``).
 
     """
-    predict_confidence = confidence_bias is not None
-    box_attrs = 5 if predict_confidence else 4
+    box_attrs = 5
     num_attrs = num_classes + box_attrs
     anchors_per_cell, remainder = divmod(conv.out_channels, num_attrs)
     if remainder != 0:
@@ -108,9 +105,5 @@ def initialize_yolo_logits(
         with torch.no_grad():
             bias = conv.bias.view(anchors_per_cell, num_attrs)
             bias[:, :4].zero_()
-            if predict_confidence:
-                assert confidence_bias is not None
-                bias[:, 4].fill_(confidence_bias)
-                bias[:, 5:].fill_(classprob_bias)
-            else:
-                bias[:, 4:].fill_(classprob_bias)
+            bias[:, 4].fill_(confidence_bias)
+            bias[:, 5:].fill_(classprob_bias)

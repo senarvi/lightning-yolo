@@ -3,7 +3,7 @@ from collections.abc import Callable, Sequence
 
 import torch
 from torch import Tensor
-from torchvision.ops import box_convert, box_iou
+from torchvision.ops import box_convert, complete_box_iou
 
 from .batching import split_targets
 from .loss import YOLOLoss
@@ -197,7 +197,8 @@ class IoUThresholdMatching(ShapeMatching):
 class SizeRatioMatching(ShapeMatching):
     """For each target, select those prior shapes, whose width and height relative to the target is below given ratio.
 
-    This is the matching rule used by Ultralytics YOLOv5 implementation.
+    The rule, originally used by Ultralytics YOLOv5, compares target dimensions with anchor dimensions and assigns
+    anchors whose largest width/height ratio is below the configured threshold.
 
     Args:
         prior_shapes: A list of all the prior box dimensions. The list should contain (width, height) tuples in the
@@ -300,10 +301,10 @@ def _tal_match(
     """
     batch_size, num_preds, max_targets = align_metric.shape
 
-    # Anchors outside the target box and padded targets are excluded from top-k selection.
+    # Keep masked alignment metrics at zero, then filter the selected top-k indices below.
     masked_metric = align_metric.clone()
-    masked_metric[~inside_selector] = -1.0
-    masked_metric[~target_mask[:, None, :].expand(batch_size, num_preds, max_targets)] = -1.0
+    masked_metric[~inside_selector] = 0.0
+    masked_metric[~target_mask[:, None, :].expand(batch_size, num_preds, max_targets)] = 0.0
 
     # For each target, select top-k anchors by the alignment metric among anchors that are inside the target box.
     masked_t = masked_metric.permute(0, 2, 1)  # [batch_size, max_targets, N]
@@ -332,9 +333,9 @@ def _tal_match(
     # Normalize each matched alignment score by the best matched alignment score for the same target, then scale it by
     # that target's best matched IoU.
     matched_metric = align_metric * matching_matrix.float()
-    best_align = matched_metric.amax(dim=1, keepdim=True).clamp(min=eps)  # [batch_size, 1, max_targets]
+    best_align = matched_metric.amax(dim=1, keepdim=True)  # [batch_size, 1, max_targets]
     best_iou = (ious * matching_matrix.float()).amax(dim=1, keepdim=True)  # [batch_size, 1, max_targets]
-    assignment_weights = (matched_metric * best_iou / best_align).amax(dim=2)  # [batch_size, N]
+    assignment_weights = (matched_metric * best_iou / (best_align + eps)).amax(dim=2)  # [batch_size, N]
 
     return pred_mask, target_selector, assignment_weights
 
@@ -348,7 +349,7 @@ def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
     per target, so this is equivalent to using the average predicted probability.
 
     Args:
-        pred_probs: Predicted class probabilities in a matrix shaped ``[predictions, num_classes]``.
+        pred_probs: Predicted class probabilities in a matrix shaped ``[predictions, classes]``.
         target_labels: Target labels either as a vector of class indices or a boolean mask shaped
             ``[targets, num_classes]``.
 
@@ -575,30 +576,31 @@ class TALMatching:
     The assignment weight sum is the sum of normalized alignment scores for the matched foreground anchors.
 
     Args:
-        prior_shapes: A list of all the prior box dimensions. Included for API compatibility with other matchers.
-        prior_shape_idxs: List of indices to ``prior_shapes`` that this layer uses. Included for API compatibility.
         topk: Number of anchors to select per target.
         alpha: Exponent for the classification score in the alignment metric.
         beta: Exponent for IoU in the alignment metric.
-        ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the predicted box has IoU
-            with some target greater than this threshold, the predictor will not be taken into account when calculating
-            the confidence loss.
+        overlap_func: Function that computes the pairwise ``[predictions, targets]`` overlaps used both for matching
+            and for the background decision. Defaults to IoU; the distributional-distance head passes complete IoU.
+        ignore_bg_threshold: A non-foreground point is supervised as background unless its best overlap with a target
+            exceeds this threshold. Defaults to 1.0, meaning that every non-foreground point is supervised as
+            background.
+        eps: Small constant added to the denominator when normalizing the alignment weights.
 
     """
 
     def __init__(
         self,
-        prior_shapes: PRIOR_SHAPES,  # noqa: ARG002
-        prior_shape_idxs: Sequence[int],  # noqa: ARG002
         topk: int = 10,
         alpha: float = 0.5,
         beta: float = 6.0,
-        ignore_bg_threshold: float = 0.7,
+        overlap_func: Callable[[Tensor, Tensor], Tensor] = complete_box_iou,
+        ignore_bg_threshold: float = 1.0,
         eps: float = 1e-9,
     ) -> None:
         self.topk = topk
         self.alpha = alpha
         self.beta = beta
+        self.overlap_func = overlap_func
         self.ignore_bg_threshold = ignore_bg_threshold
         self.eps = eps
 
@@ -640,13 +642,17 @@ class TALMatching:
         pred_probs = torch.stack([pred["classprobs"].reshape(-1, num_classes) for pred in preds])
         if not input_is_normalized:
             pred_probs = pred_probs.sigmoid()
+        # Matching is a non-differentiable assignment. Detaching the predictions keeps gradients out of the discrete
+        # top-k selection and frees the large [batch_size, N, max_targets] intermediates before backward.
+        pred_boxes = pred_boxes.detach()
+        pred_probs = pred_probs.detach()
 
         # Scatter the packed targets into a [batch_size, max_targets] padded layout without a Python per-image loop.
-        # Each packed row knows its image via batch_indices; per-image counts give its position within that image.
+        # Each packed row knows its image via sample_idxs; per-image counts give its position within that image.
         counts = targets["counts"]
         packed_boxes = targets["boxes"]
         packed_labels = targets["labels"]
-        batch_indices = targets["batch_indices"].to(device)
+        sample_idxs = targets["sample_idxs"].to(device)
         multilabel = packed_labels.ndim == 2
 
         max_targets = max(max(counts), 1)
@@ -662,9 +668,9 @@ class TALMatching:
             counts_tensor = torch.as_tensor(counts, device=device)
             image_starts = counts_tensor.cumsum(0) - counts_tensor
             within_image = torch.arange(num_targets, device=device) - image_starts.repeat_interleave(counts_tensor)
-            padded_boxes[batch_indices, within_image] = packed_boxes.to(padded_boxes.dtype)
-            padded_labels[batch_indices, within_image] = packed_labels
-            target_mask[batch_indices, within_image] = True
+            padded_boxes[sample_idxs, within_image] = packed_boxes.to(padded_boxes.dtype)
+            padded_labels[sample_idxs, within_image] = packed_labels
+            target_mask[sample_idxs, within_image] = True
 
         # Create a [batch, predictions, targets] tensor that indicates which anchor centers are inside each target box.
         # The centers and padded boxes are broadcast across the batch and prediction dimensions, respectively.
@@ -674,10 +680,10 @@ class TALMatching:
         inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0  # [batch_size, N, max_targets]
         inside_selector = inside_selector & target_mask[:, None, :]
 
-        # Calculate the TAL alignment metric from the target-class probabilities and IoUs. Padded targets are masked so
-        # that they cannot contribute to matching.
-        ious = box_iou(pred_boxes, padded_boxes)  # [batch_size, N, max_targets]
-        ious = ious * target_mask[:, None, :].float()
+        # Calculate the TAL alignment metric from the target-class probabilities and overlaps. Padded targets are masked
+        # so that they cannot contribute to matching.
+        overlaps = self.overlap_func(pred_boxes, padded_boxes)
+        overlaps = torch.where(target_mask[:, None, :], overlaps, torch.zeros_like(overlaps)).clamp(min=0)
 
         # Gather each target's predicted class score vectorized across the batch.
         if padded_labels.ndim == 2:
@@ -690,14 +696,16 @@ class TALMatching:
         else:
             class_scores = torch.matmul(pred_probs, padded_labels.transpose(1, 2).to(pred_probs.dtype))
 
-        align_metric = class_scores.pow(self.alpha) * ious.pow(self.beta)
+        align_metric = class_scores.pow(self.alpha) * overlaps.pow(self.beta)
 
         # Run TAL matching for the whole batch.
         pred_mask, target_sel, weights = _tal_match(
-            align_metric, ious, inside_selector, target_mask, self.topk, self.eps
+            align_metric, overlaps, inside_selector, target_mask, self.topk, self.eps
         )  # [batch_size, N], [batch_size, N], [batch_size, N]
 
-        best_iou = ious.amax(dim=2)
+        # A non-foreground point is background unless it overlaps a target more than the threshold. With a threshold of
+        # 1.0 every non-foreground point becomes background, because the clamped overlaps never exceed one.
+        best_iou = overlaps.amax(dim=2)
         background = (best_iou <= self.ignore_bg_threshold) & ~pred_mask
         target_boxes = torch.gather(padded_boxes, 1, target_sel.unsqueeze(-1).expand(-1, -1, 4))
 
@@ -706,9 +714,6 @@ class TALMatching:
         else:
             target_labels = torch.gather(padded_labels, 1, target_sel.unsqueeze(-1).expand(-1, -1, num_classes))
 
-        # Matching scores are fixed training targets. Detaching prevents gradients from flowing through TAL's
-        # discrete assignment graph and releases its large [batch_size, N, max_targets] intermediates before backward.
-        weights = weights.detach()
         return DenseMatchingResult(
             foreground=pred_mask,
             background=background,

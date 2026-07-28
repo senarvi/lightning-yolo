@@ -138,7 +138,7 @@ def test_collate_packed_batch() -> None:
     assert images.dtype == torch.uint8
     assert targets["boxes"].shape == (1, 4)
     assert torch.equal(targets["labels"], torch.tensor([1]))
-    assert torch.equal(targets["batch_indices"], torch.tensor([0]))
+    assert torch.equal(targets["sample_idxs"], torch.tensor([0]))
     assert targets["counts"] == [1, 0]
 
 
@@ -222,25 +222,6 @@ def test_coco_detection_datamodule_setup(tmp_path: Path) -> None:
     image, target = datamodule.train_dataset[0]
     assert image.shape[0] == 3
     assert target["boxes"].shape[1:] == (4,)
-
-
-@pytest.mark.parametrize(("num_workers", "expected_prefetch_factor"), [(0, None), (1, 4)])
-def test_coco_detection_dataloader_prefetch_factor(
-    tmp_path: Path, num_workers: int, expected_prefetch_factor: int | None
-) -> None:
-    image_dir, annotation_path = create_coco_data(tmp_path)
-    dataset = COCODetectionDataset(
-        image_dir=image_dir,
-        ann_file=annotation_path,
-        image_size=(20, 12),
-        training=False,
-    )
-    datamodule = COCODetectionDataModule(tmp_path, num_workers=num_workers, persistent_workers=False)
-    datamodule.train_dataset = dataset
-
-    dataloader = datamodule.train_dataloader()
-
-    assert dataloader.prefetch_factor == expected_prefetch_factor
 
 
 def test_close_mosaic(tmp_path: Path) -> None:

@@ -1,118 +1,40 @@
-import time
-from typing import Any, override
-
 import torch
-from lightning.pytorch import LightningModule, Trainer
-from lightning.pytorch.callbacks import Callback
-from lightning.pytorch.utilities.rank_zero import rank_zero_info
+from lightning.pytorch.callbacks import WeightAveraging
+from torch import Tensor
 
 
-class EpochLogger(Callback):
-    """Log training throughput and validation mAP at the end of each epoch.
+class EMAWeightAveraging(WeightAveraging):
+    """Average model weights with the ramped EMA schedule used by Ultralytics.
 
-    After each training and validation cycle, emits a single ``[epoch]`` line, showing the epoch number, elapsed
-    training seconds, training throughput, and validation mAP. The elapsed time covers only the training pass, not
-    validation.
+    Args:
+        decay: Maximum EMA decay.
+        warmup_updates: Number of updates over which EMA decay ramps toward its maximum.
 
     """
 
-    def __init__(self) -> None:
-        """Initialise per-epoch accumulators."""
-        self._start: float | None = None
-        self._train_elapsed: float | None = None
-        self._measured_samples: int = 0
-        self._measured_batches: int = 0
+    def __init__(self, decay: float = 0.9999, warmup_updates: float = 2000.0) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError("decay must be in the interval (0, 1).")
+        if warmup_updates <= 0.0:
+            raise ValueError("warmup_updates must be > 0.")
+        self.decay = decay
+        self.warmup_updates = warmup_updates
+        super().__init__(use_buffers=True, multi_avg_fn=self._multi_avg_fn)
 
-    @staticmethod
-    def _now() -> float:
-        """Return the current wall-clock time in seconds, after synchronising the CUDA device.
-
-        Synchronisation ensures that all pending GPU kernels have finished before the timestamp is recorded.
-        Without it, ``time.perf_counter()`` would capture the host-side submission time rather than the actual
-        GPU completion time, causing the measured elapsed time to be underestimated.
-
-        Returns:
-            Wall-clock time in seconds.
-
-        """
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return time.perf_counter()
-
-    @override
-    def on_train_epoch_start(self, trainer: Trainer, _pl_module: LightningModule) -> None:
-        """Record the epoch start time and reset sample counters.
+    @torch.no_grad()
+    def _multi_avg_fn(self, ema_tensors: list[Tensor], current_tensors: list[Tensor], num_averaged: Tensor) -> None:
+        """Update one device and dtype group using the ramped EMA decay.
 
         Args:
-            trainer: The Lightning trainer.
-            _pl_module: The Lightning module (unused).
+            ema_tensors: Current averaged tensors.
+            current_tensors: Current model tensors.
+            num_averaged: Number of completed averaging updates.
 
         """
-        self._start = self._now()
-        self._measured_samples = 0
-        self._measured_batches = 0
-
-    @override
-    def on_train_batch_end(
-        self, trainer: Trainer, _pl_module: LightningModule, _outputs: Any, batch: Any, _batch_idx: int
-    ) -> None:
-        """Accumulate the number of training samples seen in this epoch.
-
-        Args:
-            trainer: The Lightning trainer (unused).
-            _pl_module: The Lightning module (unused).
-            _outputs: Batch outputs (unused).
-            batch: The current batch as ``(images, targets)``; the first element determines the batch size.
-            _batch_idx: Batch index within the epoch (unused).
-
-        """
-        self._measured_samples += len(batch[0])
-        self._measured_batches += 1
-
-    @override
-    def on_train_epoch_end(self, trainer: Trainer, _pl_module: LightningModule) -> None:
-        """Snapshot the training-only elapsed time when the training pass finishes.
-
-        The snapshot is taken here rather than in ``on_validation_epoch_end`` so that validation
-        time is excluded from the reported training throughput.
-
-        Args:
-            trainer: The Lightning trainer (unused).
-            _pl_module: The Lightning module (unused).
-
-        """
-        if self._start is not None:
-            self._train_elapsed = self._now() - self._start
-
-    @override
-    def on_validation_epoch_end(self, trainer: Trainer, _pl_module: LightningModule) -> None:
-        """Emit a single ``[epoch]`` log line combining throughput and validation metrics.
-
-        Skipped silently for the sanity-check validation that runs before the first training epoch,
-        because no training elapsed time has been recorded yet.
-
-        Args:
-            trainer: The Lightning trainer; provides the current epoch number and callback metrics.
-            _pl_module: The Lightning module (unused).
-
-        """
-        if self._train_elapsed is None:
-            return
-        elapsed = self._train_elapsed
-        samples_per_second = self._measured_samples / elapsed if elapsed else 0.0
-
-        metrics = trainer.callback_metrics
-        val_map = metrics.get("val/map")
-        val_map_50 = metrics.get("val/map_50")
-
-        parts = [
-            f"epoch={trainer.current_epoch}",
-            f"elapsed_s={elapsed:.0f}",
-            f"img/s={samples_per_second:.1f}",
-        ]
-        if val_map is not None:
-            parts.append(f"val/map={float(val_map):.6f}")
-        if val_map_50 is not None:
-            parts.append(f"val/map_50={float(val_map_50):.6f}")
-
-        rank_zero_info("[epoch] " + "  ".join(parts))
+        updates = num_averaged + 1
+        decay = self.decay * (1.0 - torch.exp(-updates / self.warmup_updates))
+        if torch.is_floating_point(ema_tensors[0]) or torch.is_complex(ema_tensors[0]):
+            torch._foreach_lerp_(ema_tensors, current_tensors, 1.0 - decay)  # type: ignore[call-overload]
+        else:
+            for ema_tensor, current_tensor in zip(ema_tensors, current_tensors, strict=True):
+                ema_tensor.copy_(ema_tensor * decay + current_tensor * (1.0 - decay))

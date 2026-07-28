@@ -11,16 +11,10 @@ from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from torch import Tensor, nn
 
 from .config import LossConfig, MatchingConfig
+from .heads import PriorShapeDetectionLayer, create_prior_shape_detection_layer
 from .initialization import detection_classprob_bias, detection_confidence_bias, initialize_yolo_logits
-from .layers import (
-    Conv,
-    DetectionLayer,
-    MaxPool,
-    RouteLayer,
-    ShortcutLayer,
-    create_detection_layer,
-)
-from .types import NETWORK_OUTPUT, PRIOR_SHAPES, DetectionLossRecord, PackedTargetDict
+from .layers import Conv, MaxPool, RouteLayer, ShortcutLayer
+from .types import NETWORK_OUTPUT, PRIOR_SHAPES, DetectionLossContribution, PackedTargetDict
 from .utils import get_image_size
 
 DARKNET_CONFIG = dict[str, Any]
@@ -89,23 +83,21 @@ class DarknetNetwork(nn.Module):
     def forward(self, x: Tensor, targets: PackedTargetDict | None = None) -> NETWORK_OUTPUT:
         outputs: list[Tensor] = []  # Outputs from all layers
         detections: list[Tensor] = []  # Outputs from detection layers
-        losses: list[DetectionLossRecord] = []  # Loss records from detection layers
+        losses: list[DetectionLossContribution] = []  # Loss contributions from detection layers
 
         image_size = get_image_size(x)
 
         for layer in self.layers:
             if isinstance(layer, (RouteLayer, ShortcutLayer)):
                 x = layer(outputs)
-            elif isinstance(layer, DetectionLayer):
+            elif isinstance(layer, PriorShapeDetectionLayer):
                 x, preds = layer(x, image_size)
                 detections.append(x)
                 if targets is not None:
                     # Darknet configurations always use per-level matchers (TAL is rejected during construction).
                     assert layer.matching_func is not None
                     matching_result = layer.matching_func(preds, targets, image_size, layer.input_is_normalized)
-                    losses.append(
-                        layer.loss_func.matched_losses(matching_result, preds, layer.input_is_normalized, image_size)
-                    )
+                    losses.append(layer.loss_func(matching_result, preds, layer.input_is_normalized, image_size))
             else:
                 x = layer(x)
 
@@ -452,19 +444,22 @@ def _create_yolo(
     matching = matching or MatchingConfig()
     loss = loss or LossConfig()
 
-    if num_classes is None:
-        num_classes = config["classes"]
-        assert isinstance(num_classes, int)
     if matching.algorithm == "tal":
         raise ValueError(
             'Task-aligned matching ("tal") is not supported in Darknet configurations. It assigns targets across all '
             "feature levels at once, but a Darknet model is a sequential graph that processes one detection layer at a "
             "time. Use a native architecture for task-aligned matching."
         )
+
+    if num_classes is None:
+        num_classes = config["classes"]
+        assert isinstance(num_classes, int)
+
     if prior_shapes is None:
         # The "anchors" list alternates width and height.
         dims = config["anchors"]
         prior_shapes = [(dims[i], dims[i + 1]) for i in range(0, len(dims), 2)]
+
     ignore_bg_threshold = matching.ignore_bg_threshold
     if ignore_bg_threshold is None:
         ignore_bg_threshold = config.get("ignore_thresh", 1.0)
@@ -494,7 +489,7 @@ def _create_yolo(
         xy_scale = config.get("scale_x_y", 1.0)
         assert isinstance(xy_scale, float)
 
-    layer = create_detection_layer(
+    layer = create_prior_shape_detection_layer(
         num_classes=num_classes,
         prior_shapes=prior_shapes,
         prior_shape_idxs=config["mask"],
@@ -528,7 +523,7 @@ def _initialize_detection_logits(network: DarknetNetwork) -> None:
     """
     confidence_bias = detection_confidence_bias()
     for idx, layer in enumerate(network.layers):
-        if isinstance(layer, DetectionLayer) and idx > 0:
+        if isinstance(layer, PriorShapeDetectionLayer) and idx > 0:
             previous_layer = network.layers[idx - 1]
             if isinstance(previous_layer, Conv):
                 classprob_bias = detection_classprob_bias(layer.num_classes)

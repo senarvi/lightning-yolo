@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 import torch
 from torch import Tensor
 from torchvision.ops import box_iou
@@ -52,6 +54,82 @@ def global_xy(xy: Tensor, image_size: Tensor) -> Tensor:
     offset = grid_offsets(grid_size).unsqueeze(2)  # [height, width, 1, 2]
     scale = torch.div(image_size, grid_size)
     return (xy + offset) * scale
+
+
+def anchor_points_and_strides(feature_maps: Sequence[Tensor], image_size: Tensor) -> tuple[Tensor, Tensor]:
+    """Generate one anchor point per feature-map location.
+
+    Args:
+        feature_maps: Feature tensors shaped ``[B, C, H, W]``.
+        image_size: Input image width and height.
+
+    Returns:
+        Anchor points in grid coordinates shaped ``[N, 2]`` and matching stride values shaped ``[N, 1]``.
+
+    """
+    if len(feature_maps) == 0:
+        raise ValueError("At least one feature map is required.")
+
+    anchor_points = []
+    strides = []
+    for feature_map in feature_maps:
+        if feature_map.ndim != 4:
+            raise ValueError(f"Feature maps must be shaped [B, C, H, W], got {tuple(feature_map.shape)}.")
+        height, width = feature_map.shape[-2:]
+        feature_image_size = image_size.to(device=feature_map.device, dtype=feature_map.dtype)
+        stride_xy = feature_image_size / torch.tensor(
+            [width, height], device=feature_map.device, dtype=feature_map.dtype
+        )
+        if not torch.compiler.is_compiling() and not torch.isclose(stride_xy[0], stride_xy[1]):
+            raise ValueError(
+                f"Feature map stride must match in x and y, got {stride_xy[0].item()} and {stride_xy[1].item()}."
+            )
+
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(height, device=feature_map.device, dtype=feature_map.dtype) + 0.5,
+            torch.arange(width, device=feature_map.device, dtype=feature_map.dtype) + 0.5,
+            indexing="ij",
+        )
+        level_points = torch.stack((x_coords, y_coords), dim=-1).reshape(-1, 2)
+        anchor_points.append(level_points)
+        strides.append(stride_xy[:1].expand(level_points.shape[0], 1))
+
+    return torch.cat(anchor_points), torch.cat(strides)
+
+
+def distance_offsets_to_boxes(distance_offsets: Tensor, anchor_points: Tensor) -> Tensor:
+    """Convert left/top/right/bottom distances from anchor points to corner-format boxes.
+
+    Args:
+        distance_offsets: Distances shaped ``[..., N, 4]`` or ``[N, 4]``.
+        anchor_points: Point coordinates shaped ``[N, 2]``.
+
+    Returns:
+        Corner-format boxes shaped like ``distance_offsets``.
+
+    """
+    left_top = distance_offsets[..., :2]
+    right_bottom = distance_offsets[..., 2:]
+    return torch.cat((anchor_points - left_top, anchor_points + right_bottom), dim=-1)
+
+
+def boxes_to_distance_offsets(boxes: Tensor, anchor_points: Tensor, num_dfl_bins: int) -> Tensor:
+    """Convert corner-format boxes to point-relative left/top/right/bottom distances.
+
+    Args:
+        boxes: Corner-format boxes shaped ``[..., N, 4]`` or ``[N, 4]``.
+        anchor_points: Point coordinates shaped ``[N, 2]``.
+        num_dfl_bins: Number of distance bins used by the regression distribution.
+
+    Returns:
+        Clipped distance offsets shaped like ``boxes``.
+
+    """
+    if num_dfl_bins < 2:
+        raise ValueError("Distance targets require at least two DFL bins.")
+    left_top = anchor_points - boxes[..., :2]
+    right_bottom = boxes[..., 2:] - anchor_points
+    return torch.cat((left_top, right_bottom), dim=-1).clamp(0, num_dfl_bins - 1 - 0.01)
 
 
 def aligned_iou(wh1: Tensor, wh2: Tensor) -> Tensor:

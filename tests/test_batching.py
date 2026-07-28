@@ -20,7 +20,7 @@ def test_pack_targets() -> None:
 
     assert packed["boxes"].shape == (3, 4)
     assert torch.equal(packed["labels"], torch.tensor([3, 5, 7]))
-    assert torch.equal(packed["batch_indices"], torch.tensor([0, 0, 2]))
+    assert torch.equal(packed["sample_idxs"], torch.tensor([0, 0, 2]))
     assert packed["counts"] == [2, 0, 1]
 
     # Empty batch.
@@ -32,7 +32,7 @@ def test_pack_targets() -> None:
 
     assert empty_packed["boxes"].shape == (0, 4)
     assert empty_packed["labels"].shape == (0,)
-    assert empty_packed["batch_indices"].shape == (0,)
+    assert empty_packed["sample_idxs"].shape == (0,)
     assert empty_packed["counts"] == [0, 0]
 
     # Multi-label targets.

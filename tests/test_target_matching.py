@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torchvision.ops import box_iou, complete_box_iou
 
 from lightning_yolo.batching import pack_targets
 from lightning_yolo.loss import YOLOLoss
@@ -185,6 +186,165 @@ def test_sim_ota_matching() -> None:
     assert result.assignment_weight_sum == 1
 
 
+def test_tal_matching() -> None:
+    matcher = TALMatching(topk=1, alpha=0.5, beta=6.0)
+    top5_matcher = TALMatching(topk=5, alpha=0.5, beta=6.0)
+    top10_matcher = TALMatching(topk=10, alpha=0.5, beta=6.0)
+
+    one_target_boxes = torch.tensor([[0.0, 0.0, 4.0, 4.0]])
+    one_target = {
+        "boxes": one_target_boxes,
+        "labels": torch.tensor([0], dtype=torch.int64),
+    }
+    two_inside_points = torch.tensor([[1.0, 1.0], [3.0, 3.0]])
+    two_identical_boxes = torch.tensor([[[[0.0, 0.0, 4.0, 4.0]], [[0.0, 0.0, 4.0, 4.0]]]])
+    two_point_preds = {
+        "boxes": two_identical_boxes,
+        "confidences": torch.ones((1, 2, 1)),
+        "classprobs": torch.full((1, 2, 1, 1), 8.0),
+    }
+
+    # Unmatched valid points should be supervised as background.
+    background_result = matcher(
+        [
+            {
+                "boxes": two_identical_boxes,
+                "confidences": torch.ones((1, 2, 1)),
+                "classprobs": torch.tensor([[[[8.0]], [[7.0]]]]),
+            }
+        ],
+        pack_targets([one_target]),
+        anchor_points=two_inside_points,
+    )
+    assert background_result.foreground.sum() == 1
+    assert torch.equal(background_result.background, ~background_result.foreground)
+
+    # Complete IoU should be clamped and assignment outputs detached from autograd.
+    clamp_result = matcher(
+        [
+            {
+                "boxes": torch.tensor([[[[100.0, 100.0, 104.0, 104.0]]]], requires_grad=True),
+                "confidences": torch.ones((1, 1, 1)),
+                "classprobs": torch.tensor([[[[8.0]]]], requires_grad=True),
+            }
+        ],
+        pack_targets([one_target]),
+        anchor_points=torch.tensor([[2.0, 2.0]]),
+    )
+    assert clamp_result.foreground.item()
+    torch.testing.assert_close(clamp_result.assignment_weights, torch.zeros_like(clamp_result.assignment_weights))
+    assert not clamp_result.assignment_weights.requires_grad
+    assert not clamp_result.target_boxes.requires_grad
+    assert not clamp_result.target_labels.requires_grad
+
+    # Only points strictly inside the target box can become foreground.
+    inside_result = top5_matcher(
+        [
+            {
+                "boxes": torch.tensor([[[[0.0, 0.0, 4.0, 4.0]]]]).expand(1, 5, 1, 4).clone(),
+                "confidences": torch.ones((1, 5, 1)),
+                "classprobs": torch.full((1, 5, 1, 1), 8.0),
+            }
+        ],
+        pack_targets([one_target]),
+        anchor_points=torch.tensor([[0.0, 2.0], [2.0, 0.0], [4.0, 2.0], [2.0, 4.0], [2.0, 2.0]]),
+    )
+    torch.testing.assert_close(inside_result.foreground, torch.tensor([[False, False, False, False, True]]))
+    assert torch.equal(inside_result.background, ~inside_result.foreground)
+
+    # When there are fewer valid points than top-k, every valid point is selected.
+    topk_result = top10_matcher(
+        [two_point_preds],
+        pack_targets([one_target]),
+        anchor_points=two_inside_points,
+    )
+    torch.testing.assert_close(topk_result.foreground, torch.tensor([[True, True]]))
+    torch.testing.assert_close(topk_result.assignment_weights, torch.ones((1, 2)))
+
+    # Ranking should follow complete IoU (not plain IoU) when selecting candidates.
+    ranking_pred_boxes = torch.tensor([[[-4.0, -4.0, 2.0, 4.0], [1.5, 1.5, 2.5, 2.5]]])
+    ordinary_overlaps = box_iou(ranking_pred_boxes[0], one_target_boxes).squeeze(1)
+    complete_overlaps = complete_box_iou(ranking_pred_boxes[0], one_target_boxes).squeeze(1)
+    ranking_result = matcher(
+        [
+            {
+                "boxes": ranking_pred_boxes,
+                "confidences": torch.ones((1, 2, 1)),
+                "classprobs": torch.full((1, 2, 1), 8.0),
+            }
+        ],
+        pack_targets([one_target]),
+        anchor_points=torch.tensor([[1.0, 2.0], [2.0, 2.0]]),
+    )
+    assert ordinary_overlaps[0] > ordinary_overlaps[1]
+    assert complete_overlaps[1] > complete_overlaps[0]
+    torch.testing.assert_close(ranking_result.foreground, torch.tensor([[False, True]]))
+
+    # If one prediction is eligible for multiple targets, resolve it by best overlap target.
+    conflicting_targets = {
+        "boxes": torch.tensor([[0.0, 0.0, 4.0, 4.0], [0.0, 0.0, 6.0, 6.0]]),
+        "labels": torch.tensor([0, 1], dtype=torch.int64),
+    }
+    conflict_result = matcher(
+        [
+            {
+                "boxes": torch.tensor([[[[0.0, 0.0, 4.0, 4.0]]]]),
+                "confidences": torch.ones((1, 1, 1)),
+                "classprobs": torch.tensor([[[[8.0, 8.0]]]]),
+            }
+        ],
+        pack_targets([conflicting_targets]),
+        anchor_points=torch.tensor([[2.0, 2.0]]),
+    )
+    assert conflict_result.foreground.item()
+    assert conflict_result.target_labels.item() == 0
+    torch.testing.assert_close(conflict_result.target_boxes[0, 0], conflicting_targets["boxes"][0])
+
+
+def test_tal_matching_empty_targets() -> None:
+    matcher = TALMatching(topk=1, alpha=0.5, beta=6.0)
+
+    empty_targets = {
+        "boxes": torch.empty((0, 4)),
+        "labels": torch.empty(0, dtype=torch.int64),
+    }
+    one_target = {
+        "boxes": torch.tensor([[0.0, 0.0, 4.0, 4.0]]),
+        "labels": torch.tensor([0], dtype=torch.int64),
+    }
+
+    # Empty targets should mark everything as background with zero assignment weight.
+    empty_result = matcher(
+        [
+            {
+                "boxes": torch.tensor([[[[0.0, 0.0, 1.0, 1.0]]]]),
+                "confidences": torch.zeros((1, 1, 1)),
+                "classprobs": torch.zeros((1, 1, 1, 2)),
+            }
+        ],
+        pack_targets([empty_targets]),
+        anchor_points=torch.tensor([[0.5, 0.5]]),
+    )
+    assert not empty_result.foreground.any()
+    assert empty_result.background.all()
+    assert empty_result.assignment_weights.sum() == 0
+
+    # Batched matching should handle mixed non-empty and empty images.
+    mixed_batch_preds = {
+        "boxes": torch.tensor([[[[0.0, 0.0, 4.0, 4.0]], [[5.0, 5.0, 8.0, 8.0]]]]),
+        "confidences": torch.ones((1, 2, 1)),
+        "classprobs": torch.full((1, 2, 1, 1), 8.0),
+    }
+    mixed_batch_result = matcher(
+        [mixed_batch_preds, mixed_batch_preds],
+        pack_targets([one_target, empty_targets]),
+        anchor_points=torch.tensor([[2.0, 2.0], [6.0, 6.0]]),
+    )
+    torch.testing.assert_close(mixed_batch_result.foreground[0], torch.tensor([True, False]))
+    assert not mixed_batch_result.foreground[1].any()
+    assert mixed_batch_result.background[1].all()
+
+
 @pytest.mark.parametrize("input_is_normalized", [False, True])
 @pytest.mark.parametrize(
     "target_labels",
@@ -194,8 +354,8 @@ def test_sim_ota_matching() -> None:
     ],
     ids=["integer-labels", "boolean-class-mask"],
 )
-def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) -> None:
-    matcher = TALMatching(prior_shapes=[[2, 2]], prior_shape_idxs=[0], topk=1, alpha=0.5, beta=6.0)
+def test_tal_matching_input_is_normalized(input_is_normalized: bool, target_labels: torch.Tensor) -> None:
+    matcher = TALMatching(topk=1, alpha=0.5, beta=6.0)
     class_logits = torch.tensor([[[[8.0, -8.0]], [[-8.0, 8.0]]]], requires_grad=True)
     classprobs = class_logits.sigmoid() if input_is_normalized else class_logits
     preds = {
@@ -203,45 +363,26 @@ def test_tal_matching(input_is_normalized: bool, target_labels: torch.Tensor) ->
         "confidences": torch.zeros((1, 2, 1)),
         "classprobs": classprobs,
     }
-    targets = {
-        "boxes": torch.tensor([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 2.0, 1.0]]),
-        "labels": target_labels,
-        "polygons": torch.empty((0, 8)),
-    }
-    anchor_points = torch.tensor([[0.5, 0.5], [1.5, 0.5]])
+    target_boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 2.0, 1.0]])
     result = matcher(
         [preds],
-        pack_targets([targets]),
+        pack_targets(
+            [
+                {
+                    "boxes": target_boxes,
+                    "labels": target_labels,
+                    "polygons": torch.empty((0, 8)),
+                }
+            ]
+        ),
         input_is_normalized=input_is_normalized,
-        anchor_points=anchor_points,
+        anchor_points=torch.tensor([[0.5, 0.5], [1.5, 0.5]]),
     )
 
-    # The first prediction matches the first target and the second prediction matches the second target, because they
-    # have the same IoU and the same probability of the target labels, but the first prediction has a smaller center
-    # distance to the first target and the second prediction has a smaller center distance to the second target.
     assert torch.equal(result.foreground, torch.tensor([[True, True]]))
-    assert torch.equal(result.target_boxes[0], targets["boxes"])
+    assert torch.equal(result.target_boxes[0], target_boxes)
     assert torch.equal(result.target_labels[0], target_labels)
     assert result.assignment_weights.sum() == 2.0
     assert not result.assignment_weights.requires_grad
     assert result.background.shape == torch.Size([1, 2])
     assert not result.background.any()
-
-
-def test_tal_matching_empty_targets() -> None:
-    matcher = TALMatching(prior_shapes=[[2, 2]], prior_shape_idxs=[0], topk=1)
-    preds = {
-        "boxes": torch.tensor([[[[0.0, 0.0, 1.0, 1.0]]]]),
-        "confidences": torch.zeros((1, 1, 1)),
-        "classprobs": torch.zeros((1, 1, 1, 2)),
-    }
-    targets = {
-        "boxes": torch.empty((0, 4)),
-        "labels": torch.empty(0, dtype=torch.int64),
-    }
-
-    result = matcher([preds], pack_targets([targets]), anchor_points=torch.tensor([[0.5, 0.5]]))
-
-    assert not result.foreground.any()
-    assert result.background.all()
-    assert result.assignment_weights.sum() == 0

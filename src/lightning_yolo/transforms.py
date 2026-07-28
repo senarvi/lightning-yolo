@@ -468,7 +468,7 @@ class TrainAugmentation:
         scale: Maximum affine scale variation around one.
         mixup: Probability of applying MixUp; zero disables it.
         hsv: HSV gains as ``(hue, saturation, value)``.
-        flip_probability: Probability of a horizontal flip.
+        flip: Probability of a horizontal flip.
         fill: Constant fill value for padding and warp borders.
 
     """
@@ -480,7 +480,7 @@ class TrainAugmentation:
         scale: float = 0.5,
         mixup: float = 0.0,
         hsv: tuple[float, float, float] = (0.015, 0.7, 0.4),
-        flip_probability: float = 0.5,
+        flip: float = 0.5,
         fill: int = 114,
     ) -> None:
         self.image_size = image_size
@@ -490,7 +490,7 @@ class TrainAugmentation:
         self._mixup = MixUp(alpha=32.0)
         self._mixup_probability = mixup
         self._hsv = RandomHSV(*hsv)
-        self._flip = RandomHorizontalFlip(flip_probability)
+        self._flip = RandomHorizontalFlip(flip)
         self._sanitize = SanitizeBoxes()
 
     def __call__(self, index: int, source: SampleSource) -> Sample:

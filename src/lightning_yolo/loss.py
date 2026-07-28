@@ -4,7 +4,7 @@ from typing import Literal
 
 import torch
 from torch import Tensor
-from torch.nn.functional import binary_cross_entropy, binary_cross_entropy_with_logits, one_hot
+from torch.nn.functional import binary_cross_entropy, binary_cross_entropy_with_logits, cross_entropy, one_hot
 from torchvision.ops import (
     box_iou,
     complete_box_iou,
@@ -16,68 +16,16 @@ from torchvision.ops import (
 )
 
 from .matching_result import DenseMatchingResult, MatchingResult, SparseMatchingResult
-from .types import PREDICTIONS, DetectionLossRecord, PredictionDict, TargetDict
+from .types import (
+    PREDICTIONS,
+    DetectionLossContribution,
+    DistributionalDistancePredictions,
+    PredictionDict,
+    TargetDict,
+)
+from .utils import boxes_to_distance_offsets
 
 _PredKey = Literal["boxes", "confidences", "classprobs"]
-
-
-def _flatten_predictions(preds: PREDICTIONS) -> list[PredictionDict]:
-    """Flattens the spatial and anchor dimensions of each image's predictions into a single axis.
-
-    Args:
-        preds: Predictions for each image, as returned by a detection layer.
-
-    Returns:
-        One ``PredictionDict`` per image with boxes shaped ``[N, 4]``, confidences shaped ``[N]``, and classprobs
-        shaped ``[N, C]``, where ``N`` is the total number of anchors across all spatial locations.
-
-    """
-    return [
-        {
-            "boxes": pred["boxes"].reshape(-1, 4),
-            "confidences": pred["confidences"].reshape(-1),
-            "classprobs": pred["classprobs"].reshape(-1, pred["classprobs"].shape[-1]),
-        }
-        for pred in preds
-    ]
-
-
-def _stack_predictions(preds: PREDICTIONS) -> PredictionDict:
-    """Flattens and stacks predictions from all images into batched tensors.
-
-    Args:
-        preds: Predictions for each image, as returned by a detection layer.
-
-    Returns:
-        A single ``PredictionDict`` with boxes shaped ``[B, N, 4]``, confidences shaped ``[B, N]``, and classprobs
-        shaped ``[B, N, C]``.
-
-    """
-    flat_preds = _flatten_predictions(preds)
-    return {
-        "boxes": torch.stack([pred["boxes"] for pred in flat_preds]),
-        "confidences": torch.stack([pred["confidences"] for pred in flat_preds]),
-        "classprobs": torch.stack([pred["classprobs"] for pred in flat_preds]),
-    }
-
-
-def _gather_predictions(
-    preds: list[PredictionDict], selectors: list[Tensor], keys: tuple[_PredKey, ...]
-) -> dict[str, Tensor]:
-    """Selects predictions from each image by index and concatenates them across the batch.
-
-    Args:
-        preds: Flattened predictions for each image.
-        selectors: Per-image index or boolean tensors selecting which predictions to gather.
-        keys: Which prediction fields to include in the result.
-
-    Returns:
-        A dictionary with the requested fields concatenated across all images.
-
-    """
-    return {
-        key: torch.cat([pred[key][selector] for pred, selector in zip(preds, selectors, strict=True)]) for key in keys
-    }
 
 
 def box_iou_loss(boxes1: Tensor, boxes2: Tensor) -> Tensor:
@@ -210,13 +158,13 @@ def _background_confidence_loss(preds: Tensor, bce_func: Callable) -> Tensor:
 
 
 def _background_class_loss(preds: Tensor, bce_func: Callable) -> Tensor:
-    """Calculates the sum of the classification losses for background anchors.
+    """Calculates the sum of the classification losses for background candidates.
 
-    Confidence-free heads (as in YOLOv8) have no separate confidence output, so background anchors are instead
+    Confidence-free heads (as in YOLOv8) have no separate confidence output, so background candidates are instead
     supervised by driving all of their class probabilities toward zero. This replaces the background confidence loss.
 
     Args:
-        preds: An ``[N, C]`` matrix of predicted class scores for background anchors.
+        preds: An ``[N, C]`` matrix of predicted class scores for background candidates.
         bce_func: A function for calculating binary cross entropy.
 
     Returns:
@@ -267,6 +215,42 @@ def _target_labels_to_probs(
     return targets
 
 
+def dfl_loss(logits: Tensor, targets: Tensor) -> Tensor:
+    """Calculate distribution focal loss for point-to-box distances.
+
+    Args:
+        logits: Raw distance-bin logits shaped ``[..., 4, B]``, where ``B`` is the number of distance bins.
+        targets: Fractional distance targets shaped ``[..., 4]``.
+
+    Returns:
+        One loss value per foreground point, shaped like ``targets`` without the final side dimension.
+
+    """
+    if logits.ndim < 2:
+        raise ValueError("DFL logits must have at least side and bin dimensions.")
+    if logits.shape[-2] != 4:
+        raise ValueError(f"DFL logits must have four box sides, got shape {tuple(logits.shape)}.")
+    if targets.shape != logits.shape[:-1]:
+        raise ValueError(f"DFL targets must have shape {tuple(logits.shape[:-1])}, got {tuple(targets.shape)}.")
+
+    num_bins = logits.shape[-1]
+    if num_bins < 2:
+        raise ValueError("DFL loss requires at least two distance bins.")
+
+    clipped_targets = targets.clamp(0, num_bins - 1 - 0.01)
+    left_bins = clipped_targets.floor().to(torch.int64)
+    right_bins = left_bins + 1
+    right_weights = clipped_targets - left_bins.to(clipped_targets.dtype)
+    left_weights = 1.0 - right_weights
+
+    flat_logits = logits.reshape(-1, num_bins)
+    flat_left = left_bins.reshape(-1)
+    flat_right = right_bins.reshape(-1)
+    left_loss = cross_entropy(flat_logits, flat_left, reduction="none").view_as(targets)
+    right_loss = cross_entropy(flat_logits, flat_right, reduction="none").view_as(targets)
+    return (left_loss * left_weights + right_loss * right_weights).mean(-1)
+
+
 @dataclass
 class YOLOLosses:
     overlap: Tensor
@@ -304,7 +288,6 @@ class YOLOLoss:
         overlap_multiplier: float = 5.0,
         confidence_multiplier: float = 1.0,
         class_multiplier: float = 1.0,
-        predict_confidence: bool = True,
     ):
         if callable(overlap_func):
             self._pairwise_overlap = overlap_func
@@ -317,7 +300,6 @@ class YOLOLoss:
         self.overlap_multiplier = overlap_multiplier
         self.confidence_multiplier = confidence_multiplier
         self.class_multiplier = class_multiplier
-        self.predict_confidence = predict_confidence
 
     def pairwise_costs(
         self,
@@ -371,13 +353,13 @@ class YOLOLoss:
 
         return losses, overlap
 
-    def matched_losses(
+    def __call__(
         self,
         matching: MatchingResult,
         preds: PREDICTIONS,
         input_is_normalized: bool,
         image_size: Tensor,
-    ) -> DetectionLossRecord:
+    ) -> DetectionLossContribution:
         """Computes summed training losses from the predictions assigned by ``matching``.
 
         Args:
@@ -390,38 +372,15 @@ class YOLOLoss:
             The overlap, confidence, and classification loss sums with their normalizers.
 
         """
-        losses = self.sums(matching, preds, input_is_normalized, image_size)
+        if isinstance(matching, DenseMatchingResult):
+            losses = self._dense_sums(matching, preds, input_is_normalized, image_size)
+        elif isinstance(matching, SparseMatchingResult):
+            losses = self._sparse_sums(matching, preds, input_is_normalized, image_size)
+        else:
+            raise TypeError(f"Unsupported matching result type: {type(matching)!r}")
         loss_sums = torch.stack((losses.overlap, losses.confidence, losses.classification))
         normalizers = matching.assignment_weight_sum.expand_as(loss_sums).to(loss_sums.dtype)
-        return DetectionLossRecord(loss_sums=loss_sums, normalizers=normalizers)
-
-    def sums(
-        self,
-        matching: MatchingResult,
-        preds: PREDICTIONS,
-        input_is_normalized: bool,
-        image_size: Tensor,
-    ) -> YOLOLosses:
-        """Calculates loss sums for the predictions matched by ``matching``.
-
-        The reduction is specialized by the matching result layout: dense results are reduced with masking over every
-        anchor, while sparse results are reduced over only the matched foreground anchors.
-
-        Args:
-            matching: The target assignments produced by a matcher.
-            preds: Predicted boxes, confidences, and class scores for each image.
-            input_is_normalized: If ``False``, input is logits, if ``True``, input is normalized to `0..1`.
-            image_size: Width and height used for box-size weighting.
-
-        Returns:
-            Loss sums for overlap, confidence, and classification.
-
-        """
-        if isinstance(matching, DenseMatchingResult):
-            return self._dense_sums(matching, preds, input_is_normalized, image_size)
-        if isinstance(matching, SparseMatchingResult):
-            return self._sparse_sums(matching, preds, input_is_normalized, image_size)
-        raise TypeError(f"Unsupported matching result type: {type(matching)!r}")
+        return DetectionLossContribution(sums=loss_sums, normalizers=normalizers)
 
     def _dense_sums(
         self,
@@ -430,7 +389,33 @@ class YOLOLoss:
         input_is_normalized: bool,
         image_size: Tensor,
     ) -> YOLOLosses:
-        pred_batch = _stack_predictions(preds)
+        """Calculates loss sums from dense batched target assignments.
+
+        Args:
+            matching: Fixed-shape batched target assignments.
+            preds: Predicted boxes, confidences, and class scores for each image.
+            input_is_normalized: If ``False``, input is logits, if ``True``, input is normalized to `0..1`.
+            image_size: Width and height used for box-size weighting.
+
+        Returns:
+            Loss sums for overlap, confidence, and classification.
+
+        """
+        # Flatten spatial+anchor dimensions, then stack into [batch, N, ...] tensors for dense indexing.
+        flat_preds: list[PredictionDict] = [
+            {
+                "boxes": pred["boxes"].reshape(-1, 4),
+                "confidences": pred["confidences"].reshape(-1),
+                "classprobs": pred["classprobs"].reshape(-1, pred["classprobs"].shape[-1]),
+            }
+            for pred in preds
+        ]
+        pred_batch: PredictionDict = {
+            "boxes": torch.stack([pred["boxes"] for pred in flat_preds]),
+            "confidences": torch.stack([pred["confidences"] for pred in flat_preds]),
+            "classprobs": torch.stack([pred["classprobs"] for pred in flat_preds]),
+        }
+
         foreground = matching.foreground
         background = matching.background
         assignment_weights = matching.assignment_weights.to(pred_batch["boxes"].dtype)
@@ -446,19 +431,16 @@ class YOLOLoss:
         box_weights = _size_compensation(target_boxes, image_size)
         overlap_loss = (overlap_loss_values * box_weights * assignment_weights[foreground]).sum()
 
-        if self.predict_confidence:
-            confidence_targets = assignment_weights
-            if self.predict_overlap is not None:
-                overlap_targets = assignment_weights * self.predict_overlap * overlap.detach().clamp(min=0)
-                confidence_targets = confidence_targets * (1 - self.predict_overlap) + overlap_targets
-            confidence_values = bce_func(pred_batch["confidences"], confidence_targets, reduction="none")
-            background_values = bce_func(
-                pred_batch["confidences"], torch.zeros_like(pred_batch["confidences"]), reduction="none"
-            )
-            confidence_loss = torch.where(foreground, confidence_values, 0.0).sum()
-            confidence_loss = confidence_loss + torch.where(background, background_values, 0.0).sum()
-        else:
-            confidence_loss = overlap_loss.new_zeros(())
+        confidence_targets = assignment_weights
+        if self.predict_overlap is not None:
+            overlap_targets = assignment_weights * self.predict_overlap * overlap.detach().clamp(min=0)
+            confidence_targets = confidence_targets * (1 - self.predict_overlap) + overlap_targets
+        confidence_values = bce_func(pred_batch["confidences"], confidence_targets, reduction="none")
+        background_values = bce_func(
+            pred_batch["confidences"], torch.zeros_like(pred_batch["confidences"]), reduction="none"
+        )
+        confidence_loss = torch.where(foreground, confidence_values, 0.0).sum()
+        confidence_loss = confidence_loss + torch.where(background, background_values, 0.0).sum()
 
         target_labels = matching.target_labels
         flat_target_labels = target_labels.flatten(0, 1) if target_labels.ndim == 3 else target_labels.flatten()
@@ -470,8 +452,7 @@ class YOLOLoss:
         ).view_as(pred_batch["classprobs"])
         class_targets = torch.where(foreground.unsqueeze(-1), target_probs * assignment_weights.unsqueeze(-1), 0.0)
         class_values = bce_func(pred_batch["classprobs"], class_targets, reduction="none")
-        class_mask = foreground | (background if not self.predict_confidence else torch.zeros_like(background))
-        class_loss = torch.where(class_mask.unsqueeze(-1), class_values, 0.0).sum()
+        class_loss = torch.where(foreground.unsqueeze(-1), class_values, 0.0).sum()
 
         return YOLOLosses(
             overlap_loss * self.overlap_multiplier,
@@ -486,13 +467,36 @@ class YOLOLoss:
         input_is_normalized: bool,
         image_size: Tensor,
     ) -> YOLOLosses:
-        flat_preds = _flatten_predictions(preds)
-        foreground = _gather_predictions(
-            flat_preds, [image.foreground for image in matching.images], ("boxes", "confidences", "classprobs")
-        )
-        background = _gather_predictions(
-            flat_preds, [image.background for image in matching.images], ("confidences", "classprobs")
-        )
+        """Calculates loss sums from per-image sparse target assignments.
+
+        Args:
+            matching: Per-image foreground assignments and background masks.
+            preds: Predicted boxes, confidences, and class scores for each image.
+            input_is_normalized: If ``False``, input is logits, if ``True``, input is normalized to `0..1`.
+            image_size: Width and height used for box-size weighting.
+
+        Returns:
+            Loss sums for overlap, confidence, and classification.
+
+        """
+        # Flatten spatial and anchor dimensions of each image's predictions into a single axis.
+        flat_preds: list[PredictionDict] = [
+            {
+                "boxes": pred["boxes"].reshape(-1, 4),
+                "confidences": pred["confidences"].reshape(-1),
+                "classprobs": pred["classprobs"].reshape(-1, pred["classprobs"].shape[-1]),
+            }
+            for pred in preds
+        ]
+
+        def gather(selectors: list[Tensor], keys: tuple[_PredKey, ...]) -> dict[str, Tensor]:
+            return {
+                key: torch.cat([pred[key][sel] for pred, sel in zip(flat_preds, selectors, strict=True)])
+                for key in keys
+            }
+
+        foreground = gather([image.foreground for image in matching.images], ("boxes", "confidences", "classprobs"))
+        background = gather([image.background for image in matching.images], ("confidences", "classprobs"))
         target_boxes = torch.cat([image.target_boxes for image in matching.images])
         target_labels = torch.cat([image.target_labels for image in matching.images])
 
@@ -504,23 +508,118 @@ class YOLOLoss:
         overlap = 1.0 - overlap_loss_values
         overlap_loss = (overlap_loss_values * _size_compensation(target_boxes, image_size)).sum()
 
-        if self.predict_confidence:
-            confidence_loss = _foreground_confidence_loss(
-                foreground["confidences"], overlap, bce_func, self.predict_overlap
-            )
-            confidence_loss = confidence_loss + _background_confidence_loss(background["confidences"], bce_func)
-        else:
-            confidence_loss = overlap_loss.new_zeros(())
+        confidence_loss = _foreground_confidence_loss(
+            foreground["confidences"], overlap, bce_func, self.predict_overlap
+        )
+        confidence_loss = confidence_loss + _background_confidence_loss(background["confidences"], bce_func)
 
         target_probs = _target_labels_to_probs(
             target_labels, foreground["classprobs"].shape[-1], foreground["classprobs"].dtype, self.label_smoothing
         )
         class_loss = bce_func(foreground["classprobs"], target_probs, reduction="sum")
-        if not self.predict_confidence:
-            class_loss = class_loss + _background_class_loss(background["classprobs"], bce_func)
 
         return YOLOLosses(
             overlap_loss * self.overlap_multiplier,
             confidence_loss * self.confidence_multiplier,
             class_loss * self.class_multiplier,
+        )
+
+
+class DistributionalDistanceLoss:
+    """Criterion for distributional-distance heads without a confidence output.
+
+    Args:
+        overlap_func: Overlap loss function. Valid string values are "iou", "giou", "diou", and "ciou".
+        label_smoothing: The epsilon parameter for foreground class target smoothing. 0.0 means no smoothing, and 1.0
+            means foreground target probabilities are always 0.5 before assignment weighting.
+        overlap_multiplier: Gain applied to the foreground box-overlap loss.
+        class_multiplier: Gain applied to the all-points binary classification loss.
+        dfl_multiplier: Gain applied to the foreground distribution focal loss.
+        num_dfl_bins: Number of discrete distance bins predicted for each box side.
+
+    """
+
+    def __init__(
+        self,
+        overlap_func: str | Callable = "ciou",
+        label_smoothing: float | None = None,
+        overlap_multiplier: float = 7.5,
+        class_multiplier: float = 0.5,
+        dfl_multiplier: float = 1.5,
+        num_dfl_bins: int = 16,
+    ) -> None:
+        if overlap_multiplier < 0 or class_multiplier < 0 or dfl_multiplier < 0:
+            raise ValueError("Loss multipliers must be nonnegative.")
+        if num_dfl_bins < 2:
+            raise ValueError("DFL loss requires at least two distance bins.")
+
+        self.overlap_multiplier = overlap_multiplier
+        self.class_multiplier = class_multiplier
+        self.dfl_multiplier = dfl_multiplier
+        self.num_dfl_bins = num_dfl_bins
+        self.label_smoothing = label_smoothing
+        if callable(overlap_func):
+            self._elementwise_overlap_loss = lambda boxes1, boxes2: 1.0 - overlap_func(boxes1, boxes2).diagonal()
+        else:
+            _, self._elementwise_overlap_loss = _get_iou_and_loss_functions(overlap_func)
+
+    def __call__(
+        self, preds: DistributionalDistancePredictions, matching: DenseMatchingResult
+    ) -> DetectionLossContribution:
+        """Compute overlap, classification, and DFL losses for one detection head.
+
+        Args:
+            preds: Point-based predictions with decoded boxes, raw DFL logits, class logits, anchors, and strides.
+            matching: Dense target assignments produced from ``preds``.
+
+        Returns:
+            Scaled loss sums, normalizers, and names ordered as ``(overlap, classification, dfl)``.
+
+        """
+        batch_size, num_preds, num_classes = preds.class_logits.shape
+        target_scores = preds.class_logits.new_zeros(batch_size, num_preds, num_classes)
+        assignment_weights = matching.assignment_weights.to(target_scores.dtype)
+        if matching.target_labels.ndim == 2:
+            labels = matching.target_labels.clamp(max=num_classes - 1).unsqueeze(-1)
+            target_scores.scatter_(2, labels, 1.0)
+        else:
+            target_scores = matching.target_labels.to(target_scores.dtype)
+        if self.label_smoothing is not None:
+            target_scores = (self.label_smoothing / 2) + target_scores * (1.0 - self.label_smoothing)
+        target_scores = target_scores * assignment_weights.unsqueeze(-1)
+        target_scores = target_scores * matching.foreground.unsqueeze(-1)
+
+        denominator = target_scores.sum().clamp_min(1.0)
+        classification_loss = binary_cross_entropy_with_logits(preds.class_logits, target_scores, reduction="sum")
+
+        foreground = matching.foreground
+        if foreground.any():
+            score_weights = target_scores.sum(-1)[foreground]
+            pred_boxes = preds.pixel_boxes[foreground]
+            target_boxes = matching.target_boxes[foreground]
+            overlap_loss = (self._elementwise_overlap_loss(pred_boxes, target_boxes) * score_weights).sum()
+
+            expanded_anchor_points = preds.anchor_points.expand(batch_size, -1, -1)
+            expanded_strides = preds.strides.expand(batch_size, -1, -1)
+            target_grid_boxes = target_boxes / expanded_strides[foreground]
+            distance_targets = boxes_to_distance_offsets(
+                target_grid_boxes, expanded_anchor_points[foreground], self.num_dfl_bins
+            )
+            foreground_logits = preds.dfl_logits[foreground].reshape(-1, 4, self.num_dfl_bins)
+            dfl_loss_sum = (dfl_loss(foreground_logits, distance_targets) * score_weights).sum()
+        else:
+            overlap_loss = preds.pixel_boxes.sum() * 0.0
+            dfl_loss_sum = preds.dfl_logits.sum() * 0.0
+
+        loss_sums = torch.stack(
+            (
+                overlap_loss * self.overlap_multiplier,
+                classification_loss * self.class_multiplier,
+                dfl_loss_sum * self.dfl_multiplier,
+            )
+        )
+        return DetectionLossContribution(
+            sums=loss_sums,
+            normalizers=denominator.expand_as(loss_sums),
+            names=("overlap", "classification", "dfl"),
         )

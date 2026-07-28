@@ -22,7 +22,7 @@ def pack_targets(targets: list[TargetDict]) -> PackedTargetDict:
 
     Returns:
         A packed target dictionary with ``boxes`` shaped ``[T, 4]``, ``labels`` shaped ``[T]`` or ``[T, C]``,
-        ``batch_indices`` shaped ``[T]`` mapping each row to its image, and ``counts`` giving the per-image target
+        ``sample_idxs`` shaped ``[T]`` mapping each row to its image, and ``counts`` giving the per-image target
         count. ``T`` is the total number of targets in the batch.
 
     """
@@ -32,7 +32,7 @@ def pack_targets(targets: list[TargetDict]) -> PackedTargetDict:
     if total:
         boxes = torch.cat([target["boxes"] for target in targets], dim=0)
         labels = torch.cat([target["labels"] for target in targets], dim=0)
-        batch_indices = torch.cat(
+        sample_idxs = torch.cat(
             [
                 torch.full((count,), image_idx, dtype=torch.int64, device=device)
                 for image_idx, count in enumerate(counts)
@@ -44,8 +44,8 @@ def pack_targets(targets: list[TargetDict]) -> PackedTargetDict:
         first = targets[0]
         boxes = first["boxes"].new_zeros((0, 4))
         labels = first["labels"].new_zeros((0, *first["labels"].shape[1:]))
-        batch_indices = torch.zeros((0,), dtype=torch.int64, device=device)
-    return {"boxes": boxes, "labels": labels, "batch_indices": batch_indices, "counts": counts}
+        sample_idxs = torch.zeros((0,), dtype=torch.int64, device=device)
+    return {"boxes": boxes, "labels": labels, "sample_idxs": sample_idxs, "counts": counts}
 
 
 def collate_packed_batch(batch: list[tuple[Tensor, TargetDict]]) -> BATCH:
