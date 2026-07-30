@@ -311,6 +311,9 @@ def _tal_match(
     k = min(topk, num_preds)
     _, topk_indices = torch.topk(masked_t, k=k, dim=2)  # [batch_size, max_targets, k]
 
+    # This gather is what makes zeroing (rather than setting to -1) the masked metrics above safe: top-k may pick
+    # outside/padded anchors when fewer than k anchors are inside a target (or the target is padding), so re-check
+    # ``inside_selector`` here and drop those selections before they enter the matching matrix.
     valid = torch.gather(inside_selector.permute(0, 2, 1), 2, topk_indices)
 
     # Scatter topk selections back into the [batch_size, N, max_targets] matching matrix.

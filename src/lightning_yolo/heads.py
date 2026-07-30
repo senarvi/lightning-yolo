@@ -329,6 +329,10 @@ class DistributionalDistanceDetectionHead(nn.Module):
         num_dfl_bins: Number of bins in each side's distance distribution.
         strides: Pixel-space stride of each feature level, ordered like ``input_channels``. These are fixed by the
             network downsampling ratios and are used to initialize the output biases.
+        matching_func: Task-aligned matcher that assigns targets to anchor points. Defaults to a :class:`TALMatching`
+            with default hyperparameters.
+        loss_func: Criterion that computes the overlap, classification, and DFL losses. Defaults to a
+            :class:`DistributionalDistanceLoss` with ``num_dfl_bins`` bins.
 
     """
 
@@ -497,8 +501,12 @@ class DistributionalDistanceDetectionHead(nn.Module):
         if torch.compiler.is_compiling():
             return anchor_points_and_strides(features, image_size)
 
+        # The strides depend on ``image_size`` (stride = image_size / grid), so the image size is part of the key.
+        # Otherwise multi-resolution training that reuses identical feature-map shapes for different input sizes would
+        # return stale strides.
         key = (
             tuple((feature.shape[-2], feature.shape[-1]) for feature in features),
+            tuple(image_size.flatten().tolist()),
             features[0].dtype,
             features[0].device,
         )

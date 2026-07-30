@@ -2039,6 +2039,17 @@ def create_network(
             "yolox-tiny, yolox-s, yolox-m, yolox-l."
         )
 
+    if network_class is YOLOV8Network:
+        if prior_shapes is not None:
+            raise ValueError("YOLOv8 uses anchors without prior shapes and does not accept prior_shapes.")
+        if matching is not None:
+            raise ValueError("YOLOv8 uses built-in task-aligned matching and does not accept matching configuration.")
+        if xy_scale != 1.0:
+            raise ValueError("YOLOv8 point-distance decoding does not support xy_scale values other than 1.0.")
+        return network_class(num_classes=num_classes, in_channels=in_channels, loss=loss, **network_size)
+
+    # ``**`` unpacking keeps mypy from checking the prior-shape-only keyword arguments against ``YOLOV8Network``, which
+    # is still part of the ``network_class`` union here even though it was handled above.
     network_args: dict[str, Any] = {
         "num_classes": num_classes,
         "in_channels": in_channels,
@@ -2048,12 +2059,4 @@ def create_network(
         "xy_scale": xy_scale,
         **network_size,
     }
-    if network_class is YOLOV8Network:
-        if prior_shapes is not None:
-            raise ValueError("YOLOv8 uses anchors without prior shapes and does not accept prior_shapes.")
-        if matching is not None:
-            raise ValueError("YOLOv8 uses built-in task-aligned matching and does not accept matching configuration.")
-        if xy_scale != 1.0:
-            raise ValueError("YOLOv8 point-distance decoding does not support xy_scale values other than 1.0.")
-        network_args = {"num_classes": num_classes, "in_channels": in_channels, "loss": loss, **network_size}
     return network_class(**network_args)

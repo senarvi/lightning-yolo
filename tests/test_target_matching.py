@@ -261,6 +261,24 @@ def test_tal_matching() -> None:
     torch.testing.assert_close(topk_result.foreground, torch.tensor([[True, True]]))
     torch.testing.assert_close(topk_result.assignment_weights, torch.ones((1, 2)))
 
+    # A real (non-padded) target with no points inside it must yield only background and finite, zero weights. This
+    # guards the normalization by the target's best alignment score, which is zero when the target has no matches.
+    no_inside_result = top5_matcher(
+        [
+            {
+                "boxes": torch.tensor([[[[0.0, 0.0, 4.0, 4.0]]]]).expand(1, 3, 1, 4).clone(),
+                "confidences": torch.ones((1, 3, 1)),
+                "classprobs": torch.full((1, 3, 1, 1), 8.0),
+            }
+        ],
+        pack_targets([one_target]),
+        anchor_points=torch.tensor([[10.0, 10.0], [12.0, 8.0], [6.0, 6.0]]),
+    )
+    assert not no_inside_result.foreground.any()
+    assert no_inside_result.background.all()
+    torch.testing.assert_close(no_inside_result.assignment_weights, torch.zeros((1, 3)))
+    assert torch.isfinite(no_inside_result.assignment_weights).all()
+
     # Ranking should follow complete IoU (not plain IoU) when selecting candidates.
     ranking_pred_boxes = torch.tensor([[[-4.0, -4.0, 2.0, 4.0], [1.5, 1.5, 2.5, 2.5]]])
     ordinary_overlaps = box_iou(ranking_pred_boxes[0], one_target_boxes).squeeze(1)
