@@ -248,7 +248,7 @@ def test_yolo_loss() -> None:
     torch.testing.assert_close(dense_sums[0], expected_overlap * loss_func.overlap_multiplier)
 
     # Confidence loss is non-zero because the loss function always predicts confidence.
-    assert float(dense_sums[1]) > 0.0
+    assert dense_sums[1].detach().item() > 0.0
     expected_foreground_class = binary_cross_entropy_with_logits(
         pred_classprobs[0:1, :2], torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]), reduction="sum"
     )

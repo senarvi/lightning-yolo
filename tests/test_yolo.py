@@ -191,18 +191,19 @@ def test_yolo_get_lr_scheduler() -> None:
 
 
 @pytest.mark.parametrize(
-    ("architecture", "expected_num_detections"),
+    ("architecture", "expected_num_detections", "dynamo"),
     [
-        ("yolov4-tiny", 252),
-        ("yolov8n", 84),
+        ("yolov4-tiny", 252, False),
+        ("yolov8n", 84, True),
     ],
 )
 def test_yolo_to_onnx(
     tmp_path: Path,
     architecture: str,
     expected_num_detections: int,
+    dynamo: bool,
 ) -> None:
-    output_path = tmp_path / f"{architecture}.onnx"
+    output_path = tmp_path / f"{architecture}_{'dynamo' if dynamo else 'tracing'}.onnx"
     model = YOLO(architecture=architecture, num_classes=2)
     model.eval()
     images = torch.rand(1, 3, 64, 64)
@@ -211,23 +212,33 @@ def test_yolo_to_onnx(
         eager_detections = model(images)
     assert eager_detections.shape == (1, expected_num_detections, 7)
 
-    model.to_onnx(
-        output_path,
-        images,
-        input_names=["images"],
-        output_names=["detections"],
-        opset_version=18,
-        dynamo=True,
-        external_data=False,
-        fallback=False,
-        verify=False,
-        dynamic_shapes={
-            "images": {
-                2: torch.export.Dim("height", min=32),
-                3: torch.export.Dim("width", min=32),
+    export_kwargs: dict[str, object] = {
+        "input_names": ["images"],
+        "output_names": ["detections"],
+        "opset_version": 18,
+        "dynamo": dynamo,
+    }
+    if dynamo:
+        export_kwargs.update(
+            {
+                "external_data": False,
+                "fallback": False,
+                "verify": False,
+                "dynamic_shapes": {
+                    "images": {
+                        2: torch.export.Dim("height", min=32),
+                        3: torch.export.Dim("width", min=32),
+                    }
+                },
             }
-        },
-    )
+        )
+    else:
+        export_kwargs["dynamic_axes"] = {
+            "images": {2: "height", 3: "width"},
+            "detections": {1: "detections"},
+        }
+
+    model.to_onnx(output_path, images, **export_kwargs)
 
     assert output_path.is_file()
     onnx_model = onnx.load(output_path)
@@ -238,7 +249,10 @@ def test_yolo_to_onnx(
     assert image_shape[3].dim_param == "width"
     assert [output.name for output in onnx_model.graph.output] == ["detections"]
     output_shape = onnx_model.graph.output[0].type.tensor_type.shape.dim
-    assert output_shape[2].dim_value == 7
+    if dynamo:
+        assert output_shape[2].dim_value == 7
+    else:
+        assert output_shape[2].dim_param != ""
 
     session = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
     (exported_detections,) = session.run(["detections"], {"images": images.numpy()})

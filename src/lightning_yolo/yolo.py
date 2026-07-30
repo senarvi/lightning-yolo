@@ -581,7 +581,7 @@ class YOLO(LightningModule):
 
         """
         if isinstance(images, Tensor):
-            batch_size = int(images.shape[0])
+            batch_size = images.shape[0]
         else:
             if not isinstance(images, list):
                 raise TypeError(f"Expected images to be a Tensor or a list, got {type(images).__name__}.")
