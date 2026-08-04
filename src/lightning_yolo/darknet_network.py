@@ -444,11 +444,11 @@ def _create_yolo(
     matching = matching or MatchingConfig()
     loss = loss or LossConfig()
 
-    if matching.algorithm == "tal":
+    if matching.algorithm in ("tal", "simota"):
         raise ValueError(
-            'Task-aligned matching ("tal") is not supported in Darknet configurations. It assigns targets across all '
-            "feature levels at once, but a Darknet model is a sequential graph that processes one detection layer at a "
-            "time. Use a native architecture for task-aligned matching."
+            f'The "{matching.algorithm}" matching algorithm is not supported in Darknet configurations. It assigns '
+            "targets across all feature levels at once, but a Darknet model is a sequential graph that processes one "
+            "detection layer at a time. Use a native architecture for task-aligned or SimOTA matching."
         )
 
     if num_classes is None:

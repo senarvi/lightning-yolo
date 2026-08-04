@@ -1,5 +1,4 @@
 from collections.abc import Sequence
-from dataclasses import replace
 from math import log
 from typing import cast
 
@@ -139,6 +138,31 @@ class PriorShapeDetectionLayer(nn.Module):
         )
 
 
+def _pool_level_predictions(levels: Sequence[PriorShapeLevelPredictions]) -> PREDICTIONS:
+    """Concatenates every level's per-image predictions into a single flat anchor axis.
+
+    Anchors are concatenated in level order, each level flattened in row-major grid order. This matches the anchor
+    index space produced by :class:`~lightning_yolo.target_matching.SimOTAMatching` and by the head-level
+    task-aligned matcher, so the pooled predictions can be indexed directly with their assignments.
+
+    Args:
+        levels: Decoded predictions for each detection level.
+
+    Returns:
+        One prediction dictionary per image, each holding boxes, confidences, and class scores for all anchors.
+
+    """
+    num_images = levels[0].boxes.shape[0]
+    return [
+        {
+            "boxes": torch.cat([level.boxes[image_idx] for level in levels], dim=0),
+            "confidences": torch.cat([level.confidences[image_idx] for level in levels], dim=0),
+            "classprobs": torch.cat([level.classprobs[image_idx] for level in levels], dim=0),
+        }
+        for image_idx in range(num_images)
+    ]
+
+
 class PriorShapeDetectionHead(nn.Module):
     """Detection head for native YOLO architectures with multiple feature levels.
 
@@ -152,12 +176,16 @@ class PriorShapeDetectionHead(nn.Module):
 
     Args:
         layers: The per-level detection layers.
-        matching_func: A head-level matcher that assigns targets across all levels at once. When ``None``, each layer
-            uses its own ``matching_func`` instead.
+        matching_func: A head-level matcher (task-aligned or SimOTA) that assigns targets across all levels at once.
+            When ``None``, each layer uses its own ``matching_func`` instead.
 
     """
 
-    def __init__(self, layers: Sequence[PriorShapeDetectionLayer], matching_func: TALMatching | None = None) -> None:
+    def __init__(
+        self,
+        layers: Sequence[PriorShapeDetectionLayer],
+        matching_func: TALMatching | SimOTAMatching | None = None,
+    ) -> None:
         super().__init__()
         if not layers:
             raise ValueError("At least one detection layer is required.")
@@ -188,21 +216,22 @@ class PriorShapeDetectionHead(nn.Module):
             return detections, []
 
         first = self.layers[0]
-        if self.matching_func is not None:
-            predictions: PREDICTIONS = [
-                {
-                    "boxes": torch.cat([level.boxes[image_idx] for level in levels], dim=0),
-                    "confidences": torch.cat([level.confidences[image_idx] for level in levels], dim=0),
-                    "classprobs": torch.cat([level.classprobs[image_idx] for level in levels], dim=0),
-                }
-                for image_idx in range(levels[0].boxes.shape[0])
-            ]
+
+        if isinstance(self.matching_func, TALMatching):
+            predictions = _pool_level_predictions(levels)
             anchor_points = torch.cat([level.anchor_points for level in levels], dim=0)
             matching_result = self.matching_func(
                 preds=predictions,
                 targets=targets,
                 anchor_points=anchor_points,
                 input_is_normalized=first.input_is_normalized,
+            )
+            return detections, [first.loss_func(matching_result, predictions, first.input_is_normalized, image_size)]
+
+        if isinstance(self.matching_func, SimOTAMatching):
+            predictions = _pool_level_predictions(levels)
+            matching_result = self.matching_func(
+                [level.as_grid() for level in levels], targets, image_size, first.input_is_normalized
             )
             return detections, [first.loss_func(matching_result, predictions, first.input_is_normalized, image_size)]
 
@@ -220,9 +249,10 @@ class PriorShapeDetectionHead(nn.Module):
 class PriorShapeDetectionHeadWithAux(nn.Module):
     """Multi-level detection head combining lead and auxiliary layers for deep supervision.
 
-    Each lead layer is matched to targets to determine assignment; the corresponding auxiliary layer uses the same
-    lead predictions for matching but computes its own prediction losses, scaled down by ``aux_weight``. This pattern
-    is used by YOLOv7.
+    The lead layers determine the target assignment and the auxiliary layers compute their own prediction losses,
+    scaled by ``aux_weight``. With SimOTA, the assignment is solved once per image over the pooled candidates of all
+    levels: one assignment for the lead head, and one from the same lead predictions with a wider candidate range for
+    the auxiliary head. Shape-based matchers instead assign each level independently. This pattern is used by YOLOv7.
 
     Args:
         layers: The per-level lead detection layers.
@@ -235,6 +265,8 @@ class PriorShapeDetectionHeadWithAux(nn.Module):
         self,
         layers: Sequence[PriorShapeDetectionLayer],
         aux_layers: Sequence[PriorShapeDetectionLayer],
+        lead_matching: SimOTAMatching | None = None,
+        aux_matching: SimOTAMatching | None = None,
         aux_weight: float = 0.25,
     ) -> None:
         super().__init__()
@@ -244,6 +276,10 @@ class PriorShapeDetectionHeadWithAux(nn.Module):
             raise ValueError("Lead and auxiliary heads require the same number of detection layers.")
         self.layers = cast(Sequence[PriorShapeDetectionLayer], nn.ModuleList(layers))
         self.aux_layers = cast(Sequence[PriorShapeDetectionLayer], nn.ModuleList(aux_layers))
+        # SimOTA assigns targets once per image across all levels. When the matchers are ``None``, the layers carry
+        # shape-based matchers that assign each level independently.
+        self.lead_matching = lead_matching
+        self.aux_matching = aux_matching
         self.aux_weight = aux_weight
 
     def forward(
@@ -274,6 +310,26 @@ class PriorShapeDetectionHeadWithAux(nn.Module):
         if targets is None:
             return detections, []
 
+        if self.lead_matching is not None and self.aux_matching is not None:
+            lead = self.layers[0]
+            aux = self.aux_layers[0]
+            lead_grids = [level.as_grid() for level in levels]
+
+            # Lead head: one global SimOTA assignment per image over the candidates of all levels.
+            lead_predictions = _pool_level_predictions(levels)
+            lead_match = self.lead_matching(lead_grids, targets, image_size, lead.input_is_normalized)
+            lead_loss = lead.loss_func(lead_match, lead_predictions, lead.input_is_normalized, image_size)
+
+            # Auxiliary head: assign from the same lead predictions with a wider candidate range, but supervise the
+            # auxiliary outputs.
+            aux_levels = [layer(feat, image_size) for layer, feat in zip(self.aux_layers, aux_features, strict=True)]
+            aux_predictions = _pool_level_predictions(aux_levels)
+            aux_match = self.aux_matching(lead_grids, targets, image_size, aux.input_is_normalized)
+            aux_loss = aux.loss_func(aux_match, aux_predictions, aux.input_is_normalized, image_size)
+
+            return detections, [lead_loss, aux_loss.scaled(self.aux_weight)]
+
+        # Shape-based matchers assign each level independently.
         losses = []
         for layer, aux_layer, level, aux_feature in zip(
             self.layers, self.aux_layers, levels, aux_features, strict=True
@@ -557,22 +613,10 @@ def create_prior_shape_detection_layer(
     assert loss.confidence_multiplier is not None
     assert loss.class_multiplier is not None
 
-    matching_func: ShapeMatching | SimOTAMatching | None
-    if matching.algorithm == "tal":
-        # Task-aligned matching assigns targets across all levels, so it is created by the head, not the layer.
+    matching_func: ShapeMatching | None
+    if matching.algorithm in ("tal", "simota"):
+        # Task-aligned and SimOTA matching assign targets across all levels, so they are created by the head.
         matching_func = None
-    elif matching.algorithm == "simota":
-        cost_func = YOLOLoss(
-            loss.overlap_func,
-            None,
-            None,
-            loss.overlap_multiplier,
-            loss.confidence_multiplier,
-            loss.class_multiplier,
-        )
-        matching_func = SimOTAMatching(
-            prior_shapes, prior_shape_idxs, cost_func, matching.spatial_range, matching.size_range
-        )
     elif matching.algorithm == "size":
         if matching.threshold is None:
             raise ValueError("A matching threshold is required with size ratio matching.")
@@ -609,9 +653,54 @@ def create_prior_shape_detection_layer(
     )
 
 
+def _create_simota_matching(
+    prior_shapes: PRIOR_SHAPES,
+    prior_shape_idxs: Sequence[Sequence[int]],
+    matching: MatchingConfig,
+    loss: LossConfig | None,
+    spatial_range: float,
+) -> SimOTAMatching:
+    """Builds a head-level SimOTA matcher that assigns targets across all feature levels at once.
+
+    Args:
+        prior_shapes: All prior box dimensions in the network input resolution.
+        prior_shape_idxs: For each feature level, the indices into ``prior_shapes`` used by that level.
+        matching: Matching configuration; its ``size_range`` and ``ignore_bg_threshold`` are used.
+        loss: Loss configuration used to build the matching cost function.
+        spatial_range: Candidate spatial range for this matcher. The lead and auxiliary heads use different values.
+
+    Returns:
+        A SimOTA matcher spanning every feature level.
+
+    """
+    resolved_matching = matching.with_defaults()
+    resolved_loss = (loss or LossConfig()).with_defaults()
+    assert resolved_matching.ignore_bg_threshold is not None
+    assert resolved_loss.overlap_func is not None
+    assert resolved_loss.overlap_multiplier is not None
+    assert resolved_loss.confidence_multiplier is not None
+    assert resolved_loss.class_multiplier is not None
+    cost_func = YOLOLoss(
+        resolved_loss.overlap_func,
+        None,
+        None,
+        resolved_loss.overlap_multiplier,
+        resolved_loss.confidence_multiplier,
+        resolved_loss.class_multiplier,
+    )
+    return SimOTAMatching(
+        prior_shapes,
+        prior_shape_idxs,
+        cost_func,
+        spatial_range,
+        resolved_matching.size_range,
+        resolved_matching.ignore_bg_threshold,
+    )
+
+
 def create_prior_shape_detection_head(
     prior_shapes: PRIOR_SHAPES,
-    prior_shape_idxs_per_level: Sequence[Sequence[int]],
+    prior_shape_idxs: Sequence[Sequence[int]],
     num_classes: int,
     matching: MatchingConfig | None = None,
     loss: LossConfig | None = None,
@@ -626,7 +715,7 @@ def create_prior_shape_detection_head(
 
     Args:
         prior_shapes: A list of all the prior box dimensions in the network input resolution.
-        prior_shape_idxs_per_level: For each feature level, the indices into ``prior_shapes`` that the level uses.
+        prior_shape_idxs: For each feature level, the indices into ``prior_shapes`` that the level uses.
         num_classes: Number of different classes that the head predicts.
         matching: Configuration that controls how targets are assigned to anchors.
         loss: Configuration that controls how the detection losses are computed.
@@ -641,17 +730,17 @@ def create_prior_shape_detection_head(
     layers = [
         create_prior_shape_detection_layer(
             prior_shapes=prior_shapes,
-            prior_shape_idxs=list(prior_shape_idxs),
+            prior_shape_idxs=list(level_prior_shape_idxs),
             num_classes=num_classes,
             matching=matching,
             loss=loss,
             xy_scale=xy_scale,
             input_is_normalized=input_is_normalized,
         )
-        for prior_shape_idxs in prior_shape_idxs_per_level
+        for level_prior_shape_idxs in prior_shape_idxs
     ]
 
-    matching_func = None
+    matching_func: TALMatching | SimOTAMatching | None = None
     if matching.algorithm == "tal":
         resolved = matching.with_defaults()
         assert resolved.ignore_bg_threshold is not None
@@ -661,12 +750,15 @@ def create_prior_shape_detection_head(
             beta=matching.tal_beta,
             ignore_bg_threshold=resolved.ignore_bg_threshold,
         )
+    elif matching.algorithm == "simota":
+        # SimOTA assigns targets once per image across all levels, reproducing upstream YOLOX/YOLOv7.
+        matching_func = _create_simota_matching(prior_shapes, prior_shape_idxs, matching, loss, matching.spatial_range)
     return PriorShapeDetectionHead(layers, matching_func)
 
 
 def create_prior_shape_detection_head_with_aux(
     prior_shapes: PRIOR_SHAPES,
-    prior_shape_idxs_per_level: Sequence[Sequence[int]],
+    prior_shape_idxs: Sequence[Sequence[int]],
     num_classes: int,
     matching: MatchingConfig | None = None,
     loss: LossConfig | None = None,
@@ -679,7 +771,7 @@ def create_prior_shape_detection_head_with_aux(
 
     Args:
         prior_shapes: A list of all prior box dimensions in the network input resolution.
-        prior_shape_idxs_per_level: For each feature level, the indices into ``prior_shapes`` used by that level.
+        prior_shape_idxs: For each feature level, the indices into ``prior_shapes`` used by that level.
         num_classes: Number of classes predicted by the head.
         matching: Configuration that controls target assignment for the lead layers.
         loss: Configuration that controls detection losses.
@@ -698,19 +790,24 @@ def create_prior_shape_detection_head_with_aux(
         return [
             create_prior_shape_detection_layer(
                 prior_shapes=prior_shapes,
-                prior_shape_idxs=prior_shape_idxs,
+                prior_shape_idxs=level_prior_shape_idxs,
                 num_classes=num_classes,
                 matching=layer_matching,
                 loss=loss,
                 xy_scale=xy_scale,
                 input_is_normalized=input_is_normalized,
             )
-            for prior_shape_idxs in prior_shape_idxs_per_level
+            for level_prior_shape_idxs in prior_shape_idxs
         ]
 
     layers = create_layers(matching)
-    aux_layers = create_layers(replace(matching, spatial_range=aux_spatial_range))
-    return PriorShapeDetectionHeadWithAux(layers, aux_layers, aux_weight)
+    aux_layers = create_layers(matching)
+    lead_matching = None
+    aux_matching = None
+    if matching.algorithm == "simota":
+        lead_matching = _create_simota_matching(prior_shapes, prior_shape_idxs, matching, loss, matching.spatial_range)
+        aux_matching = _create_simota_matching(prior_shapes, prior_shape_idxs, matching, loss, aux_spatial_range)
+    return PriorShapeDetectionHeadWithAux(layers, aux_layers, lead_matching, aux_matching, aux_weight)
 
 
 def create_distributional_distance_detection_head(

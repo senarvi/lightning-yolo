@@ -1,15 +1,18 @@
 import torch
 import torch.nn as nn
 
-from lightning_yolo.config import LossConfig
+from lightning_yolo.batching import pack_targets
+from lightning_yolo.config import LossConfig, MatchingConfig
 from lightning_yolo.heads import (
     DFLExpectation,
     DistributionalDistanceDetectionHead,
     PriorShapeDetectionLayer,
     create_distributional_distance_detection_head,
+    create_prior_shape_detection_head,
+    create_prior_shape_detection_head_with_aux,
 )
 from lightning_yolo.loss import YOLOLoss
-from lightning_yolo.target_matching import HighestIoUMatching
+from lightning_yolo.target_matching import HighestIoUMatching, SimOTAMatching
 
 
 class FixedOutput(nn.Module):
@@ -42,7 +45,56 @@ def test_prior_shape_detection_layer() -> None:
     assert torch.isfinite(level.detections).all()
 
 
-def test_distributional_distance_detection_head() -> None:
+def test_create_prior_shape_detection_head() -> None:
+    head = create_prior_shape_detection_head(
+        [(8, 8), (16, 16)],
+        [range(0, 1), range(1, 2)],
+        num_classes=2,
+        matching=MatchingConfig(algorithm="simota"),
+    )
+    assert isinstance(head.matching_func, SimOTAMatching)
+
+    # One anchor per cell and two classes give (5 + 2) = 7 output channels per level.
+    features = [torch.randn(1, 7, 4, 4, requires_grad=True), torch.randn(1, 7, 2, 2, requires_grad=True)]
+    image_size = torch.tensor([32.0, 32.0])
+    targets = pack_targets(
+        [{"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
+    )
+    detections, losses = head(features, image_size, targets)
+
+    # Global SimOTA assigns once across both levels, so the head returns a single loss record.
+    assert len(detections) == 2
+    assert len(losses) == 1
+    assert torch.isfinite(losses[0].sums).all()
+    sum(loss.sums.sum() for loss in losses).backward()
+    assert all(feature.grad is not None and torch.isfinite(feature.grad).all() for feature in features)
+
+
+def test_create_prior_shape_detection_head_with_aux() -> None:
+    head = create_prior_shape_detection_head_with_aux(
+        [(8, 8), (16, 16)],
+        [range(0, 1), range(1, 2)],
+        num_classes=2,
+        matching=MatchingConfig(algorithm="simota"),
+    )
+
+    # One anchor per cell and two classes give (5 + 2) = 7 output channels per level.
+    features = [torch.randn(1, 7, 4, 4, requires_grad=True), torch.randn(1, 7, 2, 2, requires_grad=True)]
+    image_size = torch.tensor([32.0, 32.0])
+    targets = pack_targets(
+        [{"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
+    )
+    aux_features = [torch.randn(1, 7, 4, 4, requires_grad=True), torch.randn(1, 7, 2, 2, requires_grad=True)]
+    detections, losses = head(features, aux_features, image_size, targets)
+
+    # One global assignment for the lead head and one for the auxiliary head, not one per level.
+    assert len(detections) == 2
+    assert len(losses) == 2
+    assert all(torch.isfinite(loss.sums).all() for loss in losses)
+    sum(loss.sums.sum() for loss in losses).backward()
+    assert all(feature.grad is not None and torch.isfinite(feature.grad).all() for feature in features)
+    assert all(feature.grad is not None and torch.isfinite(feature.grad).all() for feature in aux_features)
+
     # Standard YOLOv8 feature map sizes with learned branches.
     head = DistributionalDistanceDetectionHead([8, 8, 8], num_classes=2, num_dfl_bins=4)
 

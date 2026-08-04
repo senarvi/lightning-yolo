@@ -149,7 +149,7 @@ def test_probability_of_labels_multiclass() -> None:
 def test_sim_ota_matching() -> None:
     matcher = SimOTAMatching(
         prior_shapes=[(2, 2)],
-        prior_shape_idxs=[0],
+        prior_shape_idxs=[[0]],
         loss_func=YOLOLoss("iou"),
         spatial_range=1.0,
         size_range=4.0,
@@ -167,8 +167,9 @@ def test_sim_ota_matching() -> None:
         "boxes": torch.empty((0, 4)),
         "labels": torch.empty(0, dtype=torch.int64),
     }
+    # One feature level with two images in the batch.
     result = matcher(
-        [preds, preds],
+        [[preds, preds]],
         pack_targets([targets, empty_targets]),
         image_size=torch.tensor([2.0, 2.0]),
         input_is_normalized=False,
@@ -184,6 +185,40 @@ def test_sim_ota_matching() -> None:
     assert empty.foreground.numel() == 0
     assert torch.equal(empty.background, torch.tensor([True]))
     assert result.assignment_weight_sum == 1
+
+
+def test_sim_ota_matching_pools_levels() -> None:
+    matcher = SimOTAMatching(
+        prior_shapes=[(2, 2)],
+        prior_shape_idxs=[[0], [0]],
+        loss_func=YOLOLoss("iou"),
+        spatial_range=1.0,
+        size_range=4.0,
+    )
+    level_preds = {
+        "boxes": torch.tensor([[[[0.0, 0.0, 2.0, 2.0]]]]),
+        "confidences": torch.tensor([[[0.0]]]),
+        "classprobs": torch.tensor([[[[0.0]]]]),
+    }
+    targets = {
+        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
+        "labels": torch.tensor([0], dtype=torch.int64),
+    }
+
+    # Two levels each contribute one candidate that perfectly overlaps the target. Dynamic-k is computed over the
+    # pooled candidates (k = clipped sum of the top IoUs = 2), so both pooled anchors are matched.
+    result = matcher(
+        [[level_preds], [level_preds]],
+        pack_targets([targets]),
+        image_size=torch.tensor([2.0, 2.0]),
+    )
+
+    (image,) = result.images
+    # Foreground indices address the concatenated anchors of both levels (level 1's anchor is offset by one).
+    assert torch.equal(image.foreground.sort().values, torch.tensor([0, 1]))
+    assert torch.equal(image.background, torch.tensor([False, False]))
+    assert image.target_boxes.shape == (2, 4)
+    assert result.assignment_weight_sum == 2
 
 
 def test_tal_matching() -> None:

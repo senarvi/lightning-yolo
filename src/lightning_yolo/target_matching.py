@@ -393,7 +393,11 @@ def _probability_of_labels(pred_probs: Tensor, target_labels: Tensor) -> Tensor:
 class SimOTAMatching:
     """Selects which anchors are used to predict each target using the SimOTA matching rule.
 
-    This is the matching rule used by YOLOX.
+    SimOTA was introduced by YOLOX. It does one global assignment per image over the pooled candidates of every feature
+    level, so dynamic-k selection ranks candidates across all levels jointly instead of one level at a time. A native
+    detection head decodes the per-level grid predictions and calls this matcher once; it returns a single batched
+    assignment whose foreground indices address the concatenated anchors of all levels in level order, and the head
+    computes the loss with one call over the pooled predictions.
 
     The assignment weight sum is the number of anchors selected by dynamic-k matching after conflict resolution, with
     one unit per matched foreground anchor.
@@ -401,11 +405,10 @@ class SimOTAMatching:
     Args:
         prior_shapes: A list of all the prior box dimensions. The list should contain (width, height) tuples in the
             network input resolution.
-        prior_shape_idxs: List of indices to ``prior_shapes`` that is used to select the (usually 3) prior shapes that
-            this layer uses.
+        prior_shape_idxs: For each feature level, the indices into ``prior_shapes`` that the level uses.
         loss_func: A ``YOLOLoss`` object that can be used to calculate the pairwise costs.
-        spatial_range: For each target, restrict to the anchors that are within an `N × N` grid cell are centered at the
-            target, where `N` is the value of this parameter.
+        spatial_range: For each target, restrict to the anchors that are within an `N × N` grid cell area centered at
+            the target, where `N` is the value of this parameter.
         size_range: For each target, restrict to the anchors whose prior dimensions are not larger than the target
             dimensions multiplied by this value and not smaller than the target dimensions divided by this value.
         ignore_bg_threshold: If a predictor is not responsible for predicting any target, but the predicted box has IoU
@@ -417,13 +420,13 @@ class SimOTAMatching:
     def __init__(
         self,
         prior_shapes: PRIOR_SHAPES,
-        prior_shape_idxs: Sequence[int],
+        prior_shape_idxs: Sequence[Sequence[int]],
         loss_func: YOLOLoss,
         spatial_range: float,
         size_range: float,
         ignore_bg_threshold: float = 0.7,
     ) -> None:
-        self.prior_shapes = [prior_shapes[idx] for idx in prior_shape_idxs]
+        self.prior_shapes_per_level = [[prior_shapes[idx] for idx in idxs] for idxs in prior_shape_idxs]
         self.loss_func = loss_func
         self.spatial_range = spatial_range
         self.size_range = size_range
@@ -431,72 +434,91 @@ class SimOTAMatching:
 
     def __call__(
         self,
-        preds: PREDICTIONS,
+        preds: Sequence[list[PredictionDict]],
         targets: PackedTargetDict,
         image_size: Tensor,
         input_is_normalized: bool = False,
-    ) -> MatchingResult:
-        """For each target, selects predictions using the SimOTA matching rule.
+    ) -> SparseMatchingResult:
+        """Assigns targets across all feature levels for every image in the batch.
 
         Args:
-            preds: Predictions for each image.
-            targets: Training targets for each image.
+            preds: For each detection level, the per-image grid predictions returned by
+                :meth:`PriorShapeLevelPredictions.as_grid`.
+            targets: Packed training targets for the whole batch.
             image_size: Input image width and height.
             input_is_normalized: The predicted confidences and class probabilities have been normalized by logistic
                 activation. This is used by the Darknet configurations of Scaled-YOLOv4.
 
         Returns:
-            Per-image foreground assignments for the whole batch.
+            One assignment per image, whose foreground indices address the concatenated anchors of all levels.
 
         """
         image_targets = split_targets(targets)
         images = [
-            self._match_image(image_preds, image_targets, image_size, input_is_normalized)
-            for image_preds, image_targets in zip(preds, image_targets, strict=True)
+            self._match_image([level[image_idx] for level in preds], targets_i, image_size, input_is_normalized)
+            for image_idx, targets_i in enumerate(image_targets)
         ]
         return SparseMatchingResult(images)
 
     def _match_image(
         self,
-        preds: PredictionDict,
+        level_preds: Sequence[PredictionDict],
         targets: TargetDict,
         image_size: Tensor,
         input_is_normalized: bool,
     ) -> ImageMatch:
-        height, width, boxes_per_cell, _ = preds["boxes"].shape
-        prior_mask, anchor_inside_target = self._get_prior_mask(targets, image_size, width, height, boxes_per_cell)
-        prior_preds: PredictionDict = {
-            "boxes": preds["boxes"][prior_mask],
-            "confidences": preds["confidences"][prior_mask],
-            "classprobs": preds["classprobs"][prior_mask],
-        }
+        candidate_boxes: list[Tensor] = []
+        candidate_confidences: list[Tensor] = []
+        candidate_classprobs: list[Tensor] = []
+        inside_matrices: list[Tensor] = []
+        candidate_indices: list[Tensor] = []
+        level_boxes: list[Tensor] = []
+        offset = 0
+        for prior_shapes, preds in zip(self.prior_shapes_per_level, level_preds, strict=True):
+            height, width, boxes_per_cell, _ = preds["boxes"].shape
+            prior_mask, anchor_inside_target = self._get_prior_mask(
+                prior_shapes, targets, image_size, width, height, boxes_per_cell
+            )
+            candidate_boxes.append(preds["boxes"][prior_mask])
+            candidate_confidences.append(preds["confidences"][prior_mask])
+            candidate_classprobs.append(preds["classprobs"][prior_mask])
+            inside_matrices.append(anchor_inside_target)
+            candidate_indices.append(prior_mask.reshape(-1).nonzero(as_tuple=True)[0] + offset)
+            level_boxes.append(preds["boxes"].reshape(-1, 4))
+            offset += preds["confidences"].numel()
 
-        losses, ious = self.loss_func.pairwise_costs(prior_preds, targets, input_is_normalized=input_is_normalized)
+        candidate_preds: PredictionDict = {
+            "boxes": torch.cat(candidate_boxes),
+            "confidences": torch.cat(candidate_confidences),
+            "classprobs": torch.cat(candidate_classprobs),
+        }
+        anchor_inside_target = torch.cat(inside_matrices)
+        pooled_indices = torch.cat(candidate_indices)
+        pooled_boxes = torch.cat(level_boxes)
+
+        losses, ious = self.loss_func.pairwise_costs(candidate_preds, targets, input_is_normalized=input_is_normalized)
         costs = losses.overlap + losses.confidence + losses.classification
         costs += 100000.0 * ~anchor_inside_target
         pred_mask, target_selector = _sim_ota_match(costs, ious)
 
-        # Replace the candidate-prior True values with the actual SimOTA matches.
-        prior_mask[prior_mask.nonzero(as_tuple=True)] = pred_mask
+        # The matched anchors in pooled flat order match the target selector returned by SimOTA.
+        foreground = pooled_indices[pred_mask]
 
-        # Background mask is used to select anchors that are not responsible for predicting any object, for
-        # calculating the part of the confidence loss with zero as the target confidence. It is set to False, if a
-        # predicted box overlaps any target significantly, or if a prediction is matched to a target.
-        background_mask = iou_below(preds["boxes"], targets["boxes"], self.ignore_bg_threshold)
-        background_mask[prior_mask] = False
-
-        # The matched anchors in flat order match the target selector returned by SimOTA.
-        foreground = prior_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        # Every anchor of every level is supervised as background unless it overlaps a target significantly or was
+        # matched to a target.
+        background = iou_below(pooled_boxes, targets["boxes"], self.ignore_bg_threshold)
+        background[foreground] = False
 
         return ImageMatch(
             foreground=foreground,
-            background=background_mask.reshape(-1),
+            background=background,
             target_boxes=targets["boxes"][target_selector],
             target_labels=targets["labels"][target_selector],
         )
 
     def _get_prior_mask(
         self,
+        prior_shapes: PRIOR_SHAPES,
         targets: TargetDict,
         image_size: Tensor,
         grid_width: int,
@@ -509,6 +531,7 @@ class SimOTAMatching:
         targets.
 
         Args:
+            prior_shapes: The prior box dimensions used by this feature level.
             targets: Training targets for a single image.
             image_size: Input image width and height.
             grid_width: Width of the feature grid.
@@ -532,7 +555,7 @@ class SimOTAMatching:
 
         # Create a [boxes_per_cell, targets] tensor for selecting prior shapes that are close enough to the target
         # dimensions.
-        prior_wh = torch.tensor(self.prior_shapes, device=targets["boxes"].device)
+        prior_wh = torch.tensor(prior_shapes, device=targets["boxes"].device)
         shape_selector = box_size_ratio(prior_wh, wh) < self.size_range
 
         # Create a [grid_cells, targets] tensor for selecting spatial locations that are inside target bounding boxes.
