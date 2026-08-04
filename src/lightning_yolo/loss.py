@@ -210,7 +210,7 @@ def _target_labels_to_probs(
 
 
 def dfl_loss(logits: Tensor, targets: Tensor) -> Tensor:
-    """Calculate distribution focal loss for point-to-box distances.
+    """Calculates distribution focal loss for point-to-box distances.
 
     Args:
         logits: Raw distance-bin logits shaped ``[..., 4, B]``, where ``B`` is the number of distance bins.
@@ -542,14 +542,14 @@ class DistributionalDistanceLoss:
     def __call__(
         self, preds: DistributionalDistancePredictions, matching: DenseMatchingResult
     ) -> DetectionLossContribution:
-        """Compute overlap, classification, and DFL losses for one detection head.
+        """Computes overlap, classification, and DFL losses for one detection head.
 
         Args:
             preds: Point-based predictions with decoded boxes, raw DFL logits, class logits, anchors, and strides.
             matching: Dense target assignments produced from ``preds``.
 
         Returns:
-            Scaled loss sums, normalizers, and names ordered as ``(overlap, classification, dfl)``.
+            Scaled loss sums, normalizers, and names ordered as ``(overlap, class, dfl)``.
 
         """
         batch_size, num_preds, num_classes = preds.class_logits.shape
@@ -593,5 +593,5 @@ class DistributionalDistanceLoss:
             dfl_loss_sum * self.dfl_multiplier,
         ))
         return DetectionLossContribution(
-            sums=loss_sums, normalizers=denominator.expand_as(loss_sums), names=("overlap", "classification", "dfl")
+            sums=loss_sums, normalizers=denominator.expand_as(loss_sums), names=("overlap", "class", "dfl")
         )

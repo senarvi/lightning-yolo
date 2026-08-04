@@ -39,7 +39,7 @@ def test_yolo_forward_with_losses() -> None:
     detections, losses = module._forward_with_losses(images, targets)
 
     assert detections.shape == (1, 84, 8)
-    assert losses.names == ("overlap", "classification", "dfl")
+    assert losses.names == ("overlap", "class", "dfl")
     assert torch.isfinite(losses.values).all()
     assert losses.values.max() < 100
 
@@ -55,7 +55,7 @@ def test_yolo_forward_with_losses_multilabel() -> None:
     detections, losses = module._forward_with_losses(images, targets)
 
     assert detections.shape == (1, 84, 8)
-    assert losses.names == ("overlap", "classification", "dfl")
+    assert losses.names == ("overlap", "class", "dfl")
     assert torch.isfinite(losses.values).all()
 
 
@@ -67,12 +67,12 @@ def test_yolo_log_losses() -> None:
         logged[name] = (value, kwargs)
 
     module.log = log  # type: ignore[assignment]
-    losses = DetectionLoss(values=torch.tensor([2.0, 3.0, 5.0]), names=("overlap", "classification", "dfl"))
+    losses = DetectionLoss(values=torch.tensor([2.0, 3.0, 5.0]), names=("overlap", "class", "dfl"))
 
     module._log_losses("val", losses, sync_dist=True, batch_size=4)
 
     torch.testing.assert_close(logged["val/overlap_loss"][0], torch.tensor(2.0))
-    torch.testing.assert_close(logged["val/classification_loss"][0], torch.tensor(3.0))
+    torch.testing.assert_close(logged["val/class_loss"][0], torch.tensor(3.0))
     torch.testing.assert_close(logged["val/dfl_loss"][0], torch.tensor(5.0))
     torch.testing.assert_close(logged["val/total_loss"][0], torch.tensor(10.0))
     assert all(kwargs["sync_dist"] is True for _, kwargs in logged.values())

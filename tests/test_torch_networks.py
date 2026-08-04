@@ -149,7 +149,7 @@ def test_yolo_forward_backward(
     losses = loss_record.sums / loss_record.normalizers
     total_loss = losses.sum()
 
-    assert loss_record.names == ("overlap", "classification", "dfl")
+    assert loss_record.names == ("overlap", "class", "dfl")
     assert torch.isfinite(losses).all()
     assert torch.isfinite(total_loss)
     if expected_positive_loss_index is not None:
