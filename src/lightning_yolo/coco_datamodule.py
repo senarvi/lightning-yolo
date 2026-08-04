@@ -245,15 +245,7 @@ class COCODetectionDataset(Dataset):
         self._cache: list[Sample | None] = [None] * len(index)
         self._recent: deque[int] = deque()
         self._augmentation: TrainAugmentation | EvalAugmentation = (
-            TrainAugmentation(
-                image_size,
-                translate=translate,
-                scale=scale,
-                mixup=mixup,
-                hsv=hsv,
-                flip=flip,
-                fill=114,
-            )
+            TrainAugmentation(image_size, translate=translate, scale=scale, mixup=mixup, hsv=hsv, flip=flip, fill=114)
             if training
             else EvalAugmentation(image_size, fill=114)
         )
@@ -350,10 +342,7 @@ class COCODetectionDataset(Dataset):
         if (target_height, target_width) == (input_height, input_width):
             return image, boxes.astype(np.float32, copy=False)
         image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-        scaled = boxes * np.array(
-            [target_width / input_width, target_height / input_height] * 2,
-            dtype=np.float32,
-        )
+        scaled = boxes * np.array([target_width / input_width, target_height / input_height] * 2, dtype=np.float32)
         return image, scaled.astype(np.float32, copy=False)
 
     def _cache_sample(self, index: int, sample: Sample) -> None:
@@ -457,24 +446,15 @@ class COCODetectionDataModule(LightningDataModule):
 
         if stage in (None, "fit"):
             self.train_dataset = self._create_dataset(
-                image_dir=train_images,
-                ann_file=train_annotations,
-                training=True,
-                cache_size=cache_size,
+                image_dir=train_images, ann_file=train_annotations, training=True, cache_size=cache_size
             )
         if stage in (None, "fit", "validate"):
             self.val_dataset = self._create_dataset(
-                image_dir=val_images,
-                ann_file=val_annotations,
-                training=False,
-                cache_size=0,
+                image_dir=val_images, ann_file=val_annotations, training=False, cache_size=0
             )
         if stage in (None, "test"):
             self.test_dataset = self._create_dataset(
-                image_dir=val_images,
-                ann_file=val_annotations,
-                training=False,
-                cache_size=0,
+                image_dir=val_images, ann_file=val_annotations, training=False, cache_size=0
             )
 
     def _create_dataset(self, image_dir: Path, ann_file: Path, training: bool, cache_size: int) -> COCODetectionDataset:

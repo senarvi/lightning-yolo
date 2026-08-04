@@ -79,12 +79,7 @@ class TinyStage(nn.Module):
 
     """
 
-    def __init__(
-        self,
-        num_channels: int,
-        activation: str | None = "leaky",
-        norm: str | None = "batchnorm",
-    ) -> None:
+    def __init__(self, num_channels: int, activation: str | None = "leaky", norm: str | None = "batchnorm") -> None:
         super().__init__()
 
         hidden_channels = num_channels // 2
@@ -297,11 +292,7 @@ class CSPSPP(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        activation: str | None = "silu",
-        norm: str | None = "batchnorm",
+        self, in_channels: int, out_channels: int, activation: str | None = "silu", norm: str | None = "batchnorm"
     ):
         super().__init__()
 
@@ -319,10 +310,7 @@ class CSPSPP(nn.Module):
         self.maxpool2 = MaxPool(kernel_size=9, stride=1)
         self.maxpool3 = MaxPool(kernel_size=13, stride=1)
 
-        self.mix1 = nn.Sequential(
-            conv(4 * out_channels, out_channels),
-            conv(out_channels, out_channels, kernel_size=3),
-        )
+        self.mix1 = nn.Sequential(conv(4 * out_channels, out_channels), conv(out_channels, out_channels, kernel_size=3))
         self.mix2 = Conv(2 * out_channels, out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -348,11 +336,7 @@ class FastSPP(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        activation: str | None = "silu",
-        norm: str | None = "batchnorm",
+        self, in_channels: int, out_channels: int, activation: str | None = "silu", norm: str | None = "batchnorm"
     ):
         super().__init__()
         hidden_channels = in_channels // 2
@@ -401,13 +385,11 @@ class YOLOV4TinyBackbone(nn.Module):
 
         def maxpool(out_channels: int) -> nn.Module:
             return nn.Sequential(
-                OrderedDict(
-                    [
-                        ("pad", nn.ZeroPad2d((0, 1, 0, 1))),
-                        ("maxpool", MaxPool(kernel_size=2, stride=2)),
-                        ("smooth", smooth(out_channels)),
-                    ]
-                )
+                OrderedDict([
+                    ("pad", nn.ZeroPad2d((0, 1, 0, 1))),
+                    ("maxpool", MaxPool(kernel_size=2, stride=2)),
+                    ("smooth", smooth(out_channels)),
+                ])
             )
 
         def stage(out_channels: int, use_maxpool: bool) -> nn.Module:
@@ -471,14 +453,7 @@ class YOLOV4Backbone(nn.Module):
             csp = CSPStage(
                 out_channels, out_channels, depth=depth, shortcut=True, activation=activation, norm=normalization
             )
-            return nn.Sequential(
-                OrderedDict(
-                    [
-                        ("downsample", downsample(in_channels, out_channels)),
-                        ("csp", csp),
-                    ]
-                )
-            )
+            return nn.Sequential(OrderedDict([("downsample", downsample(in_channels, out_channels)), ("csp", csp)]))
 
         convs = [conv3x3(in_channels, widths[0])] + [conv3x3(widths[0], widths[0]) for _ in range(depths[0] - 1)]
         self.stem = nn.Sequential(*convs)
@@ -531,14 +506,7 @@ class YOLOV5Backbone(nn.Module):
             csp = CSPStage(
                 out_channels, out_channels, depth=depth, shortcut=True, activation=activation, norm=normalization
             )
-            return nn.Sequential(
-                OrderedDict(
-                    [
-                        ("downsample", downsample(in_channels, out_channels)),
-                        ("csp", csp),
-                    ]
-                )
-            )
+            return nn.Sequential(OrderedDict([("downsample", downsample(in_channels, out_channels)), ("csp", csp)]))
 
         stages = [
             downsample(in_channels, width, kernel_size=6),
@@ -599,14 +567,7 @@ class YOLOV7Backbone(nn.Module):
                 activation=activation,
                 norm=normalization,
             )
-            return nn.Sequential(
-                OrderedDict(
-                    [
-                        ("downsample", downsample(in_channels, out_channels)),
-                        ("elan", elan),
-                    ]
-                )
-            )
+            return nn.Sequential(OrderedDict([("downsample", downsample(in_channels, out_channels)), ("elan", elan)]))
 
         self.stem = nn.Sequential(*[ReOrg(), conv3x3(in_channels * 4, widths[0])])
         self.stages = nn.ModuleList(
@@ -665,24 +626,15 @@ class YOLOV8Backbone(nn.Module):
             c2f = C2fStage(
                 out_channels, out_channels, depth=stage_depth, shortcut=True, activation=activation, norm=normalization
             )
-            return nn.Sequential(
-                OrderedDict(
-                    [
-                        ("downsample", downsample(in_channels, out_channels)),
-                        ("c2f", c2f),
-                    ]
-                )
-            )
+            return nn.Sequential(OrderedDict([("downsample", downsample(in_channels, out_channels)), ("c2f", c2f)]))
 
-        self.stages = nn.ModuleList(
-            [
-                downsample(in_channels, widths[0]),
-                stage(widths[0], widths[1], depth),
-                stage(widths[1], widths[2], depth * 2),
-                stage(widths[2], widths[3], depth * 2),
-                stage(widths[3], widths[4], depth),
-            ]
-        )
+        self.stages = nn.ModuleList([
+            downsample(in_channels, widths[0]),
+            stage(widths[0], widths[1], depth),
+            stage(widths[1], widths[2], depth * 2),
+            stage(widths[2], widths[3], depth * 2),
+            stage(widths[3], widths[4], depth),
+        ])
 
     def forward(self, x: Tensor) -> list[Tensor]:
         c1 = self.stages[0](x)
@@ -790,20 +742,12 @@ class YOLOV4TinyNetwork(nn.Module):
             return result
 
         self.backbone = backbone or YOLOV4TinyBackbone(
-            in_channels=in_channels,
-            width=width,
-            activation=activation,
-            normalization=normalization,
+            in_channels=in_channels, width=width, activation=activation, normalization=normalization
         )
 
         self.fpn5 = conv(width * 16, width * 8)
         self.out5 = nn.Sequential(
-            OrderedDict(
-                [
-                    ("channels", conv(width * 8, width * 16)),
-                    (f"outputs_{num_outputs}", outputs(width * 16)),
-                ]
-            )
+            OrderedDict([("channels", conv(width * 8, width * 16)), (f"outputs_{num_outputs}", outputs(width * 16))])
         )
         self.upsample5 = upsample(width * 8, width * 4)
 
@@ -928,12 +872,7 @@ class YOLOV4Network(nn.Module):
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
-                in_channels,
-                out_channels,
-                depth=2,
-                shortcut=False,
-                norm=normalization,
-                activation=activation,
+                in_channels, out_channels, depth=2, shortcut=False, norm=normalization, activation=activation
             )
 
         def out(in_channels: int) -> nn.Module:
@@ -954,10 +893,7 @@ class YOLOV4Network(nn.Module):
             self.backbone = backbone
         else:
             self.backbone = YOLOV4Backbone(
-                in_channels=in_channels,
-                widths=widths,
-                activation=activation,
-                normalization=normalization,
+                in_channels=in_channels, widths=widths, activation=activation, normalization=normalization
             )
 
         w3 = widths[-3]
@@ -1113,12 +1049,7 @@ class YOLOV4P6Network(nn.Module):
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
-                in_channels,
-                out_channels,
-                depth=2,
-                shortcut=False,
-                norm=normalization,
-                activation=activation,
+                in_channels, out_channels, depth=2, shortcut=False, norm=normalization, activation=activation
             )
 
         def out(in_channels: int) -> nn.Module:
@@ -1320,20 +1251,11 @@ class YOLOV5Network(nn.Module):
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
-                in_channels,
-                out_channels,
-                depth=depth,
-                shortcut=False,
-                norm=normalization,
-                activation=activation,
+                in_channels, out_channels, depth=depth, shortcut=False, norm=normalization, activation=activation
             )
 
         self.backbone = backbone or YOLOV5Backbone(
-            in_channels=in_channels,
-            depth=depth,
-            width=width,
-            activation=activation,
-            normalization=normalization,
+            in_channels=in_channels, depth=depth, width=width, activation=activation, normalization=normalization
         )
 
         self.spp = spp(width * 16, width * 16)
@@ -1342,12 +1264,7 @@ class YOLOV5Network(nn.Module):
         self.out3 = out(width * 4)
 
         self.fpn4 = nn.Sequential(
-            OrderedDict(
-                [
-                    ("csp", csp(width * 16, width * 8)),
-                    ("conv", conv(width * 8, width * 4)),
-                ]
-            )
+            OrderedDict([("csp", csp(width * 16, width * 8)), ("conv", conv(width * 8, width * 4))])
         )
         self.pan4 = csp(width * 8, width * 8)
         self.out4 = out(width * 8)
@@ -1667,20 +1584,11 @@ class YOLOV8Network(nn.Module):
 
         def c2f(in_channels: int, out_channels: int) -> nn.Module:
             return C2fStage(
-                in_channels,
-                out_channels,
-                depth=depth,
-                shortcut=False,
-                norm=normalization,
-                activation=activation,
+                in_channels, out_channels, depth=depth, shortcut=False, norm=normalization, activation=activation
             )
 
         self.backbone = backbone or YOLOV8Backbone(
-            in_channels=in_channels,
-            widths=widths,
-            depth=depth,
-            activation=activation,
-            normalization=normalization,
+            in_channels=in_channels, widths=widths, depth=depth, activation=activation, normalization=normalization
         )
 
         w3 = widths[-3]
@@ -1756,8 +1664,7 @@ class YOLOXHead(nn.Module):
 
         def features(num_channels: int) -> nn.Module:
             return nn.Sequential(
-                conv(num_channels, num_channels, kernel_size=3),
-                conv(num_channels, num_channels, kernel_size=3),
+                conv(num_channels, num_channels, kernel_size=3), conv(num_channels, num_channels, kernel_size=3)
             )
 
         def classprob(num_channels: int) -> nn.Sequential:
@@ -1869,30 +1776,16 @@ class YOLOXNetwork(nn.Module):
 
         def csp(in_channels: int, out_channels: int) -> nn.Module:
             return CSPStage(
-                in_channels,
-                out_channels,
-                depth=depth,
-                shortcut=False,
-                norm=normalization,
-                activation=activation,
+                in_channels, out_channels, depth=depth, shortcut=False, norm=normalization, activation=activation
             )
 
         def head(in_channels: int, hidden_channels: int) -> YOLOXHead:
             return YOLOXHead(
-                in_channels,
-                hidden_channels,
-                anchors_per_cell,
-                num_classes,
-                activation=activation,
-                norm=normalization,
+                in_channels, hidden_channels, anchors_per_cell, num_classes, activation=activation, norm=normalization
             )
 
         self.backbone = backbone or YOLOV5Backbone(
-            in_channels=in_channels,
-            depth=depth,
-            width=width,
-            activation=activation,
-            normalization=normalization,
+            in_channels=in_channels, depth=depth, width=width, activation=activation, normalization=normalization
         )
 
         self.spp = spp(width * 16, width * 16)
@@ -1901,12 +1794,7 @@ class YOLOXNetwork(nn.Module):
         self.out3 = head(width * 4, width * 4)
 
         self.fpn4 = nn.Sequential(
-            OrderedDict(
-                [
-                    ("csp", csp(width * 16, width * 8)),
-                    ("conv", conv(width * 8, width * 4)),
-                ]
-            )
+            OrderedDict([("csp", csp(width * 16, width * 8)), ("conv", conv(width * 8, width * 4))])
         )
         self.pan4 = csp(width * 8, width * 8)
         self.out4 = head(width * 8, width * 4)

@@ -148,9 +148,7 @@ def test_eval_augmentation() -> None:
 
 def test_to_tensor_sample() -> None:
     sample = Sample(
-        np.full((6, 8, 3), 255, dtype=np.uint8),
-        np.array([[1.0, 2.0, 3.0, 4.0]], np.float32),
-        np.array([5], np.int64),
+        np.full((6, 8, 3), 255, dtype=np.uint8), np.array([[1.0, 2.0, 3.0, 4.0]], np.float32), np.array([5], np.int64)
     )
 
     image, target = to_tensor_sample(sample)

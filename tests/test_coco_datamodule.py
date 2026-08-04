@@ -27,26 +27,17 @@ def create_coco_data(data_dir: Path) -> tuple[Path, Path]:
 
     annotation_path = data_dir / "annotations.json"
     annotation_path.write_text(
-        json.dumps(
-            {
-                "images": [{"id": 1, "file_name": image_path.name, "width": 10, "height": 6}],
-                "annotations": [
-                    {
-                        "id": 1,
-                        "image_id": 1,
-                        "category_id": 67,
-                        "bbox": [1.0, 1.0, 2.0, 2.0],
-                        "area": 4.0,
-                        "iscrowd": 0,
-                    }
-                ],
-                "categories": [
-                    {"id": 65, "name": "bed"},
-                    {"id": 67, "name": "dining table"},
-                    {"id": 70, "name": "toilet"},
-                ],
-            }
-        ),
+        json.dumps({
+            "images": [{"id": 1, "file_name": image_path.name, "width": 10, "height": 6}],
+            "annotations": [
+                {"id": 1, "image_id": 1, "category_id": 67, "bbox": [1.0, 1.0, 2.0, 2.0], "area": 4.0, "iscrowd": 0}
+            ],
+            "categories": [
+                {"id": 65, "name": "bed"},
+                {"id": 67, "name": "dining table"},
+                {"id": 70, "name": "toilet"},
+            ],
+        }),
         encoding="utf-8",
     )
 
@@ -73,27 +64,15 @@ def test_convert_annotations() -> None:
         },
         {
             "bbox": [0.0, 0.0, 10.0, 10.0],
-            "segmentation": [
-                [1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 1.0, 4.0],
-                [6.0, 5.0, 8.0, 5.0, 8.0, 9.0, 6.0, 9.0],
-            ],
+            "segmentation": [[1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 1.0, 4.0], [6.0, 5.0, 8.0, 5.0, 8.0, 9.0, 6.0, 9.0]],
             "category_id": 65,
             "iscrowd": 0,
         },
-        {
-            "bbox": [4.0, 6.0, 3.0, 5.0],
-            "segmentation": [],
-            "category_id": 65,
-            "iscrowd": 0,
-        },
+        {"bbox": [4.0, 6.0, 3.0, 5.0], "segmentation": [], "category_id": 65, "iscrowd": 0},
     ]
     category_id_to_label = {8: 0, 65: 1, 67: 2, 70: 3}
     boxes, labels = convert_annotations(
-        annotations=annotations,
-        width=20,
-        height=20,
-        category_id_to_label=category_id_to_label,
-        include_crowd=False,
+        annotations=annotations, width=20, height=20, category_id_to_label=category_id_to_label, include_crowd=False
     )
     expected_boxes = np.array(
         [
@@ -127,10 +106,7 @@ def test_collate_packed_batch() -> None:
     image1 = torch.zeros((3, 10, 12), dtype=torch.uint8)
     image2 = torch.zeros((3, 10, 12), dtype=torch.uint8)
     target1 = {"boxes": torch.zeros((1, 4)), "labels": torch.tensor([1])}
-    target2 = {
-        "boxes": torch.zeros((0, 4)),
-        "labels": torch.empty((0,), dtype=torch.int64),
-    }
+    target2 = {"boxes": torch.zeros((0, 4)), "labels": torch.empty((0,), dtype=torch.int64)}
     images, targets = collate_packed_batch([(image1, target1), (image2, target2)])
 
     assert isinstance(images, torch.Tensor)
@@ -144,12 +120,7 @@ def test_collate_packed_batch() -> None:
 
 def test_coco_detection_dataset(tmp_path: Path) -> None:
     image_dir, annotation_path = create_coco_data(tmp_path)
-    dataset = COCODetectionDataset(
-        image_dir=image_dir,
-        ann_file=annotation_path,
-        image_size=(20, 12),
-        training=False,
-    )
+    dataset = COCODetectionDataset(image_dir=image_dir, ann_file=annotation_path, image_size=(20, 12), training=False)
     image, target = dataset[0]
 
     assert image.shape == (3, 12, 20)
@@ -158,8 +129,7 @@ def test_coco_detection_dataset(tmp_path: Path) -> None:
     assert torch.equal(target["labels"], torch.tensor([1]))
 
     resized_image, resized_boxes = dataset._fit_within_output(
-        np.zeros((5, 7, 3), dtype=np.uint8),
-        np.array([[0.0, 0.0, 7.0, 5.0]], dtype=np.float32),
+        np.zeros((5, 7, 3), dtype=np.uint8), np.array([[0.0, 0.0, 7.0, 5.0]], dtype=np.float32)
     )
     assert resized_image.shape == (12, 17, 3)
     np.testing.assert_array_equal(resized_boxes, np.array([[0.0, 0.0, 17.0, 12.0]], dtype=np.float32))
@@ -168,11 +138,7 @@ def test_coco_detection_dataset(tmp_path: Path) -> None:
 def test_coco_detection_dataset_training(tmp_path: Path) -> None:
     image_dir, annotation_path = create_coco_data(tmp_path)
     dataset = COCODetectionDataset(
-        image_dir=image_dir,
-        ann_file=annotation_path,
-        image_size=(16, 16),
-        training=True,
-        cache_size=4,
+        image_dir=image_dir, ann_file=annotation_path, image_size=(16, 16), training=True, cache_size=4
     )
 
     image, target = dataset[0]
@@ -186,11 +152,7 @@ def test_coco_detection_dataset_training(tmp_path: Path) -> None:
 def test_coco_detection_dataset_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     image_dir, annotation_path = create_coco_data(tmp_path)
     dataset = COCODetectionDataset(
-        image_dir=image_dir,
-        ann_file=annotation_path,
-        image_size=(20, 12),
-        training=False,
-        cache_size=1,
+        image_dir=image_dir, ann_file=annotation_path, image_size=(20, 12), training=False, cache_size=1
     )
     first = dataset.load_sample(0)
     first.labels[0] = 99
@@ -226,20 +188,11 @@ def test_coco_detection_datamodule_setup(tmp_path: Path) -> None:
 
 def test_close_mosaic(tmp_path: Path) -> None:
     image_dir, annotation_path = create_coco_data(tmp_path)
-    dataset = COCODetectionDataset(
-        image_dir=image_dir,
-        ann_file=annotation_path,
-        image_size=(16, 16),
-        training=True,
-    )
+    dataset = COCODetectionDataset(image_dir=image_dir, ann_file=annotation_path, image_size=(16, 16), training=True)
     datamodule = COCODetectionDataModule(tmp_path)
     datamodule.train_dataset = dataset
     trainer = Trainer(
-        max_epochs=100,
-        enable_checkpointing=False,
-        logger=False,
-        enable_progress_bar=False,
-        enable_model_summary=False,
+        max_epochs=100, enable_checkpointing=False, logger=False, enable_progress_bar=False, enable_model_summary=False
     )
     trainer.datamodule = datamodule
     callback = CloseMosaic(epochs=10)

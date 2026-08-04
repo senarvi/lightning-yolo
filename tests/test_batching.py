@@ -1,10 +1,6 @@
 import torch
 
-from lightning_yolo.batching import (
-    collate_packed_batch,
-    pack_targets,
-    split_targets,
-)
+from lightning_yolo.batching import collate_packed_batch, pack_targets, split_targets
 
 
 def _targets() -> list[dict[str, torch.Tensor]]:

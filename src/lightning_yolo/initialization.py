@@ -67,11 +67,7 @@ def initialize_zero_bias(conv: nn.Conv2d, weight_std: float = 0.01) -> None:
 
 
 def initialize_yolo_logits(
-    conv: nn.Conv2d,
-    num_classes: int,
-    confidence_bias: float,
-    classprob_bias: float,
-    weight_std: float = 0.01,
+    conv: nn.Conv2d, num_classes: int, confidence_bias: float, classprob_bias: float, weight_std: float = 0.01
 ) -> None:
     """Initializes a coupled YOLO output convolution.
 

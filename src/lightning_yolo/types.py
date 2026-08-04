@@ -31,11 +31,7 @@ class DetectionLossContribution:
             scale: Multiplier applied to this contribution in the global loss average.
 
         """
-        return DetectionLossContribution(
-            sums=self.sums * scale,
-            normalizers=self.normalizers * scale,
-            names=self.names,
-        )
+        return DetectionLossContribution(sums=self.sums * scale, normalizers=self.normalizers * scale, names=self.names)
 
 
 @dataclass(frozen=True)

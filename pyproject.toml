@@ -45,6 +45,9 @@ line-length = 120
 target-version = "py314"
 exclude = [".git", "docs"]
 
+[tool.ruff.format]
+preview = true
+
 [tool.ruff.lint]
 select = [
     "E",  # pycodestyle errors

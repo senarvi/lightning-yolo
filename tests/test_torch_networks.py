@@ -10,9 +10,9 @@ from lightning_yolo.types import PackedTargetDict
 
 def _training_fixture() -> tuple[torch.Tensor, PackedTargetDict]:
     images = torch.linspace(0.0, 1.0, steps=3 * 64 * 64).reshape(1, 3, 64, 64)
-    targets = pack_targets(
-        [{"boxes": torch.tensor([[16.0, 16.0, 48.0, 48.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
-    )
+    targets = pack_targets([
+        {"boxes": torch.tensor([[16.0, 16.0, 48.0, 48.0]]), "labels": torch.tensor([1], dtype=torch.int64)}
+    ])
     return images, targets
 
 
@@ -46,17 +46,9 @@ def _assert_finite_nonzero_grad(model: torch.nn.Module, prefix: str) -> None:
     + [(architecture, 1) for architecture in ["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"]],
 )
 @pytest.mark.parametrize("in_channels", [1, 3])
-def test_create_network(
-    architecture: str,
-    expected_loss_records: int | None,
-    in_channels: int,
-) -> None:
+def test_create_network(architecture: str, expected_loss_records: int | None, in_channels: int) -> None:
     num_classes = 2
-    model = create_network(
-        architecture=architecture,
-        num_classes=num_classes,
-        in_channels=in_channels,
-    )
+    model = create_network(architecture=architecture, num_classes=num_classes, in_channels=in_channels)
     model.eval()
 
     images = torch.rand(1, in_channels, 128, 128)
@@ -71,9 +63,9 @@ def test_create_network(
         assert output.shape[2] == (5 + num_classes)
         assert torch.isfinite(output).all()
 
-    targets = pack_targets(
-        [{"boxes": torch.tensor([[24.0, 32.0, 88.0, 96.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
-    )
+    targets = pack_targets([
+        {"boxes": torch.tensor([[24.0, 32.0, 88.0, 96.0]]), "labels": torch.tensor([1], dtype=torch.int64)}
+    ])
     detections, losses = model(images, targets)
 
     assert len(detections) > 0
@@ -143,9 +135,7 @@ def test_yolo_forward(loss: LossConfig | None, expected_loss_settings: tuple[flo
     ],
 )
 def test_yolo_forward_backward(
-    loss: LossConfig | None,
-    expected_nonzero_grad_prefixes: tuple[str, ...],
-    expected_positive_loss_index: int | None,
+    loss: LossConfig | None, expected_nonzero_grad_prefixes: tuple[str, ...], expected_positive_loss_index: int | None
 ) -> None:
     torch.manual_seed(0)
     model = create_network("yolov8n", num_classes=2, loss=loss)

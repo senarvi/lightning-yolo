@@ -64,33 +64,11 @@ def test_sim_ota_match() -> None:
 
 
 def test_tal_match() -> None:
-    align_metric = torch.tensor(
-        [
-            [0.2, 0.9],
-            [0.8, 0.1],
-            [0.7, 0.6],
-        ]
-    )
-    ious = torch.tensor(
-        [
-            [0.3, 0.8],
-            [0.9, 0.2],
-            [0.5, 0.7],
-        ]
-    )
-    inside_selector = torch.tensor(
-        [
-            [True, True],
-            [True, False],
-            [True, True],
-        ]
-    )
+    align_metric = torch.tensor([[0.2, 0.9], [0.8, 0.1], [0.7, 0.6]])
+    ious = torch.tensor([[0.3, 0.8], [0.9, 0.2], [0.5, 0.7]])
+    inside_selector = torch.tensor([[True, True], [True, False], [True, True]])
     pred_mask, target_selector, assignment_weights = _tal_match(
-        align_metric.unsqueeze(0),
-        ious.unsqueeze(0),
-        inside_selector.unsqueeze(0),
-        torch.tensor([[True, True]]),
-        topk=1,
+        align_metric.unsqueeze(0), ious.unsqueeze(0), inside_selector.unsqueeze(0), torch.tensor([[True, True]]), topk=1
     )
 
     assert torch.equal(pred_mask[0], torch.tensor([True, True, False]))
@@ -99,74 +77,39 @@ def test_tal_match() -> None:
 
 
 def test_probability_of_labels() -> None:
-    pred_probs = torch.tensor(
-        [
-            [0.1, 0.9, 0.2],
-            [0.8, 0.3, 0.4],
-        ]
-    )
+    pred_probs = torch.tensor([[0.1, 0.9, 0.2], [0.8, 0.3, 0.4]])
     target_labels = torch.tensor([1, 5], dtype=torch.int64)
     probs = _probability_of_labels(pred_probs, target_labels)
 
     # For the first target, the label is class 1, so the probabilities are [0.9, 0.3]. For the second target, the label
     # is mapped to class 2, so the probabilities are [0.2, 0.4].
-    expected = torch.tensor(
-        [
-            [0.9, 0.2],
-            [0.3, 0.4],
-        ]
-    )
+    expected = torch.tensor([[0.9, 0.2], [0.3, 0.4]])
     torch.testing.assert_close(probs, expected)
 
 
 def test_probability_of_labels_multiclass() -> None:
-    pred_probs = torch.tensor(
-        [
-            [0.1, 0.9, 0.2],
-            [0.8, 0.3, 0.4],
-        ]
-    )
-    target_labels = torch.tensor(
-        [
-            [True, False, True],
-            [False, True, True],
-        ]
-    )
+    pred_probs = torch.tensor([[0.1, 0.9, 0.2], [0.8, 0.3, 0.4]])
+    target_labels = torch.tensor([[True, False, True], [False, True, True]])
     probs = _probability_of_labels(pred_probs, target_labels)
 
     # For the first target, the label mask is [class 0, class 2], so the probabilities are [0.1 + 0.2, 0.8 + 0.4]. For
     # the second target, the label mask is [class 1, class 2], so the probabilities are [0.9 + 0.2, 0.3 + 0.4].
-    expected = torch.tensor(
-        [
-            [0.3, 1.1],
-            [1.2, 0.7],
-        ]
-    )
+    expected = torch.tensor([[0.3, 1.1], [1.2, 0.7]])
 
     torch.testing.assert_close(probs, expected)
 
 
 def test_sim_ota_matching() -> None:
     matcher = SimOTAMatching(
-        prior_shapes=[(2, 2)],
-        prior_shape_idxs=[[0]],
-        loss_func=YOLOLoss("iou"),
-        spatial_range=1.0,
-        size_range=4.0,
+        prior_shapes=[(2, 2)], prior_shape_idxs=[[0]], loss_func=YOLOLoss("iou"), spatial_range=1.0, size_range=4.0
     )
     preds = {
         "boxes": torch.tensor([[[[0.0, 0.0, 2.0, 2.0]]]]),
         "confidences": torch.tensor([[[0.0]]]),
         "classprobs": torch.tensor([[[[0.0]]]]),
     }
-    targets = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-        "labels": torch.tensor([0], dtype=torch.int64),
-    }
-    empty_targets = {
-        "boxes": torch.empty((0, 4)),
-        "labels": torch.empty(0, dtype=torch.int64),
-    }
+    targets = {"boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]), "labels": torch.tensor([0], dtype=torch.int64)}
+    empty_targets = {"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}
     # One feature level with two images in the batch.
     result = matcher(
         [[preds, preds]],
@@ -189,29 +132,18 @@ def test_sim_ota_matching() -> None:
 
 def test_sim_ota_matching_pools_levels() -> None:
     matcher = SimOTAMatching(
-        prior_shapes=[(2, 2)],
-        prior_shape_idxs=[[0], [0]],
-        loss_func=YOLOLoss("iou"),
-        spatial_range=1.0,
-        size_range=4.0,
+        prior_shapes=[(2, 2)], prior_shape_idxs=[[0], [0]], loss_func=YOLOLoss("iou"), spatial_range=1.0, size_range=4.0
     )
     level_preds = {
         "boxes": torch.tensor([[[[0.0, 0.0, 2.0, 2.0]]]]),
         "confidences": torch.tensor([[[0.0]]]),
         "classprobs": torch.tensor([[[[0.0]]]]),
     }
-    targets = {
-        "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-        "labels": torch.tensor([0], dtype=torch.int64),
-    }
+    targets = {"boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]), "labels": torch.tensor([0], dtype=torch.int64)}
 
     # Two levels each contribute one candidate that perfectly overlaps the target. Dynamic-k is computed over the
     # pooled candidates (k = clipped sum of the top IoUs = 2), so both pooled anchors are matched.
-    result = matcher(
-        [[level_preds], [level_preds]],
-        pack_targets([targets]),
-        image_size=torch.tensor([2.0, 2.0]),
-    )
+    result = matcher([[level_preds], [level_preds]], pack_targets([targets]), image_size=torch.tensor([2.0, 2.0]))
 
     (image,) = result.images
     # Foreground indices address the concatenated anchors of both levels (level 1's anchor is offset by one).
@@ -227,10 +159,7 @@ def test_tal_matching() -> None:
     top10_matcher = TALMatching(topk=10, alpha=0.5, beta=6.0)
 
     one_target_boxes = torch.tensor([[0.0, 0.0, 4.0, 4.0]])
-    one_target = {
-        "boxes": one_target_boxes,
-        "labels": torch.tensor([0], dtype=torch.int64),
-    }
+    one_target = {"boxes": one_target_boxes, "labels": torch.tensor([0], dtype=torch.int64)}
     two_inside_points = torch.tensor([[1.0, 1.0], [3.0, 3.0]])
     two_identical_boxes = torch.tensor([[[[0.0, 0.0, 4.0, 4.0]], [[0.0, 0.0, 4.0, 4.0]]]])
     two_point_preds = {
@@ -288,11 +217,7 @@ def test_tal_matching() -> None:
     assert torch.equal(inside_result.background, ~inside_result.foreground)
 
     # When there are fewer valid points than top-k, every valid point is selected.
-    topk_result = top10_matcher(
-        [two_point_preds],
-        pack_targets([one_target]),
-        anchor_points=two_inside_points,
-    )
+    topk_result = top10_matcher([two_point_preds], pack_targets([one_target]), anchor_points=two_inside_points)
     torch.testing.assert_close(topk_result.foreground, torch.tensor([[True, True]]))
     torch.testing.assert_close(topk_result.assignment_weights, torch.ones((1, 2)))
 
@@ -319,13 +244,7 @@ def test_tal_matching() -> None:
     ordinary_overlaps = box_iou(ranking_pred_boxes[0], one_target_boxes).squeeze(1)
     complete_overlaps = complete_box_iou(ranking_pred_boxes[0], one_target_boxes).squeeze(1)
     ranking_result = matcher(
-        [
-            {
-                "boxes": ranking_pred_boxes,
-                "confidences": torch.ones((1, 2, 1)),
-                "classprobs": torch.full((1, 2, 1), 8.0),
-            }
-        ],
+        [{"boxes": ranking_pred_boxes, "confidences": torch.ones((1, 2, 1)), "classprobs": torch.full((1, 2, 1), 8.0)}],
         pack_targets([one_target]),
         anchor_points=torch.tensor([[1.0, 2.0], [2.0, 2.0]]),
     )
@@ -357,14 +276,8 @@ def test_tal_matching() -> None:
 def test_tal_matching_empty_targets() -> None:
     matcher = TALMatching(topk=1, alpha=0.5, beta=6.0)
 
-    empty_targets = {
-        "boxes": torch.empty((0, 4)),
-        "labels": torch.empty(0, dtype=torch.int64),
-    }
-    one_target = {
-        "boxes": torch.tensor([[0.0, 0.0, 4.0, 4.0]]),
-        "labels": torch.tensor([0], dtype=torch.int64),
-    }
+    empty_targets = {"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}
+    one_target = {"boxes": torch.tensor([[0.0, 0.0, 4.0, 4.0]]), "labels": torch.tensor([0], dtype=torch.int64)}
 
     # Empty targets should mark everything as background with zero assignment weight.
     empty_result = matcher(
@@ -401,10 +314,7 @@ def test_tal_matching_empty_targets() -> None:
 @pytest.mark.parametrize("input_is_normalized", [False, True])
 @pytest.mark.parametrize(
     "target_labels",
-    [
-        torch.tensor([0, 1]),
-        torch.tensor([[True, False], [False, True]]),
-    ],
+    [torch.tensor([0, 1]), torch.tensor([[True, False], [False, True]])],
     ids=["integer-labels", "boolean-class-mask"],
 )
 def test_tal_matching_input_is_normalized(input_is_normalized: bool, target_labels: torch.Tensor) -> None:
@@ -419,15 +329,7 @@ def test_tal_matching_input_is_normalized(input_is_normalized: bool, target_labe
     target_boxes = torch.tensor([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 2.0, 1.0]])
     result = matcher(
         [preds],
-        pack_targets(
-            [
-                {
-                    "boxes": target_boxes,
-                    "labels": target_labels,
-                    "polygons": torch.empty((0, 8)),
-                }
-            ]
-        ),
+        pack_targets([{"boxes": target_boxes, "labels": target_labels, "polygons": torch.empty((0, 8))}]),
         input_is_normalized=input_is_normalized,
         anchor_points=torch.tensor([[0.5, 0.5], [1.5, 0.5]]),
     )

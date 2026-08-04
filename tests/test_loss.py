@@ -21,12 +21,7 @@ from lightning_yolo.types import DistributionalDistancePredictions
 
 class FixedMatcher:
     def __call__(
-        self,
-        predictions: object,
-        targets: object,
-        *,
-        anchor_points: torch.Tensor,
-        input_is_normalized: bool,
+        self, predictions: object, targets: object, *, anchor_points: torch.Tensor, input_is_normalized: bool
     ) -> DenseMatchingResult:
         del predictions, targets, anchor_points, input_is_normalized
         return DenseMatchingResult(
@@ -39,9 +34,7 @@ class FixedMatcher:
 
 
 def _distributional_predictions(
-    class_logits: torch.Tensor,
-    dfl_logits: torch.Tensor | None = None,
-    pixel_boxes: torch.Tensor | None = None,
+    class_logits: torch.Tensor, dfl_logits: torch.Tensor | None = None, pixel_boxes: torch.Tensor | None = None
 ) -> DistributionalDistancePredictions:
     if dfl_logits is None:
         dfl_logits = torch.zeros((*class_logits.shape[:2], 16), dtype=class_logits.dtype, device=class_logits.device)
@@ -59,9 +52,7 @@ def _distributional_predictions(
 
 
 def _distributional_matching(
-    foreground: torch.Tensor,
-    target_labels: torch.Tensor,
-    assignment_weights: torch.Tensor,
+    foreground: torch.Tensor, target_labels: torch.Tensor, assignment_weights: torch.Tensor
 ) -> DenseMatchingResult:
     return DenseMatchingResult(
         foreground=foreground,
@@ -191,22 +182,16 @@ def test_yolo_loss() -> None:
         requires_grad=True,
     )
     pred_classprobs = torch.tensor(
-        [
-            [[2.0, -1.0], [-1.0, 2.0], [0.5, -0.5]],
-            [[0.2, -0.3], [-0.4, 0.6], [1.0, -1.5]],
-        ],
-        requires_grad=True,
+        [[[2.0, -1.0], [-1.0, 2.0], [0.5, -0.5]], [[0.2, -0.3], [-0.4, 0.6], [1.0, -1.5]]], requires_grad=True
     )
     image_size = torch.tensor([6.0, 2.0])
 
     # The first image has two foreground anchors; the second image has no targets, so dense TAL padding leaves
     # zero-area target boxes behind the background anchors.
-    target_boxes = torch.tensor(
-        [
-            [[0.0, 0.0, 2.0, 2.0], [2.0, 0.0, 4.0, 2.0], [0.0, 0.0, 2.0, 2.0]],
-            [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
-        ]
-    )
+    target_boxes = torch.tensor([
+        [[0.0, 0.0, 2.0, 2.0], [2.0, 0.0, 4.0, 2.0], [0.0, 0.0, 2.0, 2.0]],
+        [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+    ])
     target_labels = torch.tensor([[0, 1, 0], [0, 0, 0]])
     foreground = torch.tensor([[True, True, False], [False, False, False]])
     dense = DenseMatchingResult(
@@ -216,22 +201,20 @@ def test_yolo_loss() -> None:
         target_labels=target_labels,
         assignment_weights=foreground.float(),
     )
-    sparse = SparseMatchingResult(
-        [
-            ImageMatch(
-                foreground=torch.tensor([0, 1]),
-                background=torch.tensor([False, False, True]),
-                target_boxes=target_boxes[0, :2],
-                target_labels=target_labels[0, :2],
-            ),
-            ImageMatch(
-                foreground=torch.empty(0, dtype=torch.int64),
-                background=torch.tensor([True, True, True]),
-                target_boxes=torch.empty((0, 4)),
-                target_labels=torch.empty(0, dtype=torch.int64),
-            ),
-        ]
-    )
+    sparse = SparseMatchingResult([
+        ImageMatch(
+            foreground=torch.tensor([0, 1]),
+            background=torch.tensor([False, False, True]),
+            target_boxes=target_boxes[0, :2],
+            target_labels=target_labels[0, :2],
+        ),
+        ImageMatch(
+            foreground=torch.empty(0, dtype=torch.int64),
+            background=torch.tensor([True, True, True]),
+            target_boxes=torch.empty((0, 4)),
+            target_labels=torch.empty(0, dtype=torch.int64),
+        ),
+    ])
     preds = [
         {"boxes": boxes, "confidences": torch.ones(3), "classprobs": classprobs}
         for boxes, classprobs in zip(pred_boxes, pred_classprobs, strict=True)
@@ -293,9 +276,7 @@ def test_yolo_loss() -> None:
     )
     all_empty_sums = loss_func(all_empty_dense, preds[1:], False, image_size).sums
     all_empty_grads = torch.autograd.grad(
-        all_empty_sums[0] + all_empty_sums[2],
-        (pred_boxes, pred_classprobs),
-        allow_unused=True,
+        all_empty_sums[0] + all_empty_sums[2], (pred_boxes, pred_classprobs), allow_unused=True
     )
     assert all_empty_grads[0] is not None
     assert torch.equal(all_empty_grads[0], torch.zeros_like(pred_boxes))
@@ -346,10 +327,7 @@ def test_yolo_loss_multilabel() -> None:
                 "confidences": torch.tensor([0.1, -0.2]),
                 "classprobs": torch.tensor([[0.3, -0.7], [0.6, -0.4]]),
             },
-            {
-                "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 4.0, 4.0]]),
-                "labels": torch.tensor([0, 1]),
-            },
+            {"boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0], [0.0, 0.0, 4.0, 4.0]]), "labels": torch.tensor([0, 1])},
             False,
             (2, 2),
             id="logits",
@@ -361,10 +339,7 @@ def test_yolo_loss_multilabel() -> None:
                 "confidences": torch.tensor([0.8]),
                 "classprobs": torch.tensor([[0.7, 0.2]]),
             },
-            {
-                "boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]),
-                "labels": torch.tensor([1]),
-            },
+            {"boxes": torch.tensor([[0.0, 0.0, 2.0, 2.0]]), "labels": torch.tensor([1])},
             True,
             (1, 1),
             id="normalized",
@@ -426,9 +401,7 @@ def test_distributional_distance_loss() -> None:
 
     expected_denominator = torch.tensor(1.5)
     expected_class_sum = binary_cross_entropy_with_logits(
-        class_logits,
-        torch.tensor([[[0.5, 0.0], [0.0, 1.0]]]),
-        reduction="sum",
+        class_logits, torch.tensor([[[0.5, 0.0], [0.0, 1.0]]]), reduction="sum"
     )
 
     torch.testing.assert_close(record.normalizers, expected_denominator.expand_as(record.normalizers))

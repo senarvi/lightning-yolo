@@ -33,11 +33,7 @@ def test_route_layer() -> None:
 
 
 def test_shortcut_layer() -> None:
-    outputs = [
-        torch.ones(1, 3, 2, 2),
-        torch.full((1, 3, 2, 2), 2.0),
-        torch.full((1, 3, 2, 2), 3.0),
-    ]
+    outputs = [torch.ones(1, 3, 2, 2), torch.full((1, 3, 2, 2), 2.0), torch.full((1, 3, 2, 2), 3.0)]
     layer = ShortcutLayer(source_layer=0)
     y = layer(outputs)
 

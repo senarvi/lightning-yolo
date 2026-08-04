@@ -16,13 +16,7 @@ from torchvision.ops import (
 )
 
 from .matching_result import DenseMatchingResult, MatchingResult, SparseMatchingResult
-from .types import (
-    PREDICTIONS,
-    DetectionLossContribution,
-    DistributionalDistancePredictions,
-    PredictionDict,
-    TargetDict,
-)
+from .types import PREDICTIONS, DetectionLossContribution, DistributionalDistancePredictions, PredictionDict, TargetDict
 from .utils import boxes_to_distance_offsets
 
 _PredKey = Literal["boxes", "confidences", "classprobs"]
@@ -302,10 +296,7 @@ class YOLOLoss:
         self.class_multiplier = class_multiplier
 
     def pairwise_costs(
-        self,
-        preds: PredictionDict,
-        targets: TargetDict,
-        input_is_normalized: bool,
+        self, preds: PredictionDict, targets: TargetDict, input_is_normalized: bool
     ) -> tuple[YOLOLosses, Tensor]:
         """Calculates matrices containing the losses for all prediction/target pairs.
 
@@ -354,11 +345,7 @@ class YOLOLoss:
         return losses, overlap
 
     def __call__(
-        self,
-        matching: MatchingResult,
-        preds: PREDICTIONS,
-        input_is_normalized: bool,
-        image_size: Tensor,
+        self, matching: MatchingResult, preds: PREDICTIONS, input_is_normalized: bool, image_size: Tensor
     ) -> DetectionLossContribution:
         """Computes summed training losses from the predictions assigned by ``matching``.
 
@@ -383,11 +370,7 @@ class YOLOLoss:
         return DetectionLossContribution(sums=loss_sums, normalizers=normalizers)
 
     def _dense_sums(
-        self,
-        matching: DenseMatchingResult,
-        preds: PREDICTIONS,
-        input_is_normalized: bool,
-        image_size: Tensor,
+        self, matching: DenseMatchingResult, preds: PREDICTIONS, input_is_normalized: bool, image_size: Tensor
     ) -> YOLOLosses:
         """Calculates loss sums from dense batched target assignments.
 
@@ -445,10 +428,7 @@ class YOLOLoss:
         target_labels = matching.target_labels
         flat_target_labels = target_labels.flatten(0, 1) if target_labels.ndim == 3 else target_labels.flatten()
         target_probs = _target_labels_to_probs(
-            flat_target_labels,
-            pred_batch["classprobs"].shape[-1],
-            pred_batch["classprobs"].dtype,
-            self.label_smoothing,
+            flat_target_labels, pred_batch["classprobs"].shape[-1], pred_batch["classprobs"].dtype, self.label_smoothing
         ).view_as(pred_batch["classprobs"])
         class_targets = torch.where(foreground.unsqueeze(-1), target_probs * assignment_weights.unsqueeze(-1), 0.0)
         class_values = bce_func(pred_batch["classprobs"], class_targets, reduction="none")
@@ -461,11 +441,7 @@ class YOLOLoss:
         )
 
     def _sparse_sums(
-        self,
-        matching: SparseMatchingResult,
-        preds: PREDICTIONS,
-        input_is_normalized: bool,
-        image_size: Tensor,
+        self, matching: SparseMatchingResult, preds: PREDICTIONS, input_is_normalized: bool, image_size: Tensor
     ) -> YOLOLosses:
         """Calculates loss sums from per-image sparse target assignments.
 
@@ -611,15 +587,11 @@ class DistributionalDistanceLoss:
             overlap_loss = preds.pixel_boxes.sum() * 0.0
             dfl_loss_sum = preds.dfl_logits.sum() * 0.0
 
-        loss_sums = torch.stack(
-            (
-                overlap_loss * self.overlap_multiplier,
-                classification_loss * self.class_multiplier,
-                dfl_loss_sum * self.dfl_multiplier,
-            )
-        )
+        loss_sums = torch.stack((
+            overlap_loss * self.overlap_multiplier,
+            classification_loss * self.class_multiplier,
+            dfl_loss_sum * self.dfl_multiplier,
+        ))
         return DetectionLossContribution(
-            sums=loss_sums,
-            normalizers=denominator.expand_as(loss_sums),
-            names=("overlap", "classification", "dfl"),
+            sums=loss_sums, normalizers=denominator.expand_as(loss_sums), names=("overlap", "classification", "dfl")
         )

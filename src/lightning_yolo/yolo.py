@@ -270,10 +270,7 @@ class YOLO(LightningModule):
         )
         if scheduler is None:
             return optimizer
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
-        }
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1}}
 
     def _get_optimizer(self) -> optim.Optimizer:
         """Construct the SGD optimizer with weight decay applied only to convolution weights.
@@ -285,11 +282,7 @@ class YOLO(LightningModule):
         convolution_weights, no_decay = self._get_parameter_groups()
         momentum = float(self.hparams["momentum"])
         optimizer = optim.SGD(
-            no_decay,
-            lr=float(self.hparams["lr"]),
-            momentum=momentum,
-            nesterov=momentum > 0.0,
-            weight_decay=0.0,
+            no_decay, lr=float(self.hparams["lr"]), momentum=momentum, nesterov=momentum > 0.0, weight_decay=0.0
         )
         optimizer.add_param_group({"params": convolution_weights, "weight_decay": float(self.hparams["weight_decay"])})
         return optimizer
@@ -320,31 +313,20 @@ class YOLO(LightningModule):
 
         if warmup_steps < 2:
             return optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=1.0,
-                end_factor=final_lr_multiplier,
-                total_iters=max(total_steps - 1, 1),
+                optimizer, start_factor=1.0, end_factor=final_lr_multiplier, total_iters=max(total_steps - 1, 1)
             )
 
         warmup_scheduler = optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=1.0 / warmup_steps,
-            end_factor=1.0,
-            total_iters=warmup_steps - 1,
+            optimizer, start_factor=1.0 / warmup_steps, end_factor=1.0, total_iters=warmup_steps - 1
         )
         if decay_steps <= 0:
             return warmup_scheduler
 
         decay_scheduler = optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=1.0,
-            end_factor=final_lr_multiplier,
-            total_iters=decay_steps,
+            optimizer, start_factor=1.0, end_factor=final_lr_multiplier, total_iters=decay_steps
         )
         return optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, decay_scheduler],
-            milestones=[warmup_steps - 1],
+            optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps - 1]
         )
 
     def _get_parameter_groups(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:

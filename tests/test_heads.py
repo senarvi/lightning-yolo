@@ -47,19 +47,16 @@ def test_prior_shape_detection_layer() -> None:
 
 def test_create_prior_shape_detection_head() -> None:
     head = create_prior_shape_detection_head(
-        [(8, 8), (16, 16)],
-        [range(0, 1), range(1, 2)],
-        num_classes=2,
-        matching=MatchingConfig(algorithm="simota"),
+        [(8, 8), (16, 16)], [range(0, 1), range(1, 2)], num_classes=2, matching=MatchingConfig(algorithm="simota")
     )
     assert isinstance(head.matching_func, SimOTAMatching)
 
     # One anchor per cell and two classes give (5 + 2) = 7 output channels per level.
     features = [torch.randn(1, 7, 4, 4, requires_grad=True), torch.randn(1, 7, 2, 2, requires_grad=True)]
     image_size = torch.tensor([32.0, 32.0])
-    targets = pack_targets(
-        [{"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
-    )
+    targets = pack_targets([
+        {"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([1], dtype=torch.int64)}
+    ])
     detections, losses = head(features, image_size, targets)
 
     # Global SimOTA assigns once across both levels, so the head returns a single loss record.
@@ -72,18 +69,15 @@ def test_create_prior_shape_detection_head() -> None:
 
 def test_create_prior_shape_detection_head_with_aux() -> None:
     head = create_prior_shape_detection_head_with_aux(
-        [(8, 8), (16, 16)],
-        [range(0, 1), range(1, 2)],
-        num_classes=2,
-        matching=MatchingConfig(algorithm="simota"),
+        [(8, 8), (16, 16)], [range(0, 1), range(1, 2)], num_classes=2, matching=MatchingConfig(algorithm="simota")
     )
 
     # One anchor per cell and two classes give (5 + 2) = 7 output channels per level.
     features = [torch.randn(1, 7, 4, 4, requires_grad=True), torch.randn(1, 7, 2, 2, requires_grad=True)]
     image_size = torch.tensor([32.0, 32.0])
-    targets = pack_targets(
-        [{"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([1], dtype=torch.int64)}]
-    )
+    targets = pack_targets([
+        {"boxes": torch.tensor([[4.0, 4.0, 20.0, 20.0]]), "labels": torch.tensor([1], dtype=torch.int64)}
+    ])
     aux_features = [torch.randn(1, 7, 4, 4, requires_grad=True), torch.randn(1, 7, 2, 2, requires_grad=True)]
     detections, losses = head(features, aux_features, image_size, targets)
 

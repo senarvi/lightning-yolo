@@ -182,9 +182,7 @@ class PriorShapeDetectionHead(nn.Module):
     """
 
     def __init__(
-        self,
-        layers: Sequence[PriorShapeDetectionLayer],
-        matching_func: TALMatching | SimOTAMatching | None = None,
+        self, layers: Sequence[PriorShapeDetectionLayer], matching_func: TALMatching | SimOTAMatching | None = None
     ) -> None:
         super().__init__()
         if not layers:
@@ -193,10 +191,7 @@ class PriorShapeDetectionHead(nn.Module):
         self.matching_func = matching_func
 
     def forward(
-        self,
-        features: Sequence[Tensor],
-        image_size: Tensor,
-        targets: PackedTargetDict | None,
+        self, features: Sequence[Tensor], image_size: Tensor, targets: PackedTargetDict | None
     ) -> tuple[list[Tensor], list[DetectionLossContribution]]:
         """Decodes all feature levels and computes detection losses if targets are provided.
 
@@ -419,26 +414,22 @@ class DistributionalDistanceDetectionHead(nn.Module):
         box_hidden_channels = max(16, first_level_channels // 4, 4 * num_dfl_bins)
         class_hidden_channels = max(first_level_channels, min(num_classes, 100))
 
-        self.box_branches = nn.ModuleList(
-            [
-                nn.Sequential(
-                    Conv(channels, box_hidden_channels, kernel_size=3),
-                    Conv(box_hidden_channels, box_hidden_channels, kernel_size=3),
-                    nn.Conv2d(box_hidden_channels, 4 * num_dfl_bins, kernel_size=1),
-                )
-                for channels in input_channels
-            ]
-        )
-        self.class_branches = nn.ModuleList(
-            [
-                nn.Sequential(
-                    Conv(channels, class_hidden_channels, kernel_size=3),
-                    Conv(class_hidden_channels, class_hidden_channels, kernel_size=3),
-                    nn.Conv2d(class_hidden_channels, num_classes, kernel_size=1),
-                )
-                for channels in input_channels
-            ]
-        )
+        self.box_branches = nn.ModuleList([
+            nn.Sequential(
+                Conv(channels, box_hidden_channels, kernel_size=3),
+                Conv(box_hidden_channels, box_hidden_channels, kernel_size=3),
+                nn.Conv2d(box_hidden_channels, 4 * num_dfl_bins, kernel_size=1),
+            )
+            for channels in input_channels
+        ])
+        self.class_branches = nn.ModuleList([
+            nn.Sequential(
+                Conv(channels, class_hidden_channels, kernel_size=3),
+                Conv(class_hidden_channels, class_hidden_channels, kernel_size=3),
+                nn.Conv2d(class_hidden_channels, num_classes, kernel_size=1),
+            )
+            for channels in input_channels
+        ])
         self.dfl_expectation = DFLExpectation(num_dfl_bins)
         self._geometry_cache_key: tuple | None = None
         self._geometry_cache: tuple[Tensor, Tensor] | None = None
@@ -463,10 +454,7 @@ class DistributionalDistanceDetectionHead(nn.Module):
             nn.init.constant_(class_output.bias, log(5 / self.num_classes / (640 / stride) ** 2))
 
     def forward(
-        self,
-        features: Sequence[Tensor],
-        image_size: Tensor,
-        targets: PackedTargetDict | None = None,
+        self, features: Sequence[Tensor], image_size: Tensor, targets: PackedTargetDict | None = None
     ) -> tuple[list[Tensor], list[DetectionLossContribution]]:
         """Decode feature levels and compute detection loss if targets are provided.
 
@@ -811,9 +799,7 @@ def create_prior_shape_detection_head_with_aux(
 
 
 def create_distributional_distance_detection_head(
-    input_channels: Sequence[int],
-    num_classes: int,
-    loss: LossConfig | None = None,
+    input_channels: Sequence[int], num_classes: int, loss: LossConfig | None = None
 ) -> DistributionalDistanceDetectionHead:
     """Creates a distributional-distance detection head with its matcher and loss function.
 
@@ -840,8 +826,5 @@ def create_distributional_distance_detection_head(
         num_dfl_bins=loss.num_dfl_bins,
     )
     return DistributionalDistanceDetectionHead(
-        input_channels,
-        num_classes=num_classes,
-        num_dfl_bins=loss.num_dfl_bins,
-        loss_func=loss_func,
+        input_channels, num_classes=num_classes, num_dfl_bins=loss.num_dfl_bins, loss_func=loss_func
     )

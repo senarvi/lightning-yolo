@@ -19,10 +19,7 @@ from lightning_yolo.utils import (
 
 
 @pytest.mark.parametrize(("width", "height"), [(10, 5)])
-def test_grid_offsets(
-    width: int,
-    height: int,
-):
+def test_grid_offsets(width: int, height: int):
     size = torch.tensor([width, height])
     offsets = grid_offsets(size)
     assert offsets.shape == (height, width, 2)
@@ -97,21 +94,13 @@ def test_boxes_to_distance_offsets() -> None:
         (
             torch.tensor([[1.0, 1.0], [10.0, 1.0], [100.0, 10.0]]),
             torch.tensor([[1.0, 10.0], [2.0, 20.0]]),
-            torch.tensor(
-                [
-                    [1.0 / 10.0, 1.0 / 40.0],
-                    [1.0 / 19.0, 2.0 / 48.0],
-                    [10.0 / 1000.0, 20.0 / 1020.0],
-                ]
-            ),
+            torch.tensor([[1.0 / 10.0, 1.0 / 40.0], [1.0 / 19.0, 2.0 / 48.0], [10.0 / 1000.0, 20.0 / 1020.0]]),
         )
     ],
 )
 def test_aligned_iou(dims1, dims2, expected_ious):
     warnings.filterwarnings(
-        "ignore",
-        message=".*does not have many workers which may be a bottleneck.*",
-        category=PossibleUserWarning,
+        "ignore", message=".*does not have many workers which may be a bottleneck.*", category=PossibleUserWarning
     )
 
     torch.testing.assert_close(aligned_iou(dims1, dims2), expected_ious)

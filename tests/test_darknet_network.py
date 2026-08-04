@@ -60,53 +60,15 @@ ignore_thresh=.7
 @pytest.mark.parametrize(
     "config",
     [
-        (
-            {
-                "batch_normalize": 1,
-                "filters": 8,
-                "size": 3,
-                "stride": 1,
-                "pad": 1,
-                "activation": "leaky",
-            }
-        ),
-        (
-            {
-                "batch_normalize": 0,
-                "filters": 2,
-                "size": 1,
-                "stride": 1,
-                "pad": 1,
-                "activation": "mish",
-            }
-        ),
-        (
-            {
-                "batch_normalize": 1,
-                "filters": 6,
-                "size": 3,
-                "stride": 2,
-                "pad": 1,
-                "activation": "logistic",
-            }
-        ),
-        (
-            {
-                "batch_normalize": 0,
-                "filters": 4,
-                "size": 3,
-                "stride": 2,
-                "pad": 0,
-                "activation": "linear",
-            }
-        ),
+        ({"batch_normalize": 1, "filters": 8, "size": 3, "stride": 1, "pad": 1, "activation": "leaky"}),
+        ({"batch_normalize": 0, "filters": 2, "size": 1, "stride": 1, "pad": 1, "activation": "mish"}),
+        ({"batch_normalize": 1, "filters": 6, "size": 3, "stride": 2, "pad": 1, "activation": "logistic"}),
+        ({"batch_normalize": 0, "filters": 4, "size": 3, "stride": 2, "pad": 0, "activation": "linear"}),
     ],
 )
 def test_create_convolutional(config):
     warnings.filterwarnings(
-        "ignore",
-        message=".*does not have many workers which may be a bottleneck.*",
-        category=PossibleUserWarning,
+        "ignore", message=".*does not have many workers which may be a bottleneck.*", category=PossibleUserWarning
     )
 
     conv, _ = _create_convolutional(config, [3])
@@ -130,28 +92,10 @@ def test_create_convolutional(config):
         assert conv.act.__class__.__name__.lower().startswith(config["activation"])
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        (
-            {
-                "size": 2,
-                "stride": 2,
-            }
-        ),
-        (
-            {
-                "size": 6,
-                "stride": 3,
-            }
-        ),
-    ],
-)
+@pytest.mark.parametrize("config", [({"size": 2, "stride": 2}), ({"size": 6, "stride": 3})])
 def test_create_maxpool(config):
     warnings.filterwarnings(
-        "ignore",
-        message=".*does not have many workers which may be a bottleneck.*",
-        category=PossibleUserWarning,
+        "ignore", message=".*does not have many workers which may be a bottleneck.*", category=PossibleUserWarning
     )
 
     pad_size, remainder = divmod(max(config["size"], config["stride"]) - config["stride"], 2)
@@ -164,18 +108,10 @@ def test_create_maxpool(config):
         assert isinstance(maxpool.pad, nn.ZeroPad2d)
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        ({"from": 1, "activation": "linear"}),
-        ({"from": 3, "activation": "linear"}),
-    ],
-)
+@pytest.mark.parametrize("config", [({"from": 1, "activation": "linear"}), ({"from": 3, "activation": "linear"})])
 def test_create_shortcut(config):
     warnings.filterwarnings(
-        "ignore",
-        message=".*does not have many workers which may be a bottleneck.*",
-        category=PossibleUserWarning,
+        "ignore", message=".*does not have many workers which may be a bottleneck.*", category=PossibleUserWarning
     )
 
     shortcut, _ = _create_shortcut(config, [3])
@@ -183,18 +119,10 @@ def test_create_shortcut(config):
     assert shortcut.source_layer == config["from"]
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        ({"stride": 2}),
-        ({"stride": 4}),
-    ],
-)
+@pytest.mark.parametrize("config", [({"stride": 2}), ({"stride": 4})])
 def test_create_upsample(config):
     warnings.filterwarnings(
-        "ignore",
-        message=".*does not have many workers which may be a bottleneck.*",
-        category=PossibleUserWarning,
+        "ignore", message=".*does not have many workers which may be a bottleneck.*", category=PossibleUserWarning
     )
 
     upsample, _ = _create_upsample(config, [3])

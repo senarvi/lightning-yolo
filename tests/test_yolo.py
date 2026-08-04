@@ -17,10 +17,7 @@ from lightning_yolo.yolo import YOLO
 
 
 def test_yolo_forward() -> None:
-    module = YOLO(
-        architecture="yolov8n",
-        num_classes=3,
-    )
+    module = YOLO(architecture="yolov8n", num_classes=3)
     module.eval()
     uint8_images = torch.randint(0, 256, (2, 3, 64, 64), dtype=torch.uint8)
     float_images = uint8_images.to(torch.float32).div(255.0)
@@ -35,10 +32,7 @@ def test_yolo_forward() -> None:
 
 
 def test_yolo_forward_with_losses() -> None:
-    module = YOLO(
-        architecture="yolov8n",
-        num_classes=3,
-    )
+    module = YOLO(architecture="yolov8n", num_classes=3)
     images = torch.rand(1, 3, 64, 64)
     targets = pack_targets([{"boxes": torch.empty((0, 4)), "labels": torch.empty(0, dtype=torch.int64)}])
 
@@ -54,9 +48,9 @@ def test_yolo_forward_with_losses_multilabel() -> None:
     module = YOLO(architecture="yolov8n", num_classes=3)
     images = torch.rand(1, 3, 64, 64)
     # A boolean class mask assigns multiple classes to one box, exercising the multi-label training path.
-    targets = pack_targets(
-        [{"boxes": torch.tensor([[8.0, 8.0, 40.0, 40.0]]), "labels": torch.tensor([[True, False, True]])}]
-    )
+    targets = pack_targets([
+        {"boxes": torch.tensor([[8.0, 8.0, 40.0, 40.0]]), "labels": torch.tensor([[True, False, True]])}
+    ])
 
     detections, losses = module._forward_with_losses(images, targets)
 
@@ -99,21 +93,22 @@ def test_yolo_process_detections(monkeypatch: pytest.MonkeyPatch) -> None:
         return torch.arange(scores.numel(), device=scores.device)
 
     monkeypatch.setattr(yolo_module, "batched_nms", fake_batched_nms)
-    detections = torch.tensor(
+    detections = torch.tensor([
         [
-            [
-                [10.0, 20.0, 30.0, 40.0, 1.0, 0.2, 0.7],
-                [50.0, 60.0, 70.0, 80.0, 0.75, 0.8, 0.1],
-                [90.0, 100.0, 110.0, 120.0, 1.0, 0.6, 0.6],
-            ]
+            [10.0, 20.0, 30.0, 40.0, 1.0, 0.2, 0.7],
+            [50.0, 60.0, 70.0, 80.0, 0.75, 0.8, 0.1],
+            [90.0, 100.0, 110.0, 120.0, 1.0, 0.6, 0.6],
         ]
-    )
+    ])
 
     processed = module.process_detections(detections, confidence_threshold=0.25)
 
-    expected_nms_boxes = torch.tensor(
-        [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0], [90.0, 100.0, 110.0, 120.0], [90.0, 100.0, 110.0, 120.0]]
-    )
+    expected_nms_boxes = torch.tensor([
+        [10.0, 20.0, 30.0, 40.0],
+        [50.0, 60.0, 70.0, 80.0],
+        [90.0, 100.0, 110.0, 120.0],
+        [90.0, 100.0, 110.0, 120.0],
+    ])
     torch.testing.assert_close(captured["boxes"], expected_nms_boxes)
     torch.testing.assert_close(captured["scores"], torch.tensor([0.7, 0.6, 0.6, 0.6]))
     torch.testing.assert_close(captured["labels"], torch.tensor([1, 0, 0, 1]))
@@ -191,18 +186,9 @@ def test_yolo_get_lr_scheduler() -> None:
 
 
 @pytest.mark.parametrize(
-    ("architecture", "expected_num_detections", "dynamo"),
-    [
-        ("yolov4-tiny", 252, False),
-        ("yolov8n", 84, True),
-    ],
+    ("architecture", "expected_num_detections", "dynamo"), [("yolov4-tiny", 252, False), ("yolov8n", 84, True)]
 )
-def test_yolo_to_onnx(
-    tmp_path: Path,
-    architecture: str,
-    expected_num_detections: int,
-    dynamo: bool,
-) -> None:
+def test_yolo_to_onnx(tmp_path: Path, architecture: str, expected_num_detections: int, dynamo: bool) -> None:
     output_path = tmp_path / f"{architecture}_{'dynamo' if dynamo else 'tracing'}.onnx"
     model = YOLO(architecture=architecture, num_classes=2)
     model.eval()
@@ -219,24 +205,14 @@ def test_yolo_to_onnx(
         "dynamo": dynamo,
     }
     if dynamo:
-        export_kwargs.update(
-            {
-                "external_data": False,
-                "fallback": False,
-                "verify": False,
-                "dynamic_shapes": {
-                    "images": {
-                        2: torch.export.Dim("height", min=32),
-                        3: torch.export.Dim("width", min=32),
-                    }
-                },
-            }
-        )
+        export_kwargs.update({
+            "external_data": False,
+            "fallback": False,
+            "verify": False,
+            "dynamic_shapes": {"images": {2: torch.export.Dim("height", min=32), 3: torch.export.Dim("width", min=32)}},
+        })
     else:
-        export_kwargs["dynamic_axes"] = {
-            "images": {2: "height", 3: "width"},
-            "detections": {1: "detections"},
-        }
+        export_kwargs["dynamic_axes"] = {"images": {2: "height", 3: "width"}, "detections": {1: "detections"}}
 
     model.to_onnx(output_path, images, **export_kwargs)
 

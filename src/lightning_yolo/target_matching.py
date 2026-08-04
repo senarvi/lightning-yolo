@@ -134,10 +134,7 @@ class HighestIoUMatching(ShapeMatching):
     """
 
     def __init__(
-        self,
-        prior_shapes: PRIOR_SHAPES,
-        prior_shape_idxs: Sequence[int],
-        ignore_bg_threshold: float = 0.7,
+        self, prior_shapes: PRIOR_SHAPES, prior_shape_idxs: Sequence[int], ignore_bg_threshold: float = 0.7
     ) -> None:
         super().__init__(ignore_bg_threshold)
         self.prior_shapes = prior_shapes
@@ -274,12 +271,7 @@ def _sim_ota_match(costs: Tensor, ious: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def _tal_match(
-    align_metric: Tensor,
-    ious: Tensor,
-    inside_selector: Tensor,
-    target_mask: Tensor,
-    topk: int,
-    eps: float = 1e-9,
+    align_metric: Tensor, ious: Tensor, inside_selector: Tensor, target_mask: Tensor, topk: int, eps: float = 1e-9
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Implements the TAL matching rule.
 
@@ -461,11 +453,7 @@ class SimOTAMatching:
         return SparseMatchingResult(images)
 
     def _match_image(
-        self,
-        level_preds: Sequence[PredictionDict],
-        targets: TargetDict,
-        image_size: Tensor,
-        input_is_normalized: bool,
+        self, level_preds: Sequence[PredictionDict], targets: TargetDict, image_size: Tensor, input_is_normalized: bool
     ) -> ImageMatch:
         candidate_boxes: list[Tensor] = []
         candidate_confidences: list[Tensor] = []
@@ -631,11 +619,7 @@ class TALMatching:
         self.eps = eps
 
     def __call__(
-        self,
-        preds: PREDICTIONS,
-        targets: PackedTargetDict,
-        anchor_points: Tensor,
-        input_is_normalized: bool = False,
+        self, preds: PREDICTIONS, targets: PackedTargetDict, anchor_points: Tensor, input_is_normalized: bool = False
     ) -> MatchingResult:
         """Selects predictions for a batch using task-aligned matching.
 
@@ -714,11 +698,7 @@ class TALMatching:
         # Gather each target's predicted class score vectorized across the batch.
         if padded_labels.ndim == 2:
             label_indices = padded_labels.clamp(max=num_classes - 1)
-            class_scores = torch.gather(
-                pred_probs,
-                2,
-                label_indices[:, None, :].expand(-1, num_preds, -1),
-            )
+            class_scores = torch.gather(pred_probs, 2, label_indices[:, None, :].expand(-1, num_preds, -1))
         else:
             class_scores = torch.matmul(pred_probs, padded_labels.transpose(1, 2).to(pred_probs.dtype))
 
