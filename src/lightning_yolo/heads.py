@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from collections.abc import Sequence
 from math import log
 from typing import cast
@@ -424,9 +425,14 @@ class DistributionalDistanceDetectionHead(nn.Module):
         ])
         self.class_branches = nn.ModuleList([
             nn.Sequential(
-                Conv(channels, class_hidden_channels, kernel_size=3),
-                Conv(class_hidden_channels, class_hidden_channels, kernel_size=3),
-                nn.Conv2d(class_hidden_channels, num_classes, kernel_size=1),
+                OrderedDict([
+                    (f"outputs_{num_classes}_features_0", Conv(channels, class_hidden_channels, kernel_size=3)),
+                    (
+                        f"outputs_{num_classes}_features_1",
+                        Conv(class_hidden_channels, class_hidden_channels, kernel_size=3),
+                    ),
+                    (f"outputs_{num_classes}", nn.Conv2d(class_hidden_channels, num_classes, kernel_size=1)),
+                ])
             )
             for channels in input_channels
         ])
