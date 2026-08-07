@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -575,6 +576,15 @@ class SimOTAMatching:
         return mask, inside_selector[mask]
 
 
+@dataclass(frozen=True)
+class _DenseImageMatch:
+    foreground: Tensor
+    background: Tensor
+    target_boxes: Tensor
+    target_labels: Tensor
+    assignment_weights: Tensor
+
+
 class TALMatching:
     """Selects which anchors are used to predict each target using task-aligned matching.
 
@@ -639,8 +649,6 @@ class TALMatching:
             Fixed-shape assignments for the whole batch.
 
         """
-        batch_size = len(preds)
-        device = preds[0]["boxes"].device
         num_preds = preds[0]["boxes"].numel() // 4
         num_classes = preds[0]["classprobs"].shape[-1]
 
@@ -657,73 +665,92 @@ class TALMatching:
         pred_boxes = pred_boxes.detach()
         pred_probs = pred_probs.detach()
 
-        # Scatter the packed targets into a [batch_size, max_targets] padded layout without a Python per-image loop.
-        # Each packed row knows its image via sample_idxs; per-image counts give its position within that image.
         counts = targets["counts"]
         packed_boxes = targets["boxes"]
         packed_labels = targets["labels"]
-        sample_idxs = targets["sample_idxs"].to(device)
-        multilabel = packed_labels.ndim == 2
 
-        max_targets = max(max(counts), 1)
-        padded_boxes = pred_boxes.new_zeros(batch_size, max_targets, 4)
-        target_mask = torch.zeros(batch_size, max_targets, dtype=torch.bool, device=device)
-        if multilabel:
-            padded_labels = torch.zeros(batch_size, max_targets, num_classes, dtype=packed_labels.dtype, device=device)
-        else:
-            padded_labels = torch.zeros(batch_size, max_targets, dtype=packed_labels.dtype, device=device)
-
-        num_targets = packed_boxes.shape[0]
-        if num_targets:
-            counts_tensor = torch.as_tensor(counts, device=device)
-            image_starts = counts_tensor.cumsum(0) - counts_tensor
-            within_image = torch.arange(num_targets, device=device) - image_starts.repeat_interleave(counts_tensor)
-            padded_boxes[sample_idxs, within_image] = packed_boxes.to(padded_boxes.dtype)
-            padded_labels[sample_idxs, within_image] = packed_labels
-            target_mask[sample_idxs, within_image] = True
-
-        # Create a [batch, predictions, targets] tensor that indicates which anchor centers are inside each target box.
-        # The centers and padded boxes are broadcast across the batch and prediction dimensions, respectively.
-        pts = anchor_points[None, :, None, :]  # [1, N, 1, 2]
-        lt = pts[..., :2] - padded_boxes[:, None, :, :2]  # [batch_size, N, max_targets, 2]
-        rb = padded_boxes[:, None, :, 2:] - pts[..., :2]  # [batch_size, N, max_targets, 2]
-        inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0  # [batch_size, N, max_targets]
-        inside_selector = inside_selector & target_mask[:, None, :]
-
-        # Calculate the TAL alignment metric from the target-class probabilities and overlaps. Padded targets are masked
-        # so that they cannot contribute to matching.
-        overlaps = self.overlap_func(pred_boxes, padded_boxes)
-        overlaps = torch.where(target_mask[:, None, :], overlaps, torch.zeros_like(overlaps)).clamp(min=0)
-
-        # Gather each target's predicted class score vectorized across the batch.
-        if padded_labels.ndim == 2:
-            label_indices = padded_labels.clamp(max=num_classes - 1)
-            class_scores = torch.gather(pred_probs, 2, label_indices[:, None, :].expand(-1, num_preds, -1))
-        else:
-            class_scores = torch.matmul(pred_probs, padded_labels.transpose(1, 2).to(pred_probs.dtype))
-
-        align_metric = class_scores.pow(self.alpha) * overlaps.pow(self.beta)
-
-        # Run TAL matching for the whole batch.
-        pred_mask, target_sel, weights = _tal_match(
-            align_metric, overlaps, inside_selector, target_mask, self.topk, self.eps
-        )  # [batch_size, N], [batch_size, N], [batch_size, N]
-
-        # A non-foreground point is background unless it overlaps a target more than the threshold. With a threshold of
-        # 1.0 every non-foreground point becomes background, because the clamped overlaps never exceed one.
-        best_iou = overlaps.amax(dim=2)
-        background = (best_iou <= self.ignore_bg_threshold) & ~pred_mask
-        target_boxes = torch.gather(padded_boxes, 1, target_sel.unsqueeze(-1).expand(-1, -1, 4))
-
-        if not multilabel:
-            target_labels = torch.gather(padded_labels, 1, target_sel)
-        else:
-            target_labels = torch.gather(padded_labels, 1, target_sel.unsqueeze(-1).expand(-1, -1, num_classes))
+        # Process each image independently to reduce peak memory consumption. The [N, max_targets] intermediates inside
+        # complete_box_iou scale with the target count of one image.
+        image_results: list[_DenseImageMatch] = []
+        target_start = 0
+        for image_idx, count in enumerate(counts):
+            image_results.append(
+                self._match_image(
+                    pred_boxes[image_idx],
+                    pred_probs[image_idx],
+                    packed_boxes[target_start : target_start + count],
+                    packed_labels[target_start : target_start + count],
+                    anchor_points,
+                )
+            )
+            target_start += count
 
         return DenseMatchingResult(
+            foreground=torch.stack([result.foreground for result in image_results]),
+            background=torch.stack([result.background for result in image_results]),
+            target_boxes=torch.stack([result.target_boxes for result in image_results]),
+            target_labels=torch.stack([result.target_labels for result in image_results]),
+            assignment_weights=torch.stack([result.assignment_weights for result in image_results]),
+        )
+
+    def _match_image(
+        self,
+        pred_boxes: Tensor,
+        pred_probs: Tensor,
+        target_boxes: Tensor,
+        target_labels: Tensor,
+        anchor_points: Tensor,
+    ) -> _DenseImageMatch:
+        """Matches all predictions and targets for one image.
+
+        Args:
+            pred_boxes: Predicted boxes shaped ``[predictions, 4]``.
+            pred_probs: Predicted class probabilities shaped ``[predictions, classes]``.
+            target_boxes: Ground-truth boxes shaped ``[targets, 4]``.
+            target_labels: Ground-truth class indices shaped ``[targets]`` or class masks shaped
+                ``[targets, classes]``.
+            anchor_points: Candidate centers in image coordinates shaped ``[predictions, 2]``.
+
+        Returns:
+            Dense foreground and background assignments, matched targets, and assignment weights for one image.
+
+        """
+        num_preds, num_classes = pred_probs.shape
+        num_targets = target_boxes.shape[0]
+        if num_targets == 0:
+            label_shape = (num_preds, num_classes) if target_labels.ndim == 2 else (num_preds,)
+            return _DenseImageMatch(
+                foreground=torch.zeros(num_preds, dtype=torch.bool, device=pred_boxes.device),
+                background=torch.ones(num_preds, dtype=torch.bool, device=pred_boxes.device),
+                target_boxes=pred_boxes.new_zeros(num_preds, 4),
+                target_labels=target_labels.new_zeros(label_shape),
+                assignment_weights=pred_boxes.new_zeros(num_preds),
+            )
+
+        target_boxes = target_boxes.to(pred_boxes.dtype)
+        lt = anchor_points[:, None, :] - target_boxes[None, :, :2]
+        rb = target_boxes[None, :, 2:] - anchor_points[:, None, :]
+        inside_selector = torch.cat((lt, rb), dim=-1).amin(dim=-1) > 0.0
+        overlaps = self.overlap_func(pred_boxes, target_boxes).clamp(min=0)
+        class_scores = _probability_of_labels(pred_probs, target_labels)
+        align_metric = class_scores.pow(self.alpha) * overlaps.pow(self.beta)
+
+        target_mask = torch.ones(1, num_targets, dtype=torch.bool, device=pred_boxes.device)
+        pred_mask, target_sel, weights = _tal_match(
+            align_metric.unsqueeze(0),
+            overlaps.unsqueeze(0),
+            inside_selector.unsqueeze(0),
+            target_mask,
+            self.topk,
+            self.eps,
+        )
+        pred_mask = pred_mask.squeeze(0)
+        target_sel = target_sel.squeeze(0)
+
+        return _DenseImageMatch(
             foreground=pred_mask,
-            background=background,
-            target_boxes=target_boxes,
-            target_labels=target_labels,
-            assignment_weights=weights,
+            background=(overlaps.amax(dim=1) <= self.ignore_bg_threshold) & ~pred_mask,
+            target_boxes=target_boxes[target_sel],
+            target_labels=target_labels[target_sel],
+            assignment_weights=weights.squeeze(0),
         )
