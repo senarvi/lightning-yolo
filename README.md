@@ -170,7 +170,7 @@ Ready-to-run YOLOv8 examples are available in the [cfg directory](cfg). For exam
 uv run lightning-yolo fit --config cfg/yolov8n.yaml
 ```
 
-Metrics are written to `runs/<recipe>/csv/version_0/metrics.csv`, and checkpoints are written under
+Metrics are written to `runs/<recipe>/lightning_logs/version_0/metrics.csv`, and checkpoints are written under
 `runs/<recipe>/checkpoints/`.
 
 ## Inference
@@ -193,6 +193,36 @@ tensors:
 - *boxes*: a matrix of predicted bounding box `(x1, y1, x2, y2)` coordinates in image space
 - *scores*: a vector of detection confidences
 - *labels*: a vector of predicted class labels
+
+### Pretrained checkpoints
+
+Download a `.ckpt` asset from a [GitHub release](https://github.com/senarvi/lightning-yolo/releases), then load it
+with `YOLO.load_from_checkpoint()`. Input image dimensions must be divisible by the architecture downsampling ratio;
+the released COCO models use 640 by 640 inputs.
+
+```python
+import torch
+
+from lightning_yolo import YOLO
+
+model = YOLO.load_from_checkpoint("yolov8n.ckpt", map_location="cpu").eval()
+images = torch.rand(1, 3, 640, 640)
+with torch.inference_mode():
+  detections = model.infer(images)
+
+print(detections["boxes"], detections["scores"], detections["labels"])
+```
+
+### Evaluating a checkpoint
+
+Use the `validate` command to evaluate a checkpoint on the validation set. The command prints the COCO metrics.
+
+```bash
+uv run lightning-yolo validate --config cfg/yolov8n.yaml --ckpt_path yolov8n.ckpt
+```
+
+Replace both `yolov8n` occurrences with the architecture and matching checkpoint being evaluated. The configuration
+sets the input size, data directory, batch size, and GPU options used for the reported result.
 
 ## Development
 

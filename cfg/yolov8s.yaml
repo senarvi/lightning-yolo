@@ -2,6 +2,8 @@ trainer:
   accelerator: gpu
   devices: 1
   precision: 16-mixed
+  gradient_clip_val: 10.0
+  gradient_clip_algorithm: norm
   max_epochs: 500
   default_root_dir: runs/yolov8s
   logger:
@@ -28,9 +30,9 @@ trainer:
 model:
   architecture: yolov8s
   num_classes: 80
-  lr: 0.01
+  lr: 0.1
   momentum: 0.9
-  weight_decay: 0.0005
+  weight_decay: 0.0001
   warmup_epochs: 3.0
   final_lr_multiplier: 0.01
   confidence_threshold: 0.001

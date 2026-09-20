@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn as nn
 
@@ -89,6 +90,15 @@ def test_create_prior_shape_detection_head_with_aux() -> None:
     assert all(feature.grad is not None and torch.isfinite(feature.grad).all() for feature in features)
     assert all(feature.grad is not None and torch.isfinite(feature.grad).all() for feature in aux_features)
 
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_distributional_distance_detection_head_predict(dtype: torch.dtype) -> None:
+    """Checks decoded predictions, spatial ordering, and gradients under autocast.
+
+    Args:
+        dtype: Autocast dtype used for the learned prediction branches.
+
+    """
     # Standard YOLOv8 feature map sizes with learned branches.
     head = DistributionalDistanceDetectionHead([8, 8, 8], num_classes=2, num_dfl_bins=4)
 
@@ -103,8 +113,13 @@ def test_create_prior_shape_detection_head_with_aux() -> None:
         torch.randn(1, 8, 40, 40, requires_grad=True),
         torch.randn(1, 8, 20, 20, requires_grad=True),
     ]
-    output = head.predict(features, torch.tensor([640.0, 640.0]))
+    with torch.autocast("cpu", dtype=dtype, enabled=dtype != torch.float32):
+        output = head.predict(features, torch.tensor([640.0, 640.0]))
 
+    # Keep decoding and downstream geometry in float32 even when convolution outputs use reduced precision.
+    assert output.detections.dtype == torch.float32
+    assert output.dfl_logits.dtype == torch.float32
+    assert output.class_logits.dtype == torch.float32
     assert output.detections.shape == (1, 8400, 7)
     assert output.dfl_logits.shape == (1, 8400, 16)
     assert output.class_logits.shape == (1, 8400, 2)

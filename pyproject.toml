@@ -1,6 +1,6 @@
 [project]
 name = "lightning-yolo"
-version = "0.1.0"
+version = "1.0.0"
 description = "YOLO architectures for PyTorch Lightning."
 readme = "README.md"
 authors = [

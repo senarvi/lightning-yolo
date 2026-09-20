@@ -3,6 +3,8 @@ trainer:
   devices: 1
   precision: 16-mixed
   accumulate_grad_batches: 4
+  gradient_clip_val: 10.0
+  gradient_clip_algorithm: norm
   max_epochs: 500
   default_root_dir: runs/yolov7-w6
   logger:
@@ -29,9 +31,9 @@ trainer:
 model:
   architecture: yolov7-w6
   num_classes: 80
-  lr: 0.01
+  lr: 0.1
   momentum: 0.9
-  weight_decay: 0.0005
+  weight_decay: 0.0001
   warmup_epochs: 3.0
   final_lr_multiplier: 0.01
   confidence_threshold: 0.001
@@ -50,4 +52,4 @@ data:
   num_workers: 6
   translate: 0.1
   scale: 0.9
-  mixup: 0.1
+  mixup: 0.15

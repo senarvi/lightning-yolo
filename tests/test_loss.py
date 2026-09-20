@@ -135,41 +135,49 @@ def test_target_labels_to_probs_class_probabilities():
     assert torch.equal(result, probs)
 
 
-def test_dfl_loss() -> None:
-    # Fractional targets should interpolate between adjacent distance bins.
-    logits = torch.tensor([[[0.5, 2.0, -1.0], [1.0, -0.5, 0.25], [-0.2, 0.7, 1.5], [1.2, -0.4, 0.3]]])
-    targets = torch.tensor([[1.25, 0.5, 1.75, 0.0]])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_bins", [5, 16, 32])
+def test_dfl_loss(dtype: torch.dtype, num_bins: int) -> None:
+    """Checks distance-bin interpolation, clipping, and gradients under mixed precision.
 
-    result = dfl_loss(logits, targets)
+    Args:
+        dtype: Floating-point dtype used for logits and distance targets.
+        num_bins: Number of bins in each predicted distance distribution.
 
-    flat_logits = logits.reshape(-1, 3)
-    left_bins = torch.tensor([1, 0, 1, 0])
-    right_bins = torch.tensor([2, 1, 2, 1])
-    right_weights = torch.tensor([0.25, 0.5, 0.75, 0.0])
-    expected = (
-        (
-            torch.nn.functional.cross_entropy(flat_logits, left_bins, reduction="none") * (1 - right_weights)
-            + torch.nn.functional.cross_entropy(flat_logits, right_bins, reduction="none") * right_weights
-        )
-        .mean()
-        .unsqueeze(0)
+    """
+    logits = torch.randn(2, 4, num_bins, dtype=dtype, requires_grad=True)
+    uniform_logits = torch.zeros_like(logits, requires_grad=True)
+    targets = torch.tensor(
+        [[1.25, 0.5, 1.75, 0.0], [-2.0, num_bins - 1, num_bins + 8, num_bins - 1 - 0.01]], dtype=dtype
     )
+    original_targets = targets.clone()
 
+    # Fractional distances interpolate adjacent negative log probabilities; clip boundary targets in float32
+    # so bfloat16 rounding cannot produce an out-of-range right bin.
+    clipped_targets = targets.float().clamp(0, num_bins - 1 - 0.01)
+    left_bins = clipped_targets.floor().to(torch.int64)
+    right_weights = clipped_targets - left_bins
+    log_probs = logits.detach().float().log_softmax(-1)
+    left_loss = -log_probs.gather(-1, left_bins.unsqueeze(-1)).squeeze(-1)
+    right_loss = -log_probs.gather(-1, (left_bins + 1).unsqueeze(-1)).squeeze(-1)
+    expected = (left_loss * (1 - right_weights) + right_loss * right_weights).mean(-1)
+
+    with torch.autocast("cpu", dtype=dtype, enabled=dtype != torch.float32):
+        result = dfl_loss(logits, targets)
+        uniform_result = dfl_loss(uniform_logits, targets)
+
+    assert result.shape == (2,)
     torch.testing.assert_close(result, expected)
+    torch.testing.assert_close(targets, original_targets)
 
-    # Uniform logits should produce the uniform-loss value, clip targets in the computation, and backpropagate.
-    uniform_logits = torch.zeros((2, 4, 5), requires_grad=True)
-    clipped_targets = torch.tensor([[-2.0, 1.0, 2.0, 12.0], [1.5, 2.5, 3.0, 0.5]])
-    original_targets = clipped_targets.clone()
-    uniform_result = dfl_loss(uniform_logits, clipped_targets)
+    # Uniform predictions have loss log(num_bins), regardless of the fractional or clipped target distances.
+    torch.testing.assert_close(uniform_result, torch.full((2,), torch.log(torch.tensor(float(num_bins)))))
 
-    assert uniform_result.shape == (2,)
-    torch.testing.assert_close(clipped_targets, original_targets)
-    torch.testing.assert_close(uniform_result, torch.full((2,), torch.log(torch.tensor(5.0))))
-    uniform_result.sum().backward()
-
-    assert uniform_logits.grad is not None
-    assert torch.isfinite(uniform_logits.grad).all()
+    # Both distributions must support backpropagation with finite gradients in every tested dtype.
+    (result.sum() + uniform_result.sum()).backward()
+    for prediction in (logits, uniform_logits):
+        assert prediction.grad is not None
+        assert torch.isfinite(prediction.grad).all()
 
 
 def test_yolo_loss() -> None:

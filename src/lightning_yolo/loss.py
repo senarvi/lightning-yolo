@@ -212,6 +212,9 @@ def _target_labels_to_probs(
 def dfl_loss(logits: Tensor, targets: Tensor) -> Tensor:
     """Calculates distribution focal loss for point-to-box distances.
 
+    Half-precision targets are promoted to float32 so the upper clipping bound stays below the final bin and
+    interpolation weights retain their precision under autocast.
+
     Args:
         logits: Raw distance-bin logits shaped ``[..., 4, B]``, where ``B`` is the number of distance bins.
         targets: Fractional distance targets shaped ``[..., 4]``.
@@ -231,7 +234,8 @@ def dfl_loss(logits: Tensor, targets: Tensor) -> Tensor:
     if num_bins < 2:
         raise ValueError("DFL loss requires at least two distance bins.")
 
-    clipped_targets = targets.clamp(0, num_bins - 1 - 0.01)
+    clipped_targets: Tensor = targets.float() if targets.dtype in (torch.float16, torch.bfloat16) else targets
+    clipped_targets = clipped_targets.clamp(0, num_bins - 1 - 0.01)
     left_bins = clipped_targets.floor().to(torch.int64)
     right_bins = left_bins + 1
     right_weights = clipped_targets - left_bins.to(clipped_targets.dtype)

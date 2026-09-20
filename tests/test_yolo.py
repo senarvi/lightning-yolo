@@ -185,11 +185,17 @@ def test_yolo_get_lr_scheduler() -> None:
     assert optimizer.param_groups[0]["lr"] == pytest.approx(base_lr * module.hparams["final_lr_multiplier"])
 
 
-@pytest.mark.parametrize(
-    ("architecture", "expected_num_detections", "dynamo"), [("yolov4-tiny", 252, False), ("yolov8n", 84, True)]
-)
-def test_yolo_to_onnx(tmp_path: Path, architecture: str, expected_num_detections: int, dynamo: bool) -> None:
-    output_path = tmp_path / f"{architecture}_{'dynamo' if dynamo else 'tracing'}.onnx"
+@pytest.mark.parametrize(("architecture", "expected_num_detections"), [("yolov4-tiny", 252), ("yolov8n", 84)])
+def test_yolo_to_onnx(tmp_path: Path, architecture: str, expected_num_detections: int) -> None:
+    """Checks dynamic ONNX exports against eager inference for both detection head types.
+
+    Args:
+        tmp_path: Temporary directory for the exported model.
+        architecture: Built-in architecture to export.
+        expected_num_detections: Number of predictions for a 64 by 64 image.
+
+    """
+    output_path = tmp_path / f"{architecture}.onnx"
     model = YOLO(architecture=architecture, num_classes=2)
     model.eval()
     images = torch.rand(1, 3, 64, 64)
@@ -198,23 +204,16 @@ def test_yolo_to_onnx(tmp_path: Path, architecture: str, expected_num_detections
         eager_detections = model(images)
     assert eager_detections.shape == (1, expected_num_detections, 7)
 
-    export_kwargs: dict[str, object] = {
-        "input_names": ["images"],
-        "output_names": ["detections"],
-        "opset_version": 18,
-        "dynamo": dynamo,
-    }
-    if dynamo:
-        export_kwargs.update({
-            "external_data": False,
-            "fallback": False,
-            "verify": False,
-            "dynamic_shapes": {"images": {2: torch.export.Dim("height", min=32), 3: torch.export.Dim("width", min=32)}},
-        })
-    else:
-        export_kwargs["dynamic_axes"] = {"images": {2: "height", 3: "width"}, "detections": {1: "detections"}}
-
-    model.to_onnx(output_path, images, **export_kwargs)
+    model.to_onnx(
+        output_path,
+        images,
+        input_names=["images"],
+        output_names=["detections"],
+        opset_version=18,
+        dynamo=True,
+        external_data=False,
+        dynamic_shapes={"images": {2: torch.export.Dim("height", min=32), 3: torch.export.Dim("width", min=32)}},
+    )
 
     assert output_path.is_file()
     onnx_model = onnx.load(output_path)
@@ -225,12 +224,15 @@ def test_yolo_to_onnx(tmp_path: Path, architecture: str, expected_num_detections
     assert image_shape[3].dim_param == "width"
     assert [output.name for output in onnx_model.graph.output] == ["detections"]
     output_shape = onnx_model.graph.output[0].type.tensor_type.shape.dim
-    if dynamo:
-        assert output_shape[2].dim_value == 7
-    else:
-        assert output_shape[2].dim_param != ""
+    assert output_shape[2].dim_value == 7
 
     session = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
     (exported_detections,) = session.run(["detections"], {"images": images.numpy()})
 
     torch.testing.assert_close(torch.from_numpy(exported_detections), eager_detections, rtol=1e-4, atol=1e-4)
+
+    resized_images = torch.rand(1, 3, 96, 128)
+    with torch.no_grad():
+        resized_detections = model(resized_images)
+    (exported_resized_detections,) = session.run(["detections"], {"images": resized_images.numpy()})
+    torch.testing.assert_close(torch.from_numpy(exported_resized_detections), resized_detections, rtol=1e-4, atol=1e-4)

@@ -498,6 +498,9 @@ class DistributionalDistanceDetectionHead(nn.Module):
     def predict(self, features: Sequence[Tensor], image_size: Tensor) -> DistributionalDistancePredictions:
         """Decode feature levels into public detections and raw training logits.
 
+        Reduced-precision branch outputs are promoted to float32 before decoding to preserve box coordinates and
+        numerical stability in matching, losses, and postprocessing.
+
         Args:
             features: Feature tensors for each detection level, ordered from highest to lowest resolution.
             image_size: Image width and height in pixels as an `(x, y)` tensor.
@@ -517,6 +520,8 @@ class DistributionalDistanceDetectionHead(nn.Module):
             level.permute(0, 2, 3, 1).reshape(level.shape[0], -1, level.shape[1]) for level in prediction_levels
         ]
         flattened = torch.cat(flattened_levels, dim=1)
+        if flattened.dtype in (torch.float16, torch.bfloat16):
+            flattened = flattened.float()
         dfl_logits = flattened[..., : 4 * self.num_dfl_bins]
         class_logits = flattened[..., 4 * self.num_dfl_bins :]
 
